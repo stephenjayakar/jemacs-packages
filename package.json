@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Jemacs plugins not in the core repo. Each directory exports install(editor).",
   "dependencies": {
-    "@jemacs/core": "file:../jemacs/packages/jemacs-core"
+    "@jemacs/core": "file:../jemacs-opentui/packages/jemacs-core"
   },
   "scripts": {
     "check": "bun x tsc --noEmit -p .",

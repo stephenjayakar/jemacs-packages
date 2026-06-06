@@ -4,13 +4,13 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "paths": {
-      "@jemacs/core": ["../jemacs/packages/jemacs-core/index.ts"],
-      "@jemacs/core/kernel/*": ["../jemacs/src/kernel/*"],
-      "@jemacs/core/modes/*": ["../jemacs/src/modes/*"],
-      "@jemacs/core/runtime/*": ["../jemacs/src/runtime/*"],
-      "@jemacs/core/platform/*": ["../jemacs/src/platform/*"],
-      "@jemacs/core/display/*": ["../jemacs/src/display/*"],
-      "@jemacs/core/lsp/*": ["../jemacs/src/lsp/*"]
+      "@jemacs/core": ["../jemacs-opentui/packages/jemacs-core/index.ts"],
+      "@jemacs/core/kernel/*": ["../jemacs-opentui/src/kernel/*"],
+      "@jemacs/core/modes/*": ["../jemacs-opentui/src/modes/*"],
+      "@jemacs/core/runtime/*": ["../jemacs-opentui/src/runtime/*"],
+      "@jemacs/core/platform/*": ["../jemacs-opentui/src/platform/*"],
+      "@jemacs/core/display/*": ["../jemacs-opentui/src/display/*"],
+      "@jemacs/core/lsp/*": ["../jemacs-opentui/src/lsp/*"]
     },
     "strict": true,
     "skipLibCheck": true,
