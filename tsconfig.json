@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "paths": {
+      "@jemacs/core": ["../jemacs/packages/jemacs-core/index.ts"],
+      "@jemacs/core/kernel/*": ["../jemacs/src/kernel/*"],
+      "@jemacs/core/modes/*": ["../jemacs/src/modes/*"],
+      "@jemacs/core/runtime/*": ["../jemacs/src/runtime/*"],
+      "@jemacs/core/platform/*": ["../jemacs/src/platform/*"],
+      "@jemacs/core/display/*": ["../jemacs/src/display/*"],
+      "@jemacs/core/lsp/*": ["../jemacs/src/lsp/*"]
+    },
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["bun-types"]
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules"]
+}

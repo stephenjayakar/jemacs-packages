@@ -1,0 +1,17 @@
+{
+  "name": "jemacs-packages",
+  "private": true,
+  "type": "module",
+  "description": "Jemacs plugins not in the core repo. Each directory exports install(editor).",
+  "dependencies": {
+    "@jemacs/core": "file:../jemacs/packages/jemacs-core"
+  },
+  "scripts": {
+    "check": "bun x tsc --noEmit -p .",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "bun-types": "^1.3.14"
+  }
+}

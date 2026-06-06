@@ -2,20 +2,17 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve } from "node:path"
 
-type Editor = import("../../jemacs-opentui/src/kernel/editor").Editor
-type BufferModel = import("../../jemacs-opentui/src/kernel/buffer").BufferModel
+import type { Editor, BufferModel } from "@jemacs/core"
+import { addHook, Keymap, defcustom, getCustom } from "@jemacs/core"
+import { defineMinorMode } from "@jemacs/core/modes/minor-mode"
+import { spawnProcess } from "@jemacs/core/platform/runtime"
 
 type FindFileOp = (editor: Editor, path: string) => Promise<void>
 
+// TODO: @jemacs/builtin-plugins — plugins/ is not part of @jemacs/core's export surface.
 type ProjectileDeps = {
-  addHook: typeof import("../../jemacs-opentui/src/kernel/hooks").addHook
-  Keymap: typeof import("../../jemacs-opentui/src/kernel/keymap").Keymap
-  defineMinorMode: typeof import("../../jemacs-opentui/src/modes/minor-mode").defineMinorMode
-  spawnProcess: typeof import("../../jemacs-opentui/src/platform/runtime").spawnProcess
-  defcustom: typeof import("../../jemacs-opentui/src/runtime/custom").defcustom
-  getCustom: typeof import("../../jemacs-opentui/src/runtime/custom").getCustom
-  compilationStart: typeof import("../../jemacs-opentui/plugins/compile").compilationStart
-  lastCompileCommand: typeof import("../../jemacs-opentui/plugins/compile").lastCompileCommand
+  compilationStart: typeof import("@jemacs/core/../../plugins/compile").compilationStart
+  lastCompileCommand: typeof import("@jemacs/core/../../plugins/compile").lastCompileCommand
 }
 
 const ROOT_MARKERS_BOTTOM_UP = [
@@ -37,20 +34,16 @@ export function resetProjectileStateForTests(): void {
   projectsCache.clear()
 }
 
-function jemacsHome(): string {
-  return process.env.JEMACS_HOME ?? join(homedir(), "programming", "jemacs", "jemacs-opentui")
-}
-
 function jemacsDir(): string {
   return join(homedir(), ".jemacs")
 }
 
-function knownProjectsFile(getCustom: ProjectileDeps["getCustom"]): string {
+function knownProjectsFile(): string {
   return getCustom<string>("projectile-known-projects-file")
     ?? join(jemacsDir(), "projectile-bookmarks.json")
 }
 
-function keymapPrefix(getCustom: ProjectileDeps["getCustom"]): string {
+function keymapPrefix(): string {
   return getCustom<string>("projectile-keymap-prefix") ?? "C-c p"
 }
 
@@ -107,11 +100,7 @@ export async function projectileProjectRoot(dir?: string): Promise<string | null
   return null
 }
 
-export async function projectileProjectFiles(
-  projectRoot: string,
-  spawnProcess: ProjectileDeps["spawnProcess"],
-  getCustom: ProjectileDeps["getCustom"],
-): Promise<string[]> {
+export async function projectileProjectFiles(projectRoot: string): Promise<string[]> {
   const root = resolve(projectRoot)
   if (getCustom<boolean>("projectile-enable-caching")) {
     const cached = projectsCache.get(root)
@@ -135,8 +124,8 @@ function invalidateProjectCaches(root?: string): void {
   else projectsCache.clear()
 }
 
-async function readKnownProjectsFile(getCustom: ProjectileDeps["getCustom"]): Promise<string[]> {
-  const text = await readFile(knownProjectsFile(getCustom), "utf8").catch(() => null)
+async function readKnownProjectsFile(): Promise<string[]> {
+  const text = await readFile(knownProjectsFile(), "utf8").catch(() => null)
   if (!text) return []
   try {
     const data = JSON.parse(text) as unknown
@@ -146,50 +135,43 @@ async function readKnownProjectsFile(getCustom: ProjectileDeps["getCustom"]): Pr
   }
 }
 
-async function saveKnownProjects(getCustom: ProjectileDeps["getCustom"]): Promise<void> {
-  const file = knownProjectsFile(getCustom)
+async function saveKnownProjects(): Promise<void> {
+  const file = knownProjectsFile()
   await mkdir(dirname(file), { recursive: true })
   await writeFile(file, JSON.stringify(knownProjects ?? [], null, 2), "utf8")
 }
 
-export async function projectileKnownProjects(getCustom: ProjectileDeps["getCustom"]): Promise<string[]> {
-  if (!knownProjects) knownProjects = await readKnownProjectsFile(getCustom)
+export async function projectileKnownProjects(): Promise<string[]> {
+  if (!knownProjects) knownProjects = await readKnownProjectsFile()
   return [...knownProjects]
 }
 
-export async function projectileAddKnownProject(
-  root: string,
-  getCustom: ProjectileDeps["getCustom"],
-): Promise<void> {
+export async function projectileAddKnownProject(root: string): Promise<void> {
   const dir = resolve(root)
   if (getCustom<string[]>("projectile-ignored-projects")?.includes(dir)) return
-  const list = await projectileKnownProjects(getCustom)
+  const list = await projectileKnownProjects()
   const i = list.indexOf(dir)
   if (i === 0) return
   if (i > 0) list.splice(i, 1)
   list.unshift(dir)
   knownProjects = list
-  await saveKnownProjects(getCustom)
+  await saveKnownProjects()
 }
 
 function projectileDefaultProjectName(root: string): string {
   return basename(resolve(root)) || root
 }
 
-function projectileProjectName(root: string | null, getCustom: ProjectileDeps["getCustom"]): string {
+function projectileProjectName(root: string | null): string {
   const custom = getCustom<string>("projectile-project-name")
   if (custom) return custom
   if (root) return projectileDefaultProjectName(root)
   return "-"
 }
 
-function prependProjectName(
-  prompt: string,
-  root: string | null,
-  getCustom: ProjectileDeps["getCustom"],
-): string {
+function prependProjectName(prompt: string, root: string | null): string {
   if (!root) return prompt
-  return `[${projectileProjectName(root, getCustom)}] ${prompt}`
+  return `[${projectileProjectName(root)}] ${prompt}`
 }
 
 async function projectileCompletingRead(
@@ -197,10 +179,9 @@ async function projectileCompletingRead(
   prompt: string,
   collection: string[],
   root: string | null,
-  getCustom: ProjectileDeps["getCustom"],
   history?: string,
 ): Promise<string | null> {
-  return editor.completingRead(prependProjectName(prompt, root, getCustom), {
+  return editor.completingRead(prependProjectName(prompt, root), {
     collection,
     history: history ?? "projectile",
   })
@@ -210,23 +191,19 @@ async function startDir(editor: Editor, override?: string): Promise<string> {
   return override ?? editor.currentBuffer.directory() ?? process.cwd()
 }
 
-async function acquireRoot(
-  editor: Editor,
-  getCustom: ProjectileDeps["getCustom"],
-  override?: string,
-): Promise<string | null> {
+async function acquireRoot(editor: Editor, override?: string): Promise<string | null> {
   const start = await startDir(editor, override)
   const root = await projectileProjectRoot(start)
   if (root) return root
 
   const requireRoot = getCustom<boolean | "prompt">("projectile-require-project-root")
   if (requireRoot === "prompt") {
-    const projects = await projectileKnownProjects(getCustom)
+    const projects = await projectileKnownProjects()
     if (!projects.length) {
       editor.message("There are no known projects")
       return null
     }
-    return projectileCompletingRead(editor, "Switch to project: ", projects, null, getCustom, "projectile-project")
+    return projectileCompletingRead(editor, "Switch to project: ", projects, null, "projectile-project")
   }
   if (requireRoot === true) {
     editor.message(`Projectile cannot find a project definition in ${start}`)
@@ -245,22 +222,20 @@ function allBuffers(editor: Editor): BufferModel[] {
 
 async function openFindFile(
   editor: Editor,
-  deps: ProjectileDeps,
   invalidate: number | boolean | null | undefined,
   open: FindFileOp,
   override?: string,
 ): Promise<void> {
-  const { getCustom, spawnProcess } = deps
-  const root = await acquireRoot(editor, getCustom, override)
+  const root = await acquireRoot(editor, override)
   if (!root) return
   maybeInvalidateCache(invalidate, root)
-  await projectileAddKnownProject(root, getCustom)
-  const files = await projectileProjectFiles(root, spawnProcess, getCustom)
+  await projectileAddKnownProject(root)
+  const files = await projectileProjectFiles(root)
   if (!files.length) {
     editor.message(`No tracked files in ${root}`)
     return
   }
-  const choice = await projectileCompletingRead(editor, "Find file: ", files, root, getCustom, "projectile-file")
+  const choice = await projectileCompletingRead(editor, "Find file: ", files, root, "projectile-file")
   if (!choice) return
   await open(editor, join(root, choice))
   await editor.runHook("projectile-find-file-hook", editor.currentBuffer)
@@ -287,40 +262,33 @@ function selectDwimFiles(files: string[], needle: string): string[] {
 
 async function findFileDwim(
   editor: Editor,
-  deps: ProjectileDeps,
   invalidate: number | boolean | null | undefined,
   open: FindFileOp,
   override?: string,
 ): Promise<void> {
-  const { getCustom, spawnProcess } = deps
-  const root = await acquireRoot(editor, getCustom, override)
+  const root = await acquireRoot(editor, override)
   if (!root) return
   maybeInvalidateCache(invalidate, root)
-  const files = await projectileProjectFiles(root, spawnProcess, getCustom)
+  const files = await projectileProjectFiles(root)
   const needle = filenameAtPoint(editor.currentBuffer)
   const matches = selectDwimFiles(files, needle)
   let choice: string | null
   if (matches.length === 1) choice = matches[0]!
   else if (matches.length > 1) {
-    choice = await projectileCompletingRead(editor, "Switch to: ", matches, root, getCustom, "projectile-file")
+    choice = await projectileCompletingRead(editor, "Switch to: ", matches, root, "projectile-file")
   } else {
-    choice = await projectileCompletingRead(editor, "Switch to: ", files, root, getCustom, "projectile-file")
+    choice = await projectileCompletingRead(editor, "Switch to: ", files, root, "projectile-file")
   }
   if (!choice) return
   await open(editor, join(root, choice))
   await editor.runHook("projectile-find-file-hook", editor.currentBuffer)
 }
 
-async function switchProjectByName(
-  editor: Editor,
-  project: string,
-  commander: boolean,
-  getCustom: ProjectileDeps["getCustom"],
-): Promise<void> {
+async function switchProjectByName(editor: Editor, project: string, commander: boolean): Promise<void> {
   const root = resolve(project)
   if (!(await projectileProjectRoot(root))) {
-    knownProjects = (await projectileKnownProjects(getCustom)).filter(p => p !== root)
-    await saveKnownProjects(getCustom)
+    knownProjects = (await projectileKnownProjects()).filter(p => p !== root)
+    await saveKnownProjects()
     editor.message(`Directory ${root} is not a project`)
     return
   }
@@ -404,32 +372,7 @@ const PROJECTILE_COMMAND_MAP: Array<[string, string]> = [
   ["c r", "projectile-run-project"],
 ]
 
-async function loadDeps(): Promise<ProjectileDeps> {
-  const home = jemacsHome()
-  const [hooks, keymap, minor, runtime, custom, compile] = await Promise.all([
-    import(join(home, "src/kernel/hooks.ts")),
-    import(join(home, "src/kernel/keymap.ts")),
-    import(join(home, "src/modes/minor-mode.ts")),
-    import(join(home, "src/platform/runtime.ts")),
-    import(join(home, "src/runtime/custom.ts")),
-    import(join(home, "plugins/compile/index.ts")),
-  ])
-  return {
-    addHook: hooks.addHook,
-    Keymap: keymap.Keymap,
-    defineMinorMode: minor.defineMinorMode,
-    spawnProcess: runtime.spawnProcess,
-    defcustom: custom.defcustom,
-    getCustom: custom.getCustom,
-    compilationStart: compile.compilationStart,
-    lastCompileCommand: compile.lastCompileCommand,
-  }
-}
-
-export async function install(editor: Editor): Promise<void> {
-  const deps = await loadDeps()
-  const { addHook, Keymap, defineMinorMode, defcustom, getCustom, compilationStart, lastCompileCommand, spawnProcess } = deps
-
+export async function install(editor: Editor, deps?: ProjectileDeps): Promise<void> {
   defcustom("projectile-enable-caching", "boolean", true,
     "When t enables project files caching for the session.")
   defcustom("projectile-keymap-prefix", "string", "C-c p",
@@ -449,6 +392,12 @@ export async function install(editor: Editor): Promise<void> {
   const defaultOpen: FindFileOp = async (ed, path) => { await ed.openFile(path) }
   const otherWindowOpen: FindFileOp = async (ed, path) => { await ed.run("find-file-other-window", [path]) }
 
+  const requireCompile = (ed: Editor): ProjectileDeps | null => {
+    if (deps) return deps
+    ed.message("projectile: compile plugin not wired (pass deps to install)")
+    return null
+  }
+
   editor.command("projectile-project-root", async ({ editor, args }) => {
     const root = await projectileProjectRoot(args[0] ?? await startDir(editor))
     if (root) editor.message(root)
@@ -456,34 +405,34 @@ export async function install(editor: Editor): Promise<void> {
   }, "Echo the root directory of the current project.")
 
   editor.command("projectile-find-file", async ({ editor, args, prefixArgument }) => {
-    await openFindFile(editor, deps, prefixArgument, defaultOpen, args[0])
+    await openFindFile(editor, prefixArgument, defaultOpen, args[0])
   }, "Jump to a project's file using completion.")
 
   editor.command("projectile-find-file-other-window", async ({ editor, args, prefixArgument }) => {
-    await openFindFile(editor, deps, prefixArgument, otherWindowOpen, args[0])
+    await openFindFile(editor, prefixArgument, otherWindowOpen, args[0])
   }, "Jump to a project file in another window.")
 
   editor.command("projectile-find-file-other-frame", async ({ editor, args, prefixArgument }) => {
-    await openFindFile(editor, deps, prefixArgument, defaultOpen, args[0])
+    await openFindFile(editor, prefixArgument, defaultOpen, args[0])
   }, "Jump to a project file (no separate frame in Jemacs).")
 
   editor.command("projectile-find-file-dwim", async ({ editor, args, prefixArgument }) => {
-    await findFileDwim(editor, deps, prefixArgument, defaultOpen, args[0])
+    await findFileDwim(editor, prefixArgument, defaultOpen, args[0])
   }, "Jump to a project file using completion based on context.")
 
   editor.command("projectile-find-file-dwim-other-window", async ({ editor, args, prefixArgument }) => {
-    await findFileDwim(editor, deps, prefixArgument, otherWindowOpen, args[0])
+    await findFileDwim(editor, prefixArgument, otherWindowOpen, args[0])
   }, "DWIM find-file in another window.")
 
   editor.command("projectile-switch-project", async ({ editor, prefixArgument }) => {
-    const projects = await projectileKnownProjects(getCustom)
+    const projects = await projectileKnownProjects()
     if (!projects.length) {
       editor.message("There are no known projects")
       return
     }
-    const root = await projectileCompletingRead(editor, "Switch to project: ", projects, null, getCustom, "projectile-project")
+    const root = await projectileCompletingRead(editor, "Switch to project: ", projects, null, "projectile-project")
     if (!root) return
-    await switchProjectByName(editor, root, prefixArgument != null, getCustom)
+    await switchProjectByName(editor, root, prefixArgument != null)
   }, "Switch to a known project.")
 
   editor.command("projectile-switch-open-project", async ({ editor, prefixArgument }) => {
@@ -492,9 +441,9 @@ export async function install(editor: Editor): Promise<void> {
       editor.message("There are no open projects")
       return
     }
-    const root = await projectileCompletingRead(editor, "Switch to open project: ", projects, null, getCustom, "projectile-project")
+    const root = await projectileCompletingRead(editor, "Switch to open project: ", projects, null, "projectile-project")
     if (!root) return
-    await switchProjectByName(editor, root, prefixArgument != null, getCustom)
+    await switchProjectByName(editor, root, prefixArgument != null)
   }, "Switch to an open project.")
 
   editor.command("projectile-invalidate-cache", async ({ editor, prefixArgument }) => {
@@ -513,39 +462,41 @@ export async function install(editor: Editor): Promise<void> {
   editor.command("projectile-dired", async ({ editor, prefixArgument }) => {
     let root: string | null
     if (prefixArgument != null) {
-      const projects = await projectileKnownProjects(getCustom)
-      root = await projectileCompletingRead(editor, "Dired in project: ", projects, null, getCustom, "projectile-project")
+      const projects = await projectileKnownProjects()
+      root = await projectileCompletingRead(editor, "Dired in project: ", projects, null, "projectile-project")
     } else {
-      root = await acquireRoot(editor, getCustom)
+      root = await acquireRoot(editor)
     }
     if (!root) return
     await editor.run("dired", [root])
   }, "Open dired at the project root.")
 
   editor.command("projectile-compile-project", async ({ editor, args, prefixArgument }) => {
-    const root = await acquireRoot(editor, getCustom)
+    const compile = requireCompile(editor)
+    if (!compile) return
+    const root = await acquireRoot(editor)
     if (!root) return
     const cmd = args[0]
       ?? (prefixArgument != null
-        ? await editor.prompt("Compile command: ", lastCompileCommand(editor), "compile-command")
-        : lastCompileCommand(editor))
+        ? await editor.prompt("Compile command: ", compile.lastCompileCommand(editor), "compile-command")
+        : compile.lastCompileCommand(editor))
     if (!cmd) return
-    await compilationStart(editor, cmd, root)
+    await compile.compilationStart(editor, cmd, root)
   }, "Compile the current project.")
 
   editor.command("projectile-grep", async ({ editor, args }) => {
-    const root = await acquireRoot(editor, getCustom)
+    const root = await acquireRoot(editor)
     if (!root) return
-    const pattern = args[0] ?? await editor.prompt(prependProjectName("Grep for: ", root, getCustom), "", "search")
+    const pattern = args[0] ?? await editor.prompt(prependProjectName("Grep for: ", root), "", "search")
     if (!pattern) return
     await editor.run("counsel-ag", [pattern])
   }, "Grep the project.")
 
   editor.command("projectile-ag", async ({ editor, args, prefixArgument }) => {
-    const root = await acquireRoot(editor, getCustom)
+    const root = await acquireRoot(editor)
     if (!root) return
     const label = prefixArgument != null ? "Ag regexp search for: " : "Ag search for: "
-    const pattern = args[0] ?? await editor.prompt(prependProjectName(label, root, getCustom), "", "search")
+    const pattern = args[0] ?? await editor.prompt(prependProjectName(label, root), "", "search")
     if (!pattern) return
     await editor.run("counsel-ag", [pattern])
   }, "Search the project with ripgrep.")
@@ -557,30 +508,30 @@ export async function install(editor: Editor): Promise<void> {
   editor.command("projectile-add-known-project", async ({ editor, args }) => {
     const root = args[0] ?? await editor.prompt("Add to known projects: ", editor.currentBuffer.directory() ?? process.cwd())
     if (!root) return
-    await projectileAddKnownProject(root, getCustom)
+    await projectileAddKnownProject(root)
     editor.message(`Added ${resolve(root)} to known projects`)
   }, "Add a directory to known projects.")
 
   editor.command("projectile-switch-to-buffer", async ({ editor }) => {
-    const root = await acquireRoot(editor, getCustom)
+    const root = await acquireRoot(editor)
     if (!root) return
     const names = projectBufferFiles(editor, root).map(b => b.name)
-    const choice = await projectileCompletingRead(editor, "Switch to buffer: ", names, root, getCustom, "projectile-buffer")
+    const choice = await projectileCompletingRead(editor, "Switch to buffer: ", names, root, "projectile-buffer")
     if (!choice) return
     editor.switchToBuffer(choice)
   }, "Switch to a buffer in the current project.")
 
   editor.command("projectile-switch-to-buffer-other-window", async ({ editor }) => {
-    const root = await acquireRoot(editor, getCustom)
+    const root = await acquireRoot(editor)
     if (!root) return
     const names = projectBufferFiles(editor, root).map(b => b.name)
-    const choice = await projectileCompletingRead(editor, "Switch to buffer: ", names, root, getCustom, "projectile-buffer")
+    const choice = await projectileCompletingRead(editor, "Switch to buffer: ", names, root, "projectile-buffer")
     if (!choice) return
     await editor.run("switch-to-buffer-other-window", [choice])
   }, "Switch to a project buffer in another window.")
 
   editor.command("projectile-kill-buffers", async ({ editor }) => {
-    const root = await acquireRoot(editor, getCustom)
+    const root = await acquireRoot(editor)
     if (!root) return
     const buffers = projectBufferFiles(editor, root).filter(b => b.path)
     for (const buf of buffers) editor.killBuffer(buf.name)
@@ -588,25 +539,25 @@ export async function install(editor: Editor): Promise<void> {
   }, "Kill project file buffers.")
 
   editor.command("projectile-find-dir", async ({ editor, prefixArgument }) => {
-    const root = await acquireRoot(editor, getCustom)
+    const root = await acquireRoot(editor)
     if (!root) return
     maybeInvalidateCache(prefixArgument, root)
-    const files = await projectileProjectFiles(root, spawnProcess, getCustom)
+    const files = await projectileProjectFiles(root)
     const dirs = [...new Set(files.map(f => {
       const d = dirname(f)
       return d === "." ? "" : d + "/"
     }).filter(Boolean))].sort()
-    const choice = await projectileCompletingRead(editor, "Find directory: ", dirs, root, getCustom, "projectile-dir")
+    const choice = await projectileCompletingRead(editor, "Find directory: ", dirs, root, "projectile-dir")
     if (!choice) return
     await editor.run("dired", [join(root, choice)])
   }, "Jump to a project directory.")
 
   editor.command("projectile-find-test-file", async ({ editor, prefixArgument }) => {
-    const root = await acquireRoot(editor, getCustom)
+    const root = await acquireRoot(editor)
     if (!root) return
     maybeInvalidateCache(prefixArgument, root)
-    const files = (await projectileProjectFiles(root, spawnProcess, getCustom)).filter(testFilePredicate)
-    const choice = await projectileCompletingRead(editor, "Find test file: ", files, root, getCustom, "projectile-file")
+    const files = (await projectileProjectFiles(root)).filter(testFilePredicate)
+    const choice = await projectileCompletingRead(editor, "Find test file: ", files, root, "projectile-file")
     if (!choice) return
     await editor.openFile(join(root, choice))
   }, "Jump to a test file in the project.")
@@ -619,7 +570,7 @@ export async function install(editor: Editor): Promise<void> {
       return
     }
     const rel = path.startsWith(root) ? path.slice(root.length + 1) : basename(path)
-    const files = await projectileProjectFiles(root, spawnProcess, getCustom)
+    const files = await projectileProjectFiles(root)
     const target = testFilePredicate(rel)
       ? files.find(f => f === rel.replace(/_test(\.[^/]+)$/, "$1").replace(/\.test(\.[^/]+)$/, "$1").replace(/\/test\//, "/"))
       : files.find(f => f === complementaryTestPath(rel))
@@ -643,10 +594,10 @@ export async function install(editor: Editor): Promise<void> {
   })
 
   editor.command("projectile-find-file-in-known-projects", async ({ editor }) => {
-    const projects = await projectileKnownProjects(getCustom)
+    const projects = await projectileKnownProjects()
     const all: string[] = []
     for (const p of projects) {
-      const files = await projectileProjectFiles(p, spawnProcess, getCustom)
+      const files = await projectileProjectFiles(p)
       for (const f of files) all.push(join(p, f))
     }
     const choice = await editor.completingRead("Find file: ", { collection: all, history: "projectile-file" })
@@ -675,39 +626,45 @@ export async function install(editor: Editor): Promise<void> {
   }, "Find references in the project.")
 
   editor.command("projectile-vc", async ({ editor }) => {
-    const root = await acquireRoot(editor, getCustom)
+    const root = await acquireRoot(editor)
     if (!root) return
     await editor.run("dired", [root])
   }, "Open version control at project root.")
 
   editor.command("projectile-run-shell-command-in-root", async ({ editor, args }) => {
-    const root = await acquireRoot(editor, getCustom)
+    const compile = requireCompile(editor)
+    if (!compile) return
+    const root = await acquireRoot(editor)
     if (!root) return
-    const cmd = args[0] ?? await editor.prompt(prependProjectName("Run command: ", root, getCustom), "", "shell-command")
+    const cmd = args[0] ?? await editor.prompt(prependProjectName("Run command: ", root), "", "shell-command")
     if (!cmd) return
-    await compilationStart(editor, cmd, root)
+    await compile.compilationStart(editor, cmd, root)
   }, "Run a shell command at the project root.")
 
   editor.command("projectile-test-project", async ({ editor, args, prefixArgument }) => {
-    const root = await acquireRoot(editor, getCustom)
+    const compile = requireCompile(editor)
+    if (!compile) return
+    const root = await acquireRoot(editor)
     if (!root) return
     const cmd = args[0] ?? (prefixArgument != null ? await editor.prompt("Test command: ", "bun test", "compile-command") : "bun test")
-    await compilationStart(editor, cmd, root)
+    await compile.compilationStart(editor, cmd, root)
   }, "Run the project test command.")
 
-  editor.command("projectile-run-project", async ({ editor, args, prefixArgument }) => {
-    const root = await acquireRoot(editor, getCustom)
+  editor.command("projectile-run-project", async ({ editor, args }) => {
+    const compile = requireCompile(editor)
+    if (!compile) return
+    const root = await acquireRoot(editor)
     if (!root) return
     const cmd = args[0] ?? await editor.prompt("Run command: ", "", "compile-command")
     if (!cmd) return
-    await compilationStart(editor, cmd, root)
+    await compile.compilationStart(editor, cmd, root)
   }, "Run the project.")
 
   editor.command("projectile-commander", async ({ editor }) => {
     await editor.run("execute-extended-command")
   }, "Projectile commander (M-x fallback).")
 
-  const prefix = keymapPrefix(getCustom)
+  const prefix = keymapPrefix()
   for (const [suffix, command] of PROJECTILE_COMMAND_MAP) {
     projectileMap.bind(`${prefix} ${suffix}`, command)
   }
@@ -726,7 +683,7 @@ export async function install(editor: Editor): Promise<void> {
     const root = await projectileProjectRoot(dirname(path))
     if (!root) return
     if (getCustom<boolean>("projectile-track-known-projects-automatically")) {
-      await projectileAddKnownProject(root, getCustom)
+      await projectileAddKnownProject(root)
     }
     if (getCustom<boolean>("projectile-enable-caching") && projectsCache.has(root)) {
       const rel = path.startsWith(root) ? path.slice(root.length + 1) : null

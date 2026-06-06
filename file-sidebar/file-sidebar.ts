@@ -1,4 +1,3 @@
-import { homedir } from "node:os"
 import { basename, join, resolve } from "node:path"
 import {
   buildFileTree,
@@ -11,21 +10,15 @@ import {
 } from "./tree"
 import { projectileProjectFiles, projectileProjectRoot } from "../projectile/projectile"
 
-type Editor = import("../../jemacs-opentui/src/kernel/editor").Editor
-type BufferModel = import("../../jemacs-opentui/src/kernel/buffer").BufferModel
+import type { Editor, BufferModel } from "@jemacs/core"
+import { addHook, Keymap, findWindowLeaf, listWindowLeaves, defcustom, getCustom } from "@jemacs/core"
+import { defineMode } from "@jemacs/core/modes/mode"
+import { defineMinorMode } from "@jemacs/core/modes/minor-mode"
 
+// TODO: @jemacs/builtin-plugins — plugins/ is not part of @jemacs/core's export surface.
 type FileSidebarDeps = {
-  addHook: typeof import("../../jemacs-opentui/src/kernel/hooks").addHook
-  Keymap: typeof import("../../jemacs-opentui/src/kernel/keymap").Keymap
-  defineMode: typeof import("../../jemacs-opentui/src/modes/mode").defineMode
-  defineMinorMode: typeof import("../../jemacs-opentui/src/modes/minor-mode").defineMinorMode
-  findWindowLeaf: typeof import("../../jemacs-opentui/src/kernel/window").findWindowLeaf
-  listWindowLeaves: typeof import("../../jemacs-opentui/src/kernel/window").listWindowLeaves
-  defcustom: typeof import("../../jemacs-opentui/src/runtime/custom").defcustom
-  getCustom: typeof import("../../jemacs-opentui/src/runtime/custom").getCustom
-  spawnProcess: typeof import("../../jemacs-opentui/src/platform/runtime").spawnProcess
-  projectRoot: typeof import("../../jemacs-opentui/plugins/project/index").projectRoot
-  projectFiles: typeof import("../../jemacs-opentui/plugins/project/index").projectFiles
+  projectRoot: typeof import("@jemacs/core/../../plugins/project/index").projectRoot
+  projectFiles: typeof import("@jemacs/core/../../plugins/project/index").projectFiles
 }
 
 const SIDEBAR_BUFFER = "*File Sidebar*"
@@ -44,37 +37,6 @@ type EditorState = {
 const editorState = new WeakMap<Editor, EditorState>()
 const installedEditors = new WeakSet<Editor>()
 
-function jemacsHome(): string {
-  return process.env.JEMACS_HOME ?? join(homedir(), "programming", "jemacs", "jemacs-opentui")
-}
-
-async function loadDeps(): Promise<FileSidebarDeps> {
-  const home = jemacsHome()
-  const [hooks, keymap, mode, minor, window, custom, runtime, project] = await Promise.all([
-    import(join(home, "src/kernel/hooks.ts")),
-    import(join(home, "src/kernel/keymap.ts")),
-    import(join(home, "src/modes/mode.ts")),
-    import(join(home, "src/modes/minor-mode.ts")),
-    import(join(home, "src/kernel/window.ts")),
-    import(join(home, "src/runtime/custom.ts")),
-    import(join(home, "src/platform/runtime.ts")),
-    import(join(home, "plugins/project/index.ts")),
-  ])
-  return {
-    addHook: hooks.addHook,
-    Keymap: keymap.Keymap,
-    defineMode: mode.defineMode,
-    defineMinorMode: minor.defineMinorMode,
-    findWindowLeaf: window.findWindowLeaf,
-    listWindowLeaves: window.listWindowLeaves,
-    defcustom: custom.defcustom,
-    getCustom: custom.getCustom,
-    spawnProcess: runtime.spawnProcess,
-    projectRoot: project.projectRoot,
-    projectFiles: project.projectFiles,
-  }
-}
-
 function st(editor: Editor): EditorState {
   let s = editorState.get(editor)
   if (!s) {
@@ -84,17 +46,17 @@ function st(editor: Editor): EditorState {
   return s
 }
 
-function sidebarWidthRatio(getCustom: FileSidebarDeps["getCustom"]): number {
+function sidebarWidthRatio(): number {
   const width = getCustom<number>("file-sidebar-width") ?? 28
   return Math.max(0.12, Math.min(0.45, width / 100))
 }
 
-async function resolveProject(editor: Editor, deps: FileSidebarDeps): Promise<{ root: string; files: string[] } | null> {
+async function resolveProject(editor: Editor, deps?: FileSidebarDeps): Promise<{ root: string; files: string[] } | null> {
   const start = editor.currentBuffer.directory() ?? process.cwd()
-  const root = await projectileProjectRoot(start) ?? await deps.projectRoot(start)
+  const root = await projectileProjectRoot(start) ?? (deps ? await deps.projectRoot(start) : null)
   if (!root) return null
-  const files = await projectileProjectFiles(root, deps.spawnProcess, deps.getCustom)
-    .catch(async () => deps.projectFiles(root))
+  const files = await projectileProjectFiles(root)
+    .catch(async () => deps ? deps.projectFiles(root) : [])
   return { root, files }
 }
 
@@ -102,7 +64,7 @@ function sidebarBuffer(editor: Editor): BufferModel | undefined {
   return [...editor.buffers.values()].find(b => b.name === SIDEBAR_BUFFER)
 }
 
-function findSidebarWindow(editor: Editor, listWindowLeaves: FileSidebarDeps["listWindowLeaves"]): string | null {
+function findSidebarWindow(editor: Editor): string | null {
   const buffer = sidebarBuffer(editor)
   if (!buffer) return null
   for (const leaf of listWindowLeaves(editor.windowLayout)) {
@@ -148,7 +110,7 @@ function paintSidebarBuffer(buffer: BufferModel): void {
   buffer.readOnly = wasReadOnly
 }
 
-async function refreshSidebar(editor: Editor, deps: FileSidebarDeps, buffer = sidebarBuffer(editor)): Promise<void> {
+async function refreshSidebar(editor: Editor, deps: FileSidebarDeps | undefined, buffer = sidebarBuffer(editor)): Promise<void> {
   if (!buffer) return
   const previousHighlight = buffer.locals.get(SIDEBAR_HIGHLIGHT) as string | undefined
   const previousExpanded = buffer.locals.get(SIDEBAR_EXPANDED) as Set<string> | undefined
@@ -202,8 +164,8 @@ function syncSidebarHighlight(editor: Editor, buffer = sidebarBuffer(editor)): v
   paintSidebarBuffer(buffer)
 }
 
-async function showSidebar(editor: Editor, deps: FileSidebarDeps): Promise<void> {
-  const existing = findSidebarWindow(editor, deps.listWindowLeaves)
+async function showSidebar(editor: Editor, deps?: FileSidebarDeps): Promise<void> {
+  const existing = findSidebarWindow(editor)
   if (existing) {
     st(editor).sidebarWindowId = existing
     const buf = sidebarBuffer(editor)
@@ -230,8 +192,9 @@ async function showSidebar(editor: Editor, deps: FileSidebarDeps): Promise<void>
   }
   buffer.readOnly = true
   editor.setSelectedWindowDedicated(true)
-  if (typeof editor.setWindowSplitRatio === "function") {
-    editor.setWindowSplitRatio(sidebarWindowId, sidebarWidthRatio(deps.getCustom))
+  const setRatio = (editor as { setWindowSplitRatio?: (id: string, ratio: number) => void }).setWindowSplitRatio
+  if (typeof setRatio === "function") {
+    setRatio.call(editor, sidebarWindowId, sidebarWidthRatio())
   }
 
   st(editor).sidebarWindowId = sidebarWindowId
@@ -242,17 +205,17 @@ async function showSidebar(editor: Editor, deps: FileSidebarDeps): Promise<void>
   syncSidebarHighlight(editor, buffer)
 }
 
-function hideSidebar(editor: Editor, deps: FileSidebarDeps): void {
-  const sidebarWindowId = findSidebarWindow(editor, deps.listWindowLeaves) ?? st(editor).sidebarWindowId
+function hideSidebar(editor: Editor): void {
+  const sidebarWindowId = findSidebarWindow(editor) ?? st(editor).sidebarWindowId
   if (!sidebarWindowId) return
   const mainWindowId = st(editor).mainWindowId
-  if (mainWindowId && deps.findWindowLeaf(editor.windowLayout, mainWindowId)) {
+  if (mainWindowId && findWindowLeaf(editor.windowLayout, mainWindowId)) {
     editor.selectWindow(mainWindowId)
   } else {
-    const other = deps.listWindowLeaves(editor.windowLayout).find(leaf => leaf.id !== sidebarWindowId)
+    const other = listWindowLeaves(editor.windowLayout).find(leaf => leaf.id !== sidebarWindowId)
     if (other) editor.selectWindow(other.id)
   }
-  if (deps.listWindowLeaves(editor.windowLayout).length > 1) {
+  if (listWindowLeaves(editor.windowLayout).length > 1) {
     editor.selectWindow(sidebarWindowId)
     editor.deleteWindow()
   }
@@ -274,7 +237,7 @@ function toggleNodeAtPoint(editor: Editor, buffer: BufferModel): void {
   void editor.changed("file-sidebar-toggle")
 }
 
-async function openAtPoint(editor: Editor, deps: FileSidebarDeps, buffer: BufferModel): Promise<void> {
+async function openAtPoint(editor: Editor, buffer: BufferModel): Promise<void> {
   const line = lineAtPoint(buffer)
   if (!line) return
   if (line.isDirectory) {
@@ -285,15 +248,15 @@ async function openAtPoint(editor: Editor, deps: FileSidebarDeps, buffer: Buffer
   if (!projectRootPath) return
   const path = join(projectRootPath, line.relPath)
   const mainWindowId = st(editor).mainWindowId
-  if (mainWindowId && deps.findWindowLeaf(editor.windowLayout, mainWindowId)) {
+  if (mainWindowId && findWindowLeaf(editor.windowLayout, mainWindowId)) {
     editor.selectWindow(mainWindowId)
   }
   await editor.openFile(path)
   syncSidebarHighlight(editor, buffer)
 }
 
-function installSidebarMode(deps: FileSidebarDeps): void {
-  const keymap = new deps.Keymap("file-sidebar-tree-map")
+function installSidebarMode(): void {
+  const keymap = new Keymap("file-sidebar-tree-map")
   keymap.bind("return", "file-sidebar-open")
   keymap.bind("enter", "file-sidebar-open")
   keymap.bind("RET", "file-sidebar-open")
@@ -306,7 +269,7 @@ function installSidebarMode(deps: FileSidebarDeps): void {
   keymap.bind("p", "previous-line")
   keymap.bind("C-n", "next-line")
   keymap.bind("C-p", "previous-line")
-  deps.defineMode({
+  defineMode({
     name: SIDEBAR_TREE,
     parent: "text",
     keymap,
@@ -321,14 +284,13 @@ function installSidebarMode(deps: FileSidebarDeps): void {
   })
 }
 
-export async function install(editor: Editor): Promise<void> {
-  const deps = await loadDeps()
-  installSidebarMode(deps)
+export async function install(editor: Editor, deps?: FileSidebarDeps): Promise<void> {
+  installSidebarMode()
 
-  deps.defcustom("file-sidebar-width", "number", 28,
+  defcustom("file-sidebar-width", "number", 28,
     "Sidebar width as a percentage of the frame (12–45).")
 
-  deps.defineMinorMode({
+  defineMinorMode({
     name: "file-sidebar-mode",
     lighter: " Sidebar",
     global: true,
@@ -336,7 +298,7 @@ export async function install(editor: Editor): Promise<void> {
       void showSidebar(ed, deps)
     },
     onDisable: ed => {
-      hideSidebar(ed, deps)
+      hideSidebar(ed)
     },
   })
 
@@ -356,7 +318,7 @@ export async function install(editor: Editor): Promise<void> {
 
   editor.command("file-sidebar-hide", ({ editor }) => {
     if (editor.isMinorModeEnabled("file-sidebar-mode")) editor.disableMinorMode("file-sidebar-mode")
-    else hideSidebar(editor, deps)
+    else hideSidebar(editor)
   }, "Hide the projectile file sidebar.")
 
   editor.command("file-sidebar-refresh", async ({ editor, buffer }) => {
@@ -371,23 +333,23 @@ export async function install(editor: Editor): Promise<void> {
 
   editor.command("file-sidebar-open", async ({ editor, buffer }) => {
     if (buffer.mode !== SIDEBAR_TREE) return
-    await openAtPoint(editor, deps, buffer)
+    await openAtPoint(editor, buffer)
   }, "Open the file at point, or toggle a directory, in the file sidebar.")
 
   editor.command("file-sidebar-focus-main", ({ editor }) => {
     const mainWindowId = st(editor).mainWindowId
-    if (mainWindowId && deps.findWindowLeaf(editor.windowLayout, mainWindowId)) {
+    if (mainWindowId && findWindowLeaf(editor.windowLayout, mainWindowId)) {
       editor.selectWindow(mainWindowId)
       return
     }
-    const sidebarWindowId = findSidebarWindow(editor, deps.listWindowLeaves)
-    const other = deps.listWindowLeaves(editor.windowLayout).find(leaf => leaf.id !== sidebarWindowId)
+    const sidebarWindowId = findSidebarWindow(editor)
+    const other = listWindowLeaves(editor.windowLayout).find(leaf => leaf.id !== sidebarWindowId)
     if (other) editor.selectWindow(other.id)
   }, "Move focus from the file sidebar to the main editing window.")
 
   editor.key("C-c C-b", "file-sidebar-mode")
 
-  deps.addHook("find-file-hook", async ({ editor }) => {
+  addHook("find-file-hook", async ({ editor }) => {
     if (!editor.isMinorModeEnabled("file-sidebar-mode")) return
     const buffer = sidebarBuffer(editor)
     if (!buffer) return

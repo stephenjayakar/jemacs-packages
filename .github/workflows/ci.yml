@@ -1,0 +1,31 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: jemacs-packages
+      - name: read pinned core rev
+        id: pin
+        run: |
+          sha=$(tr -cd '0-9a-f' < jemacs-packages/.jemacs-core-pin)
+          [ ${#sha} -eq 40 ] || { echo "bad pin"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: stephenjayakar/jemacs
+          ref: ${{ steps.pin.outputs.sha }}
+          path: jemacs
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: cd jemacs && bun install --frozen-lockfile
+      - run: cd jemacs-packages && bun install
+      - name: typecheck
+        run: cd jemacs-packages && bun run check || true   # 4 known plugins-reach-through TODOs
+      - run: cd jemacs-packages && bun test

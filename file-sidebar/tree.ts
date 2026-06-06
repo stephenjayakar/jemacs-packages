@@ -1,4 +1,4 @@
-import type { TextSpan } from "../../jemacs-opentui/src/modes/mode"
+import type { TextSpan } from "@jemacs/core/modes/mode"
 
 export type FileTreeNode = {
   name: string
