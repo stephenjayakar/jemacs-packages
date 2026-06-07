@@ -20,11 +20,11 @@ jobs:
         with:
           repository: stephenjayakar/jemacs
           ref: ${{ steps.pin.outputs.sha }}
-          path: jemacs
+          path: jemacs-opentui
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - run: cd jemacs && bun install --frozen-lockfile
+      - run: cd jemacs-opentui && bun install --frozen-lockfile
       - run: cd jemacs-packages && bun install
       - name: typecheck
         run: cd jemacs-packages && bun run check || true   # 4 known plugins-reach-through TODOs
