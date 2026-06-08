@@ -73,6 +73,7 @@ export async function runJagentAgent(
           editor,
           cwd: state.cwd,
           bashTimeoutMs: settings.bashTimeoutMs,
+          sessionBufferId: state.buffer.id,
         })
         event(state, { type: "tool_end", result, at: at() })
         state.messages.push({

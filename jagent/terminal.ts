@@ -1,6 +1,6 @@
 import { homedir } from "node:os"
 import { join } from "node:path"
-import type { BufferModel, Editor } from "@jemacs/core"
+import { BufferModel, type Editor } from "@jemacs/core"
 
 type JtermModule = {
   spawnSession: (
@@ -28,6 +28,10 @@ export type JagentTerminalRun = {
   exitCode: number | null
   timedOut: boolean
   elapsedMs: number
+}
+
+export type JagentTerminalDisplayOptions = {
+  keepBufferId?: string
 }
 
 const JAGENT_TERMINAL_BUFFER = "*Jagent Terminal*"
@@ -72,10 +76,26 @@ function sleep(ms: number): Promise<void> {
 
 export async function ensureJagentTerminal(editor: Editor, cwd: string): Promise<BufferModel> {
   let buffer = terminalBuffer(editor)
-  if (!buffer) buffer = editor.scratch(JAGENT_TERMINAL_BUFFER, "", "jterm-mode")
+  if (!buffer) {
+    buffer = new BufferModel({ name: JAGENT_TERMINAL_BUFFER, text: "", kind: "scratch", mode: "jterm-mode" })
+    editor.addBuffer(buffer)
+    editor.enterMode(buffer, "jterm-mode")
+  }
   else editor.enterMode(buffer, "jterm-mode")
   buffer.locals.set("default-directory", cwd)
   return buffer
+}
+
+function showTerminalPane(editor: Editor, buffer: BufferModel, options: JagentTerminalDisplayOptions = {}): void {
+  const originalWindowId = editor.selectedWindowId
+  editor.displayBufferInOtherWindow(buffer.id, { select: false })
+  if (options.keepBufferId && editor.currentBufferId !== options.keepBufferId) {
+    const keepBuffer = editor.buffers.get(options.keepBufferId)
+    if (keepBuffer) editor.switchToBuffer(keepBuffer.id)
+  }
+  else {
+    editor.selectWindow(originalWindowId)
+  }
 }
 
 export async function runCommandInJterm(
@@ -83,6 +103,7 @@ export async function runCommandInJterm(
   command: string,
   cwd: string,
   timeoutMs: number,
+  options: JagentTerminalDisplayOptions = {},
 ): Promise<JagentTerminalRun> {
   const jterm = await loadJterm()
   const buffer = await ensureJagentTerminal(editor, cwd)
@@ -93,7 +114,7 @@ export async function runCommandInJterm(
   buffer.setText(`$ ${command}\n`, false)
   buffer.readOnly = true
   buffer.locals.set(JTERM_SESSION_LOCAL, true)
-  editor.switchToBuffer(buffer.id)
+  showTerminalPane(editor, buffer, options)
 
   const { rows, cols } = bodyDims(buffer)
   const started = Date.now()

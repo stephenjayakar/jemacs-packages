@@ -8,6 +8,7 @@ type ToolContext = {
   editor: Editor
   cwd: string
   bashTimeoutMs: number
+  sessionBufferId?: string
 }
 
 function asString(value: unknown, fallback = ""): string {
@@ -83,7 +84,9 @@ async function grepTool(call: JagentToolCall, ctx: ToolContext): Promise<string>
   const path = asString(call.args.path, ".")
   const maxMatches = Math.max(1, asNumber(call.args.maxMatches, 120))
   const command = `rg -n --color=never -- ${shellQuote(pattern)} ${shellQuote(path)} | head -n ${maxMatches}`
-  const result = await runCommandInJterm(ctx.editor, command, ctx.cwd, ctx.bashTimeoutMs)
+  const result = await runCommandInJterm(ctx.editor, command, ctx.cwd, ctx.bashTimeoutMs, {
+    keepBufferId: ctx.sessionBufferId,
+  })
   return result.output || "(no matches)"
 }
 
@@ -91,7 +94,9 @@ async function bashTool(call: JagentToolCall, ctx: ToolContext): Promise<string>
   const command = asString(call.args.command)
   if (!command) throw new Error("command is required")
   const timeoutMs = Math.max(1_000, asNumber(call.args.timeoutMs, ctx.bashTimeoutMs))
-  const result = await runCommandInJterm(ctx.editor, command, ctx.cwd, timeoutMs)
+  const result = await runCommandInJterm(ctx.editor, command, ctx.cwd, timeoutMs, {
+    keepBufferId: ctx.sessionBufferId,
+  })
   const suffix = result.timedOut
     ? `\n[timeout after ${result.elapsedMs} ms]`
     : `\n[exit ${result.exitCode ?? "?"}, ${result.elapsedMs} ms]`
