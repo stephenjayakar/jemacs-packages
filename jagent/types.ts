@@ -1,8 +1,40 @@
-export type JagentProviderName = "auto" | "gemini" | "openai" | "anthropic"
+export type JagentBuiltInProviderName = "gemini" | "openai" | "anthropic" | "mock"
+export type JagentProviderName = "auto" | JagentBuiltInProviderName | (string & {})
+
+export type JagentProviderKind =
+  | JagentBuiltInProviderName
+  | "openai-compatible"
+
+export type JagentMockResponse =
+  | string
+  | {
+    content?: string
+    toolCalls?: JagentToolCall[]
+    model?: string
+  }
+
+export type JagentCustomProvider = {
+  kind?: JagentProviderKind
+  apiKey?: string
+  apiKeyEnv?: string
+  baseURL?: string
+  headers?: Record<string, string>
+  defaultModel?: string
+  systemPrompt?: string
+  modelSystemPrompts?: Record<string, string>
+  mockResponses?: JagentMockResponse[]
+}
 
 export type JagentSettings = {
   provider: JagentProviderName
+  defaultProvider: JagentProviderName
   model: string
+  defaultModel: string
+  systemPrompt: string
+  providerSystemPrompts: Record<string, string>
+  modelSystemPrompts: Record<string, string>
+  customProviders: Record<string, JagentCustomProvider>
+  mockResponses: JagentMockResponse[]
   apiKeys: {
     gemini: string
     openai: string

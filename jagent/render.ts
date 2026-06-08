@@ -1,5 +1,6 @@
 import type { BufferModel } from "@jemacs/core"
 import type { FaceName, TextSpan } from "@jemacs/core/modes/mode"
+import { describeJagentSettings } from "./provider"
 import type { JagentEvent, JagentMessage, JagentSettings, JagentToolResult } from "./types"
 
 export const JAGENT_SECTIONS = "jagent-sections"
@@ -83,11 +84,11 @@ export function renderJagentTranscript(
 ): Rendered {
   const sections: JagentSection[] = []
   const state = { text: "" }
-  const modelLabel = `${settings.provider}/${settings.model || "default"}`
+  const modelLabel = describeJagentSettings(settings)
 
   push(sections, state, divider("Jagent Agent", `${modelLabel} @ ${cwd}`), "banner")
   push(sections, state,
-    "i/RET prompt  b buffer context  a abort  c clear  t terminal  g redraw  q bury\n\n",
+    "i/RET prompt  b buffer context  s sessions  n new session  a abort  c clear  t terminal  g redraw  q bury\n\n",
     "muted")
 
   const recentEvents = events.slice(-5)
