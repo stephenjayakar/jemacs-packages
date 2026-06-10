@@ -1532,6 +1532,25 @@ function applyTransientArgs(editor: Editor, deps: GptelDeps, args: string[]): vo
   }
 }
 
+function transientValue(args: string[], flag: string): string | undefined {
+  const index = args.findIndex(arg => arg === flag)
+  return index >= 0 ? args[index + 1] : undefined
+}
+
+function positionalArgs(args: string[]): string[] {
+  const values: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!
+    if (arg.startsWith("--tool=")) continue
+    if (arg.startsWith("--")) {
+      if (args[i + 1] && !args[i + 1]!.startsWith("--")) i++
+      continue
+    }
+    values.push(arg)
+  }
+  return values
+}
+
 async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferModel, args: string[] = [], priorVariants: string[] = []): Promise<void> {
   applyTransientArgs(editor, deps, args)
   const markers = chatMarkers(deps)
@@ -1905,6 +1924,95 @@ function describeState(editor: Editor, deps: GptelDeps): string {
   ].join("\n")
 }
 
+function knownDirectives(): Record<string, string> {
+  return {
+    default: "You are a helpful assistant.",
+    concise: "You are a helpful assistant. Answer as concisely as possible.",
+    shell: "Reply only with shell commands and no prose.",
+    poet: "You are a poet. Reply only in verse.",
+    code: "You are a careful programming assistant. Prefer small, correct patches and explain tradeoffs briefly.",
+    rewrite: "You are a writing assistant. Rewrite the provided text according to the user's instruction and return only the replacement text.",
+  }
+}
+
+function directiveNames(): string[] {
+  return Object.keys(knownDirectives())
+}
+
+function gptelToolsDefinition(editor: Editor, deps: GptelDeps): TransientDefinition {
+  const selected = new Set((deps.getCustom<string>("gptel-tools") ?? "").split(/[, ]+/).filter(Boolean))
+  const toolInfixes = [...state(editor).tools.values()].sort((a, b) => a.name.localeCompare(b.name)).map((tool, index) => ({
+    key: String(index + 1),
+    label: tool.description ? `${tool.name} - ${tool.description}` : tool.name,
+    argument: `--tool=${tool.name}`,
+    kind: "toggle" as const,
+    defaultValue: selected.has(tool.name),
+  }))
+  return {
+    name: "gptel-tools",
+    title: "gptel tools",
+    groups: [
+      {
+        title: "Options",
+        infixes: [
+          { key: "-u", label: "Use tools", argument: "--use-tools", kind: "toggle", defaultValue: deps.getCustom<boolean | string>("gptel-use-tools") !== false },
+          { key: "-c", label: "Confirm calls", argument: "--confirm-tools", kind: "toggle", defaultValue: deps.getCustom<boolean>("gptel-confirm-tool-calls") !== false },
+          { key: "-i", label: "Include results", argument: "--include-tool-results", kind: "value", defaultValue: String(deps.getCustom<boolean | string>("gptel-include-tool-results") ?? "auto") },
+        ],
+      },
+      {
+        title: "Registered Tools",
+        infixes: toolInfixes,
+        suffixes: [
+          { key: "RET", label: "Apply", command: "gptel-tools-apply" },
+        ],
+      },
+    ],
+  }
+}
+
+const gptelSystemPromptDefinition: TransientDefinition = {
+  name: "gptel-system-prompt",
+  title: "gptel system prompt",
+  groups: [
+    {
+      title: "Edit",
+      infixes: [
+        { key: "-s", label: "System prompt", argument: "--system", kind: "value" },
+      ],
+      suffixes: [
+        { key: "RET", label: "Set prompt", command: "gptel-system-prompt-set" },
+      ],
+    },
+    {
+      title: "Directives",
+      suffixes: directiveNames().map((name, index) => ({ key: String(index + 1), label: name, command: "gptel-system-prompt-set", args: [name] })),
+    },
+  ],
+}
+
+const gptelRewriteDefinition: TransientDefinition = {
+  name: "gptel-rewrite",
+  title: "gptel rewrite",
+  groups: [
+    {
+      title: "Rewrite",
+      infixes: [
+        { key: "-i", label: "Instruction", argument: "--instruction", kind: "value" },
+      ],
+      suffixes: [
+        { key: "r", label: "Rewrite", command: "gptel-rewrite-run" },
+        { key: "a", label: "Accept", command: "gptel-rewrite-accept" },
+        { key: "k", label: "Reject", command: "gptel-rewrite-reject" },
+      ],
+    },
+    {
+      title: "Directives",
+      suffixes: directiveNames().map((name, index) => ({ key: String(index + 1), label: name, command: "gptel-rewrite-run", args: [name] })),
+    },
+  ],
+}
+
 const gptelMenuDefinition: TransientDefinition = {
   name: "gptel-menu",
   title: "gptel",
@@ -1920,7 +2028,7 @@ const gptelMenuDefinition: TransientDefinition = {
         { key: "-T", label: "Tools", argument: "--tools", kind: "value" },
         { key: "-S", label: "Schema", argument: "--schema", kind: "value" },
         { key: "-v", label: "Reasoning", argument: "--reasoning", kind: "value" },
-        { key: "-S", label: "No stream", argument: "--no-stream", kind: "toggle" },
+        { key: "-x", label: "No stream", argument: "--no-stream", kind: "toggle" },
       ],
     },
     {
@@ -2294,10 +2402,24 @@ export async function install(editor: Editor): Promise<void> {
   }, "Remove gptel context for this buffer or current context entry.")
 
   editor.command("gptel-rewrite", async ({ editor, buffer, args }) => {
-    const instruction = args.join(" ") || await editor.prompt("Rewrite instruction: ", "Improve clarity while preserving meaning.", "gptel-rewrite")
+    applyTransientArgs(editor, deps, args)
+    if (buffer.useRegion()) {
+      const instruction = positionalArgs(args).join(" ") || await editor.prompt("Rewrite instruction: ", "Improve clarity while preserving meaning.", "gptel-rewrite")
+      if (!instruction) return
+      await rewriteRegion(editor, deps, buffer, instruction)
+      return
+    }
+    editor.openTransient(gptelRewriteDefinition)
+  }, "Rewrite the active region using gptel.")
+
+  editor.command("gptel-rewrite-run", async ({ editor, buffer, args }) => {
+    applyTransientArgs(editor, deps, args)
+    const directive = positionalArgs(args).find(arg => knownDirectives()[arg])
+    const instruction = transientValue(args, "--instruction")
+      ?? (directive ? knownDirectives()[directive] : await editor.prompt("Rewrite instruction: ", "Improve clarity while preserving meaning.", "gptel-rewrite"))
     if (!instruction) return
     await rewriteRegion(editor, deps, buffer, instruction)
-  }, "Rewrite the active region using gptel.")
+  }, "Run a gptel rewrite from the rewrite transient.")
 
   editor.command("gptel-rewrite-accept", ({ editor }) => {
     acceptRewrite(editor)
@@ -2369,9 +2491,19 @@ export async function install(editor: Editor): Promise<void> {
     if (name) await applyPreset(editor, deps, name)
   }, "Apply a gptel preset.")
 
-  editor.command("gptel-system-prompt", async ({ editor }) => {
-    const prompt = await editor.prompt("System prompt: ", deps.getCustom<string>("gptel-system-message") ?? "", "gptel-system")
+  editor.command("gptel-system-prompt", ({ editor }) => {
+    editor.openTransient(gptelSystemPromptDefinition)
+  }, "Open the gptel system prompt transient.")
+
+  editor.command("gptel-system-prompt-set", async ({ editor, args }) => {
+    applyTransientArgs(editor, deps, args)
+    const directive = positionalArgs(args).find(arg => knownDirectives()[arg])
+    const promptFromArgs = transientValue(args, "--system")
+    const prompt = directive
+      ? knownDirectives()[directive]
+      : promptFromArgs ?? await editor.prompt("System prompt: ", deps.getCustom<string>("gptel-system-message") ?? "", "gptel-system")
     if (prompt != null) deps.setCustom("gptel-system-message", prompt)
+    editor.message("gptel: system prompt set")
   }, "Set the gptel system prompt.")
 
   editor.command("gptel-tools", async ({ editor, args }) => {
@@ -2380,11 +2512,32 @@ export async function install(editor: Editor): Promise<void> {
       editor.message("gptel: no tools registered")
       return
     }
+    if (!args.length) {
+      editor.openTransient(gptelToolsDefinition(editor, deps))
+      return
+    }
     const current = deps.getCustom<string>("gptel-tools") ?? ""
     const value = args.join(" ") || await editor.prompt("Tools (comma/space separated): ", current, "gptel-tools")
     if (value != null) deps.setCustom("gptel-tools", value)
     editor.message(`gptel tools: ${deps.getCustom<string>("gptel-tools") || "(none)"}`)
   }, "Set active gptel tools by name.")
+
+  editor.command("gptel-tools-apply", ({ editor, args }) => {
+    const selected: string[] = []
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i]!
+      if (arg === "--use-tools") deps.setCustom("gptel-use-tools", true)
+      else if (arg === "--confirm-tools") deps.setCustom("gptel-confirm-tool-calls", true)
+      else if (arg === "--include-tool-results") {
+        const value = args[++i]
+        if (value != null) deps.setCustom("gptel-include-tool-results", value)
+      } else if (arg.startsWith("--tool=")) {
+        selected.push(arg.slice("--tool=".length))
+      }
+    }
+    deps.setCustom("gptel-tools", selected.join(","))
+    editor.message(`gptel tools: ${selected.join(", ") || "(none)"}`)
+  }, "Apply active tools from the gptel tools transient.")
 
   editor.command("gptel-openai-oauth-login", async ({ editor, args }) => {
     const token = args.join(" ") || await editor.prompt("OpenAI OAuth token: ", "", "gptel-openai-oauth-token")

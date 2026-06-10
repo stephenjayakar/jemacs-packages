@@ -40,7 +40,7 @@ import {
   type GptelBackend,
   type GptelMessage,
 } from "./gptel"
-import { BufferModel, Editor, setCustom } from "@jemacs/core"
+import { BufferModel, Editor, getCustom, setCustom } from "@jemacs/core"
 
 test("default backends include Stephen's configured Claude backend", () => {
   const claude = defaultBackends().find(backend => backend.name === "Claude")
@@ -414,6 +414,39 @@ test("gptel-send honors custom prompt and response markers", async () => {
   setCustom("gptel-prompt-prefix", "User:\n")
   setCustom("gptel-response-prefix", "Assistant:\n")
   setCustom("gptel-response-separator", "\n\n")
+})
+
+test("gptel transient commands expose submenus and apply selected values", async () => {
+  const editor = new Editor()
+  await install(editor)
+  await editor.run("gptel-menu")
+  const menuKeys = editor.transient?.definition.groups.flatMap(group => [
+    ...(group.infixes ?? []).map(infix => infix.key),
+    ...(group.suffixes ?? []).map(suffix => suffix.key),
+  ]) ?? []
+  expect(menuKeys.filter(key => key === "-S")).toHaveLength(1)
+  expect(menuKeys).toContain("-x")
+
+  await editor.run("gptel-system-prompt")
+  expect(editor.transient?.definition.name).toBe("gptel-system-prompt")
+  await editor.run("gptel-system-prompt-set", ["shell"])
+  expect(getCustom<string>("gptel-system-message")).toBe("Reply only with shell commands and no prose.")
+
+  gptelMakeTool(editor, {
+    name: "lookup",
+    description: "search docs",
+    function: () => "ok",
+  })
+  await editor.run("gptel-tools")
+  expect(editor.transient?.definition.name).toBe("gptel-tools")
+  await editor.run("gptel-tools-apply", ["--tool=lookup", "--include-tool-results", "true"])
+  expect(getCustom<string>("gptel-tools")).toBe("lookup")
+  expect(getCustom<string>("gptel-include-tool-results")).toBe("true")
+
+  const buffer = editor.scratch("*rewrite-menu*", "no region", "text")
+  editor.switchToBuffer(buffer.id)
+  await editor.run("gptel-rewrite")
+  expect(editor.transient?.definition.name).toBe("gptel-rewrite")
 })
 
 test("gptel response navigation and marking use response ranges", async () => {
