@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { defaultBackends, extractPrompt, parseSseEvents, renderContext } from "./gptel"
+import { defaultBackends, extractPrompt, parseSseEvents, renderContext, toolCallsFromJson, type GptelBackend } from "./gptel"
 import { BufferModel } from "@jemacs/core"
 
 test("default backends include Stephen's configured Claude backend", () => {
@@ -33,4 +33,32 @@ test("renderContext includes buffers and files", () => {
 
 test("parseSseEvents joins data lines", () => {
   expect(parseSseEvents("data: one\ndata: two\n\n: ping\n\ndata: three\n\n")).toEqual(["one\ntwo", "three"])
+})
+
+test("toolCallsFromJson parses OpenAI chat tool calls", () => {
+  const backend = { name: "ChatGPT", kind: "openai", models: ["gpt-4.1"] } satisfies GptelBackend
+  expect(toolCallsFromJson(backend, {
+    choices: [{
+      message: {
+        tool_calls: [{
+          id: "call_1",
+          function: { name: "read_file", arguments: "{\"path\":\"a.ts\"}" },
+        }],
+      },
+    }],
+  })).toEqual([{ id: "call_1", name: "read_file", arguments: { path: "a.ts" } }])
+})
+
+test("toolCallsFromJson parses OpenAI Responses function calls", () => {
+  const backend = { name: "Responses", kind: "openai-responses", models: ["gpt-4.1"] } satisfies GptelBackend
+  expect(toolCallsFromJson(backend, {
+    output: [{ type: "function_call", call_id: "call_2", name: "grep", arguments: "{\"pattern\":\"x\"}" }],
+  })).toEqual([{ id: "call_2", name: "grep", arguments: { pattern: "x" } }])
+})
+
+test("toolCallsFromJson parses Anthropic tool_use blocks", () => {
+  const backend = { name: "Claude", kind: "anthropic", models: ["claude"] } satisfies GptelBackend
+  expect(toolCallsFromJson(backend, {
+    content: [{ type: "tool_use", id: "toolu_1", name: "bash", input: { command: "pwd" } }],
+  })).toEqual([{ id: "toolu_1", name: "bash", arguments: { command: "pwd" } }])
 })

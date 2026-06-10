@@ -2,11 +2,18 @@ export { install } from "./gptel"
 export {
   defaultBackends,
   extractPrompt,
+  gptelMakeAnthropic,
+  gptelMakeGemini,
+  gptelMakeOpenAI,
+  gptelMakePreset,
+  gptelMakeTool,
   parseSseEvents,
   renderContext,
+  toolCallsFromJson,
   type GptelBackend,
   type GptelContextItem,
   type GptelMessage,
   type GptelPreset,
   type GptelTool,
+  type GptelToolCall,
 } from "./gptel"

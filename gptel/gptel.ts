@@ -1,6 +1,6 @@
-import { existsSync, readFileSync, statSync } from "node:fs"
+import { readFileSync, statSync } from "node:fs"
 import { readdir, readFile, stat } from "node:fs/promises"
-import { basename, dirname, join, resolve } from "node:path"
+import { join, resolve } from "node:path"
 import { homedir } from "node:os"
 import type { BufferModel } from "../../jemacs-opentui/src/kernel/buffer"
 import type { Editor, TransientDefinition } from "../../jemacs-opentui/src/kernel/editor"
@@ -21,6 +21,7 @@ export type GptelMessage = {
   content: string
   name?: string
   toolCallId?: string
+  toolCalls?: GptelToolCall[]
 }
 
 export type GptelBackendKind =
@@ -60,6 +61,12 @@ export type GptelTool = {
   function: (args: unknown, ctx: { editor: Editor; buffer: BufferModel }) => unknown | Promise<unknown>
 }
 
+export type GptelToolCall = {
+  id: string
+  name: string
+  arguments: unknown
+}
+
 export type GptelPreset = {
   name: string
   description?: string
@@ -91,6 +98,7 @@ type RequestResult = {
   text: string
   raw?: unknown
   usage?: Record<string, unknown>
+  toolCalls?: GptelToolCall[]
 }
 
 const STATE_KEY = "gptel-state"
@@ -335,7 +343,89 @@ function replaceWritable(buffer: BufferModel, start: number, end: number, text: 
   buffer.readOnly = wasReadOnly
 }
 
-function requestBody(backend: GptelBackend, model: string, messages: GptelMessage[], deps: GptelDeps, stream: boolean): unknown {
+function selectedTools(editor: Editor, deps: GptelDeps): GptelTool[] {
+  const st = state(editor)
+  const names = deps.getCustom<string>("gptel-tools")
+    ?.split(/[, ]+/)
+    .map(name => name.trim())
+    .filter(Boolean)
+  if (!names?.length) return []
+  return names.map(name => st.tools.get(name)).filter((tool): tool is GptelTool => Boolean(tool))
+}
+
+function openAiTool(tool: GptelTool): unknown {
+  return {
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters ?? { type: "object", properties: {} },
+    },
+  }
+}
+
+function anthropicTool(tool: GptelTool): unknown {
+  return {
+    name: tool.name,
+    description: tool.description,
+    input_schema: tool.parameters ?? { type: "object", properties: {} },
+  }
+}
+
+function openAiMessages(messages: GptelMessage[]): unknown[] {
+  return messages.map(message => {
+    if (message.role === "tool") {
+      return {
+        role: "tool",
+        tool_call_id: message.toolCallId,
+        name: message.name,
+        content: message.content,
+      }
+    }
+    const base: Record<string, unknown> = { role: message.role, content: message.content }
+    if (message.toolCalls?.length) {
+      base.tool_calls = message.toolCalls.map(call => ({
+        id: call.id,
+        type: "function",
+        function: { name: call.name, arguments: JSON.stringify(call.arguments ?? {}) },
+      }))
+    }
+    return base
+  })
+}
+
+function anthropicMessages(messages: GptelMessage[]): unknown[] {
+  return messages.filter(m => m.role !== "system").map(message => {
+    if (message.role === "tool") {
+      return {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: message.toolCallId,
+          content: message.content,
+        }],
+      }
+    }
+    if (message.toolCalls?.length) {
+      const content: unknown[] = []
+      if (message.content) content.push({ type: "text", text: message.content })
+      for (const call of message.toolCalls) {
+        content.push({ type: "tool_use", id: call.id, name: call.name, input: call.arguments ?? {} })
+      }
+      return { role: "assistant", content }
+    }
+    return { role: message.role === "assistant" ? "assistant" : "user", content: message.content }
+  })
+}
+
+function requestBody(
+  backend: GptelBackend,
+  model: string,
+  messages: GptelMessage[],
+  deps: GptelDeps,
+  stream: boolean,
+  tools: GptelTool[] = [],
+): unknown {
   const temperature = deps.getCustom<number>("gptel-temperature")
   const maxTokens = deps.getCustom<number>("gptel-max-tokens")
   if (backend.kind === "anthropic") {
@@ -346,7 +436,8 @@ function requestBody(backend: GptelBackend, model: string, messages: GptelMessag
       temperature: temperature || undefined,
       stream,
       system,
-      messages: messages.filter(m => m.role !== "system").map(m => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content })),
+      messages: anthropicMessages(messages),
+      tools: tools.length ? tools.map(anthropicTool) : undefined,
     }
   }
   if (backend.kind === "gemini") {
@@ -369,7 +460,8 @@ function requestBody(backend: GptelBackend, model: string, messages: GptelMessag
     return {
       model,
       stream,
-      input: messages.map(m => ({ role: m.role === "system" ? "developer" : m.role, content: m.content })),
+      input: openAiMessages(messages).map((m: any) => ({ ...m, role: m.role === "system" ? "developer" : m.role })),
+      tools: tools.length ? tools.map(openAiTool) : undefined,
       temperature: temperature || undefined,
       max_output_tokens: maxTokens || undefined,
     }
@@ -377,7 +469,9 @@ function requestBody(backend: GptelBackend, model: string, messages: GptelMessag
   return {
     model,
     stream,
-    messages: messages.map(m => ({ role: m.role, content: m.content })),
+    messages: openAiMessages(messages),
+    tools: tools.length ? tools.map(openAiTool) : undefined,
+    tool_choice: tools.length ? "auto" : undefined,
     temperature: temperature || undefined,
     max_tokens: maxTokens || undefined,
   }
@@ -407,17 +501,42 @@ export function parseSseEvents(chunk: string): string[] {
   return events
 }
 
+function parseJsonMaybe(value: unknown): unknown {
+  if (typeof value !== "string") return value ?? {}
+  try { return JSON.parse(value) } catch { return value }
+}
+
+export function toolCallsFromJson(backend: GptelBackend, json: unknown): GptelToolCall[] {
+  const data = json as Record<string, any>
+  if (backend.kind === "anthropic") {
+    return (data.content ?? [])
+      .filter((part: any) => part.type === "tool_use")
+      .map((part: any) => ({ id: String(part.id), name: String(part.name), arguments: part.input ?? {} }))
+  }
+  if (backend.kind === "openai-responses") {
+    return (data.output ?? [])
+      .filter((item: any) => item.type === "function_call")
+      .map((item: any) => ({ id: String(item.call_id ?? item.id), name: String(item.name), arguments: parseJsonMaybe(item.arguments) }))
+  }
+  const calls = data.choices?.[0]?.message?.tool_calls ?? []
+  return calls.map((call: any) => ({
+    id: String(call.id),
+    name: String(call.function?.name ?? call.name),
+    arguments: parseJsonMaybe(call.function?.arguments ?? call.arguments),
+  }))
+}
+
 function textFromJson(backend: GptelBackend, json: unknown): string {
   const data = json as Record<string, any>
   if (backend.kind === "anthropic") {
-    return data.content?.map((part: any) => part.text ?? "").join("") ?? ""
+    return data.content?.filter((part: any) => part.type !== "tool_use").map((part: any) => part.text ?? "").join("") ?? ""
   }
   if (backend.kind === "gemini") {
     return data.candidates?.flatMap((c: any) => c.content?.parts ?? []).map((p: any) => p.text ?? "").join("") ?? ""
   }
   if (backend.kind === "ollama") return data.message?.content ?? data.response ?? ""
   if (backend.kind === "openai-responses") {
-    return data.output_text ?? data.output?.flatMap((o: any) => o.content ?? []).map((c: any) => c.text ?? "").join("") ?? ""
+    return data.output_text ?? data.output?.filter((o: any) => o.type !== "function_call").flatMap((o: any) => o.content ?? []).map((c: any) => c.text ?? "").join("") ?? ""
   }
   return data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text ?? ""
 }
@@ -447,7 +566,7 @@ async function requestLlm(
   backend: GptelBackend,
   model: string,
   messages: GptelMessage[],
-  options: { onDelta?: (delta: string) => void; signal?: AbortSignal } = {},
+  options: { onDelta?: (delta: string) => void; signal?: AbortSignal; tools?: GptelTool[] } = {},
 ): Promise<RequestResult> {
   if (backend.kind === "mock") {
     const response = `Mock response to: ${messages.at(-1)?.content ?? ""}`
@@ -458,11 +577,11 @@ async function requestLlm(
     return { text: response }
   }
 
-  const stream = backend.stream !== false && deps.getCustom<boolean>("gptel-stream") !== false
+  const stream = backend.stream !== false && deps.getCustom<boolean>("gptel-stream") !== false && !(options.tools?.length)
   const response = await fetch(backendUrl(backend, model), {
     method: "POST",
     headers: requestHeaders(backend),
-    body: JSON.stringify(requestBody(backend, model, messages, deps, stream)),
+    body: JSON.stringify(requestBody(backend, model, messages, deps, stream, options.tools)),
     signal: options.signal,
   })
   if (!response.ok) {
@@ -471,7 +590,7 @@ async function requestLlm(
   }
   if (!stream || !response.body) {
     const json = await response.json()
-    return { text: textFromJson(backend, json), raw: json }
+    return { text: textFromJson(backend, json), raw: json, toolCalls: toolCallsFromJson(backend, json) }
   }
 
   const reader = response.body.getReader()
@@ -498,6 +617,83 @@ async function requestLlm(
     options.onDelta?.(delta)
   }
   return { text }
+}
+
+function toolResultString(result: unknown): string {
+  if (typeof result === "string") return result
+  if (result instanceof Error) return result.message
+  try { return JSON.stringify(result, null, 2) } catch { return String(result) }
+}
+
+async function executeToolCalls(
+  editor: Editor,
+  buffer: BufferModel,
+  toolCalls: readonly GptelToolCall[],
+): Promise<GptelMessage[]> {
+  const st = state(editor)
+  const results: GptelMessage[] = []
+  for (const call of toolCalls) {
+    const tool = st.tools.get(call.name)
+    if (!tool) {
+      results.push({
+        role: "tool",
+        name: call.name,
+        toolCallId: call.id,
+        content: `No such gptel tool: ${call.name}`,
+      })
+      continue
+    }
+    try {
+      editor.message(`gptel tool: ${call.name}`)
+      const value = await tool.function(call.arguments, { editor, buffer })
+      results.push({
+        role: "tool",
+        name: call.name,
+        toolCallId: call.id,
+        content: toolResultString(value),
+      })
+    } catch (error) {
+      results.push({
+        role: "tool",
+        name: call.name,
+        toolCallId: call.id,
+        content: `Tool error: ${error instanceof Error ? error.message : String(error)}`,
+      })
+    }
+  }
+  return results
+}
+
+async function requestWithTools(
+  editor: Editor,
+  deps: GptelDeps,
+  backend: GptelBackend,
+  model: string,
+  messages: GptelMessage[],
+  buffer: BufferModel,
+  options: { onDelta?: (delta: string) => void; signal?: AbortSignal } = {},
+): Promise<RequestResult> {
+  const tools = selectedTools(editor, deps)
+  const maxRounds = Math.max(0, deps.getCustom<number>("gptel-max-tool-rounds") ?? 3)
+  let conversation = [...messages]
+  let finalText = ""
+  for (let round = 0; round <= maxRounds; round++) {
+    const result = await requestLlm(editor, deps, backend, model, conversation, {
+      ...options,
+      tools,
+      onDelta: round === 0 ? options.onDelta : undefined,
+    })
+    if (result.text) finalText = result.text
+    const calls = result.toolCalls ?? []
+    if (!calls.length || !tools.length) return { ...result, text: finalText }
+    conversation = [
+      ...conversation,
+      { role: "assistant", content: result.text, toolCalls: calls },
+      ...await executeToolCalls(editor, buffer, calls),
+    ]
+    if (round === 0 && options.onDelta && result.text) options.onDelta("\n")
+  }
+  return { text: finalText }
 }
 
 function ensureChatBuffer(editor: Editor, name = GPTEL_BUFFER_PREFIX): BufferModel {
@@ -530,6 +726,9 @@ function applyTransientArgs(editor: Editor, deps: GptelDeps, args: string[]): vo
     } else if (arg === "--max-tokens") {
       const value = Number(args[++i])
       if (Number.isFinite(value)) deps.setCustom("gptel-max-tokens", value)
+    } else if (arg === "--tools") {
+      const value = args[++i]
+      if (value != null) deps.setCustom("gptel-tools", value)
     } else if (arg === "--no-stream") {
       deps.setCustom("gptel-stream", false)
     } else if (arg === "--stream") {
@@ -558,7 +757,7 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
   const responseStart = buffer.text.length
   editor.message(`gptel: ${backend.name}/${model}`)
   try {
-    const result = await requestLlm(editor, deps, backend, model, messages, {
+    const result = await requestWithTools(editor, deps, backend, model, messages, buffer, {
       signal: controller.signal,
       onDelta(delta) {
         appendWritable(buffer, delta)
@@ -602,7 +801,7 @@ async function rewriteRegion(editor: Editor, deps: GptelDeps, buffer: BufferMode
     { role: "user", content: `Instruction:\n${instruction}\n\nText:\n${original}` },
   ]
   editor.message(`gptel-rewrite: ${backend.name}/${model}`)
-  const result = await requestLlm(editor, deps, backend, model, messages)
+  const result = await requestWithTools(editor, deps, backend, model, messages, buffer)
   const replacement = result.text.trim()
   replaceWritable(buffer, bounds[0], bounds[1], replacement)
   editor.message("gptel-rewrite: replaced region")
@@ -716,6 +915,7 @@ const gptelMenuDefinition: TransientDefinition = {
         { key: "-s", label: "System", argument: "--system", kind: "value" },
         { key: "-t", label: "Temperature", argument: "--temperature", kind: "value" },
         { key: "-n", label: "Max tokens", argument: "--max-tokens", kind: "value" },
+        { key: "-T", label: "Tools", argument: "--tools", kind: "value" },
         { key: "-S", label: "No stream", argument: "--no-stream", kind: "toggle" },
       ],
     },
@@ -731,6 +931,7 @@ const gptelMenuDefinition: TransientDefinition = {
         { key: "r", label: "Rewrite region", command: "gptel-rewrite" },
         { key: "y", label: "Copy response", command: "gptel-copy-last-response" },
         { key: "p", label: "Preset", command: "gptel-preset" },
+        { key: "T", label: "Tools", command: "gptel-tools" },
         { key: "i", label: "Inspect", command: "gptel-inspect" },
         { key: "A", label: "Abort", command: "gptel-abort" },
       ],
@@ -785,6 +986,7 @@ async function applyPreset(editor: Editor, deps: GptelDeps, name: string): Promi
   if (preset.model) deps.setCustom("gptel-model", preset.model)
   if (preset.system) deps.setCustom("gptel-system-message", preset.system)
   if (typeof preset.temperature === "number") deps.setCustom("gptel-temperature", preset.temperature)
+  if (preset.tools) deps.setCustom("gptel-tools", preset.tools.join(","))
   editor.message(`gptel: applied preset ${name}`)
 }
 
@@ -800,6 +1002,8 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-temperature", "number", 0.7, "Sampling temperature for gptel requests.", "gptel")
   deps.defcustom("gptel-max-tokens", "number", 4096, "Maximum output tokens for gptel requests.", "gptel")
   deps.defcustom("gptel-stream", "boolean", true, "Stream gptel responses into the current buffer.", "gptel")
+  deps.defcustom("gptel-tools", "string", "", "Comma or space separated gptel tool names to include with requests.", "gptel")
+  deps.defcustom("gptel-max-tool-rounds", "number", 3, "Maximum number of tool-call continuation rounds.", "gptel")
 
   editor.command("gptel", async ({ editor, args }) => {
     const name = args.join(" ") || GPTEL_BUFFER_PREFIX
@@ -890,6 +1094,18 @@ export async function install(editor: Editor): Promise<void> {
     const prompt = await editor.prompt("System prompt: ", deps.getCustom<string>("gptel-system-message") ?? "", "gptel-system")
     if (prompt != null) deps.setCustom("gptel-system-message", prompt)
   }, "Set the gptel system prompt.")
+
+  editor.command("gptel-tools", async ({ editor, args }) => {
+    const st = state(editor)
+    if (!st.tools.size) {
+      editor.message("gptel: no tools registered")
+      return
+    }
+    const current = deps.getCustom<string>("gptel-tools") ?? ""
+    const value = args.join(" ") || await editor.prompt("Tools (comma/space separated): ", current, "gptel-tools")
+    if (value != null) deps.setCustom("gptel-tools", value)
+    editor.message(`gptel tools: ${deps.getCustom<string>("gptel-tools") || "(none)"}`)
+  }, "Set active gptel tools by name.")
 
   editor.command("gptel-version", ({ editor }) => {
     editor.message("gptel.ts 0.9.9.5-compatible")
