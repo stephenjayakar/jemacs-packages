@@ -99,9 +99,13 @@ type GptelState = {
     prompt: string
     messages: GptelMessage[]
     insertionStart: number
+    responseStart: number
+    responseEnd: number
     insertionEnd: number
     backend: string
     model: string
+    variants: string[]
+    variantIndex: number
   }
 }
 
@@ -1002,7 +1006,7 @@ function applyTransientArgs(editor: Editor, deps: GptelDeps, args: string[]): vo
   }
 }
 
-async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferModel, args: string[] = []): Promise<void> {
+async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferModel, args: string[] = [], priorVariants: string[] = []): Promise<void> {
   applyTransientArgs(editor, deps, args)
   const { prompt } = extractPrompt(buffer)
   if (!prompt) {
@@ -1028,6 +1032,8 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
       },
     })
     if (!buffer.text.slice(responseStart).trim() && result.text) appendWritable(buffer, result.text)
+    const responseEnd = buffer.text.length
+    const responseText = buffer.text.slice(responseStart, responseEnd)
     appendWritable(buffer, USER_BEGIN)
     buffer.point = buffer.text.length
     state(editor).lastRequest = {
@@ -1035,9 +1041,13 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
       prompt,
       messages,
       insertionStart,
+      responseStart,
+      responseEnd,
       insertionEnd: buffer.text.length,
       backend: backend.name,
       model,
+      variants: [responseText, ...priorVariants.filter(variant => variant !== responseText)],
+      variantIndex: 0,
     }
     editor.message(`gptel: done (${backend.name}/${model})`)
   } catch (error) {
@@ -1048,6 +1058,28 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
     state(editor).activeRequests.delete(buffer.id)
     void editor.changed("gptel-send")
   }
+}
+
+function switchLastVariant(editor: Editor, direction: number): void {
+  const st = state(editor)
+  const last = st.lastRequest
+  if (!last || last.variants.length < 2) {
+    editor.message("gptel: no response variants")
+    return
+  }
+  const buffer = editor.buffers.get(last.bufferId)
+  if (!buffer) return
+  const nextIndex = (last.variantIndex + direction + last.variants.length) % last.variants.length
+  const next = last.variants[nextIndex] ?? ""
+  const oldLength = last.responseEnd - last.responseStart
+  replaceWritable(buffer, last.responseStart, last.responseEnd, next)
+  const delta = next.length - oldLength
+  last.responseEnd += delta
+  last.insertionEnd += delta
+  last.variantIndex = nextIndex
+  buffer.point = last.responseStart + next.length
+  editor.message(`gptel: variant ${nextIndex + 1}/${last.variants.length}`)
+  void editor.changed("gptel-variant")
 }
 
 async function rewriteRegion(editor: Editor, deps: GptelDeps, buffer: BufferModel, instruction: string): Promise<void> {
@@ -1130,6 +1162,8 @@ function installModes(deps: GptelDeps): void {
   chatMap.bind("C-c C-c", "gptel-send")
   chatMap.bind("C-c C-k", "gptel-abort")
   chatMap.bind("C-c C-r", "gptel-rewrite")
+  chatMap.bind("C-c C-v p", "gptel-previous-variant")
+  chatMap.bind("C-c C-v n", "gptel-next-variant")
   chatMap.bind("C-c C-a", "gptel-add")
   chatMap.bind("C-c C-n", "gptel-context-remove-all")
   deps.defineMode({ name: GPTEL_CHAT_MODE, parent: "markdown", keymap: chatMap, fontLock: gptelFontLock })
@@ -1248,6 +1282,8 @@ function describeState(editor: Editor, deps: GptelDeps): string {
     "  gptel-add              add region/current buffer to context",
     "  gptel-add-file         add a file or directory to context",
     "  gptel-rewrite          rewrite active region",
+    "  gptel-regenerate       regenerate the last response",
+    "  gptel-previous-variant cycle response variants",
     "  gptel-menu             inspect and change backend/model",
     "  gptel-abort            abort active request",
   ].join("\n")
@@ -1279,6 +1315,9 @@ const gptelMenuDefinition: TransientDefinition = {
         { key: "c", label: "Show context", command: "gptel-context" },
         { key: "x", label: "Clear context", command: "gptel-context-remove-all" },
         { key: "r", label: "Rewrite region", command: "gptel-rewrite" },
+        { key: "R", label: "Regenerate", command: "gptel-regenerate" },
+        { key: "v p", label: "Previous variant", command: "gptel-previous-variant" },
+        { key: "v n", label: "Next variant", command: "gptel-next-variant" },
         { key: "y", label: "Copy response", command: "gptel-copy-last-response" },
         { key: "p", label: "Preset", command: "gptel-preset" },
         { key: "T", label: "Tools", command: "gptel-tools" },
@@ -1586,10 +1625,20 @@ export async function install(editor: Editor): Promise<void> {
     }
     const buffer = editor.buffers.get(last.bufferId)
     if (!buffer) return
+    const currentResponse = buffer.text.slice(last.responseStart, last.responseEnd)
+    const priorVariants = [currentResponse, ...last.variants.filter(variant => variant !== currentResponse)]
     replaceWritable(buffer, last.insertionStart, last.insertionEnd, "")
     buffer.point = buffer.text.length
-    await sendFromBuffer(editor, deps, buffer)
+    await sendFromBuffer(editor, deps, buffer, [], priorVariants)
   }, "Regenerate the previous gptel response.")
+
+  editor.command("gptel-previous-variant", ({ editor }) => {
+    switchLastVariant(editor, 1)
+  }, "Switch the last gptel response to the previous variant.")
+
+  editor.command("gptel-next-variant", ({ editor }) => {
+    switchLastVariant(editor, -1)
+  }, "Switch the last gptel response to the next variant.")
 
   editor.command("gptel-copy-last-response", ({ editor, buffer }) => {
     const response = lastAssistantResponse(buffer)

@@ -21,10 +21,11 @@ import {
   renderContext,
   renderContextBuffer,
   toolCallsFromJson,
+  install,
   type GptelBackend,
   type GptelMessage,
 } from "./gptel"
-import { BufferModel, Editor } from "@jemacs/core"
+import { BufferModel, Editor, setCustom } from "@jemacs/core"
 
 test("default backends include Stephen's configured Claude backend", () => {
   const claude = defaultBackends().find(backend => backend.name === "Claude")
@@ -197,4 +198,24 @@ test("gptelToolCallSummary formats tool confirmation details", () => {
   ])
   expect(summary).toContain("1. lookup\n{\n  \"q\": \"jemacs\"\n}")
   expect(summary).toContain("2. read_file")
+})
+
+test("gptel variant commands switch the last response in place", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  const buffer = editor.scratch("*ChatGPT-test*", "User:\nhello", "gptel-chat")
+  buffer.point = buffer.text.length
+  editor.switchToBuffer(buffer.id)
+  await editor.run("gptel-send")
+
+  const state = editor.locals.get("gptel-state") as {
+    lastRequest: { responseStart: number; responseEnd: number; variants: string[]; variantIndex: number }
+  }
+  state.lastRequest.variants.push("alternate response")
+  await editor.run("gptel-previous-variant")
+
+  expect(buffer.text.slice(state.lastRequest.responseStart, state.lastRequest.responseEnd)).toBe("alternate response")
+  expect(state.lastRequest.variantIndex).toBe(1)
 })
