@@ -28,6 +28,7 @@ import {
   gptelMakePrivateGPT,
   gptelMakeTool,
   gptelMakeXAI,
+  gptelMcpRegisterServer,
   gptelToolCallSummary,
   mediaPartsFromContext,
   mimeTypeForPath,
@@ -560,6 +561,43 @@ test("gptel-send sends tools and inserts included tool results", async () => {
     setCustom("gptel-confirm-tool-calls", true)
     setCustom("gptel-stream", true)
   }
+})
+
+test("gptel MCP commands activate and remove server tools", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const lifecycle: string[] = []
+  gptelMcpRegisterServer(editor, {
+    name: "github",
+    status: "disconnected",
+    connect: () => { lifecycle.push("connect") },
+    disconnect: () => { lifecycle.push("disconnect") },
+    tools: [
+      {
+        name: "search repos",
+        description: "Search GitHub repositories.",
+        parameters: { type: "object", properties: { query: { type: "string" } } },
+        function: args => `repos:${(args as { query?: string }).query ?? ""}`,
+      },
+    ],
+  })
+
+  await editor.run("gptel-mcp-connect", ["github"])
+  const st = editor.locals.get("gptel-state") as {
+    tools: Map<string, { category?: string; sourceName?: string }>
+    mcpServers: Map<string, { status?: string }>
+  }
+  expect(lifecycle).toEqual(["connect"])
+  expect(st.mcpServers.get("github")?.status).toBe("connected")
+  expect(st.tools.get("mcp_github_search_repos")?.category).toBe("mcp-github")
+  expect(st.tools.get("mcp_github_search_repos")?.sourceName).toBe("search repos")
+  expect(getCustom<string>("gptel-tools")).toBe("mcp_github_search_repos")
+
+  await editor.run("gptel-mcp-disconnect", ["github"])
+  expect(lifecycle).toEqual(["connect", "disconnect"])
+  expect(st.mcpServers.get("github")?.status).toBe("disconnected")
+  expect(st.tools.has("mcp_github_search_repos")).toBe(false)
+  expect(getCustom<string>("gptel-tools")).toBe("")
 })
 
 test("gptel pre and post tool call functions can alter calls and results", async () => {

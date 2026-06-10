@@ -66,7 +66,26 @@ export type GptelTool = {
   parameters?: unknown
   confirm?: boolean
   include?: boolean
+  category?: string
+  sourceName?: string
   function: (args: unknown, ctx: { editor: Editor; buffer: BufferModel }) => unknown | Promise<unknown>
+}
+
+export type GptelMcpToolSpec = {
+  name: string
+  description?: string
+  parameters?: unknown
+  confirm?: boolean
+  include?: boolean
+  function?: (args: unknown, ctx: { editor: Editor; buffer: BufferModel }) => unknown | Promise<unknown>
+}
+
+export type GptelMcpServer = {
+  name: string
+  status?: "connected" | "disconnected"
+  tools?: GptelMcpToolSpec[]
+  connect?: () => void | Promise<void>
+  disconnect?: () => void | Promise<void>
 }
 
 export type GptelToolCall = {
@@ -115,6 +134,7 @@ export type GptelPostToolCallFunction = (call: GptelToolCall, result: GptelMessa
 type GptelState = {
   backends: Map<string, GptelBackend>
   tools: Map<string, GptelTool>
+  mcpServers: Map<string, GptelMcpServer>
   presets: Map<string, GptelPreset>
   promptTransforms: GptelPromptTransform[]
   responseFilters: GptelResponseFilter[]
@@ -338,6 +358,7 @@ function state(editor: Editor): GptelState {
   const next: GptelState = {
     backends: new Map(defaultBackends().map(backend => [backend.name, backend])),
     tools: new Map(),
+    mcpServers: new Map(),
     presets: new Map(),
     promptTransforms: [],
     responseFilters: [],
@@ -2158,6 +2179,8 @@ function describeState(editor: Editor, deps: GptelDeps): string {
     "  gptel-openai-oauth-login save OpenAI OAuth token",
     "  gptel-gh-login         save GitHub Copilot token",
     "  gptel-menu             inspect and change backend/model",
+    "  gptel-mcp-connect      activate tools from registered MCP servers",
+    "  gptel-mcp-disconnect   remove MCP tools and disconnect servers",
     "  gptel-save-state       persist gptel metadata in this buffer",
     "  gptel-restore-state    restore gptel metadata from this buffer",
     "  gptel-abort            abort active request",
@@ -2204,6 +2227,8 @@ function gptelToolsDefinition(editor: Editor, deps: GptelDeps): TransientDefinit
         title: "Registered Tools",
         infixes: toolInfixes,
         suffixes: [
+          { key: "M+", label: "Add MCP tools", command: "gptel-mcp-connect" },
+          { key: "M-", label: "Remove MCP tools", command: "gptel-mcp-disconnect" },
           { key: "RET", label: "Apply", command: "gptel-tools-apply" },
         ],
       },
@@ -2474,6 +2499,96 @@ export function gptelMakeOpenAIOAuth(editor: Editor, name: string, options: Part
 export function gptelMakeTool(editor: Editor, tool: GptelTool): GptelTool {
   state(editor).tools.set(tool.name, tool)
   return tool
+}
+
+function mcpCategory(serverName: string): string {
+  return `mcp-${serverName}`
+}
+
+function mcpSafeToolName(serverName: string, toolName: string): string {
+  const safe = (value: string) => value.replace(/[^A-Za-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "") || "tool"
+  return `mcp_${safe(serverName)}_${safe(toolName)}`
+}
+
+function selectedToolNames(deps: Pick<GptelDeps, "getCustom">): string[] {
+  return (deps.getCustom<string>("gptel-tools") ?? "").split(/[, ]+/).map(name => name.trim()).filter(Boolean)
+}
+
+function setSelectedToolNames(deps: Pick<GptelDeps, "setCustom">, names: string[]): void {
+  deps.setCustom("gptel-tools", [...new Set(names.filter(Boolean))].join(","))
+}
+
+function mcpToolFromSpec(serverName: string, spec: GptelMcpToolSpec): GptelTool {
+  return {
+    name: mcpSafeToolName(serverName, spec.name),
+    sourceName: spec.name,
+    category: mcpCategory(serverName),
+    description: spec.description ?? `MCP tool ${spec.name} from ${serverName}`,
+    parameters: spec.parameters ?? { type: "object", properties: {} },
+    confirm: spec.confirm,
+    include: spec.include,
+    function: spec.function ?? (async () => {
+      throw new Error(`gptel: MCP tool ${serverName}/${spec.name} has no callable adapter`)
+    }),
+  }
+}
+
+export function gptelMcpRegisterServer(editor: Editor, server: GptelMcpServer): GptelMcpServer {
+  state(editor).mcpServers.set(server.name, server)
+  return server
+}
+
+export function gptelMcpGetTools(editor: Editor, serverNames?: string[]): GptelTool[] {
+  const st = state(editor)
+  const names = serverNames?.length ? serverNames : [...st.mcpServers.keys()]
+  const tools: GptelTool[] = []
+  for (const name of names) {
+    const server = st.mcpServers.get(name)
+    if (!server || server.status === "disconnected") continue
+    tools.push(...(server.tools ?? []).map(tool => mcpToolFromSpec(name, tool)))
+  }
+  return tools
+}
+
+export async function gptelMcpConnect(editor: Editor, deps: Pick<GptelDeps, "getCustom" | "setCustom">, serverNames?: string[]): Promise<GptelTool[]> {
+  const st = state(editor)
+  const names = serverNames?.length ? serverNames : [...st.mcpServers.keys()]
+  if (!names.length) return []
+  const activated: GptelTool[] = []
+  for (const name of names) {
+    const server = st.mcpServers.get(name)
+    if (!server) continue
+    await server.connect?.()
+    server.status = "connected"
+    for (const toolSpec of server.tools ?? []) {
+      const tool = mcpToolFromSpec(name, toolSpec)
+      st.tools.set(tool.name, tool)
+      activated.push(tool)
+    }
+  }
+  if (activated.length) setSelectedToolNames(deps, [...selectedToolNames(deps), ...activated.map(tool => tool.name)])
+  return activated
+}
+
+export async function gptelMcpDisconnect(editor: Editor, deps: Pick<GptelDeps, "getCustom" | "setCustom">, serverNames?: string[]): Promise<string[]> {
+  const st = state(editor)
+  const names = serverNames?.length ? serverNames : [...st.mcpServers.keys()]
+  const categories = new Set(names.map(mcpCategory))
+  const removed: string[] = []
+  for (const [name, tool] of st.tools) {
+    if (tool.category && categories.has(tool.category)) {
+      st.tools.delete(name)
+      removed.push(name)
+    }
+  }
+  setSelectedToolNames(deps, selectedToolNames(deps).filter(name => !removed.includes(name)))
+  for (const name of names) {
+    const server = st.mcpServers.get(name)
+    if (!server) continue
+    await server.disconnect?.()
+    server.status = "disconnected"
+  }
+  return removed
 }
 
 export function gptelMakePreset(editor: Editor, preset: GptelPreset): GptelPreset {
@@ -2798,6 +2913,20 @@ export async function install(editor: Editor): Promise<void> {
     deps.setCustom("gptel-tools", selected.join(","))
     editor.message(`gptel tools: ${selected.join(", ") || "(none)"}`)
   }, "Apply active tools from the gptel tools transient.")
+
+  editor.command("gptel-mcp-connect", async ({ editor, args }) => {
+    const added = await gptelMcpConnect(editor, deps, args.length ? args : undefined)
+    editor.message(added.length
+      ? `gptel: added ${added.length} MCP tool${added.length === 1 ? "" : "s"}`
+      : "gptel: no MCP tools added")
+  }, "Register and activate tools from configured MCP servers.")
+
+  editor.command("gptel-mcp-disconnect", async ({ editor, args }) => {
+    const removed = await gptelMcpDisconnect(editor, deps, args.length ? args : undefined)
+    editor.message(removed.length
+      ? `gptel: removed ${removed.length} MCP tool${removed.length === 1 ? "" : "s"}`
+      : "gptel: no MCP tools removed")
+  }, "Remove MCP tools from gptel and disconnect their servers.")
 
   editor.command("gptel-openai-oauth-login", async ({ editor, args }) => {
     const token = args.join(" ") || await editor.prompt("OpenAI OAuth token: ", "", "gptel-openai-oauth-token")
