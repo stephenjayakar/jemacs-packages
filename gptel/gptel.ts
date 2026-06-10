@@ -32,6 +32,7 @@ export type GptelBackendKind =
   | "gemini"
   | "ollama"
   | "kagi"
+  | "bedrock"
   | "mock"
 
 export type GptelBackend = {
@@ -49,6 +50,7 @@ export type GptelBackend = {
   requestParams?: Record<string, unknown>
   apiKeyHeader?: string
   authorizationPrefix?: string
+  modelRegion?: "global" | "apac" | "eu" | "us"
 }
 
 export type GptelContextItem =
@@ -317,12 +319,29 @@ function backendKey(backend: GptelBackend): string {
   return ""
 }
 
+const BEDROCK_MODEL_IDS: Record<string, string> = {
+  "claude-sonnet-4-5-20250929": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+  "claude-opus-4-1-20250805": "anthropic.claude-opus-4-1-20250805-v1:0",
+  "claude-3-7-sonnet-20250219": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+  "claude-3-5-sonnet-20241022": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+  "claude-3-5-haiku-20241022": "anthropic.claude-3-5-haiku-20241022-v1:0",
+  "nova-2-lite-v1": "amazon.nova-2-lite-v1:0",
+  "mistral-7b": "mistral.mistral-7b-instruct-v0:2",
+  "llama-3-3-70b": "meta.llama3-3-70b-instruct-v1:0",
+}
+
+function bedrockModelId(backend: GptelBackend, model: string): string {
+  const mapped = BEDROCK_MODEL_IDS[model] ?? model
+  return backend.modelRegion ? `${backend.modelRegion}.${mapped}` : mapped
+}
+
 function backendUrl(backend: GptelBackend, model: string): string {
   const protocol = backend.protocol ?? "https"
   const host = backend.host ?? "api.openai.com"
+  const endpointModel = backend.kind === "bedrock" ? bedrockModelId(backend, model) : model
   const kagiAction = model === "fastgpt" ? "fastgpt" : "summarize"
   const endpoint = (backend.endpoint ?? "/v1/chat/completions")
-    .replace("{model}", encodeURIComponent(model))
+    .replace("{model}", encodeURIComponent(endpointModel))
     .replace("{kagiAction}", kagiAction)
   if (/^https?:\/\//.test(endpoint)) return endpoint
   return `${protocol}://${host}${endpoint}`
@@ -611,6 +630,16 @@ function anthropicTool(tool: GptelTool): unknown {
   }
 }
 
+function bedrockTool(tool: GptelTool): unknown {
+  return {
+    toolSpec: {
+      name: tool.name,
+      description: tool.description,
+      inputSchema: { json: tool.parameters ?? { type: "object", properties: {} } },
+    },
+  }
+}
+
 function openAiContent(message: GptelMessage): unknown {
   if (!message.media?.length) return message.content
   const parts: unknown[] = []
@@ -731,6 +760,44 @@ function ollamaMessages(messages: GptelMessage[]): unknown[] {
   })
 }
 
+function bedrockContent(message: GptelMessage): unknown[] {
+  if (message.role === "tool") {
+    return [{
+      toolResult: {
+        toolUseId: message.toolCallId,
+        status: message.content.startsWith("Tool error:") ? "error" : "success",
+        content: [{ text: message.content }],
+      },
+    }]
+  }
+  if (message.toolCalls?.length) {
+    const content: unknown[] = []
+    if (message.content) content.push({ text: message.content })
+    for (const call of message.toolCalls) {
+      content.push({ toolUse: { toolUseId: call.id, name: call.name, input: call.arguments ?? {} } })
+    }
+    return content
+  }
+  const content: unknown[] = []
+  if (message.content) content.push({ text: message.content })
+  for (const media of message.media ?? []) {
+    if (isImageMime(media.mime)) {
+      const format = media.mime.replace(/^image\//, "").replace("jpg", "jpeg")
+      content.push({ image: { format, source: { bytes: media.base64 } } })
+    } else if (media.mime === "application/pdf") {
+      content.push({ document: { format: "pdf", name: media.path.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") || "document", source: { bytes: media.base64 } } })
+    }
+  }
+  return content.length ? content : [{ text: "" }]
+}
+
+function bedrockMessages(messages: GptelMessage[]): unknown[] {
+  return messages.filter(message => message.role !== "system").map(message => ({
+    role: message.role === "assistant" ? "assistant" : "user",
+    content: bedrockContent(message),
+  }))
+}
+
 export function providerMessagesForBackend(backend: GptelBackend, messages: GptelMessage[]): unknown[] {
   if (backend.kind === "anthropic") return anthropicMessages(messages)
   if (backend.kind === "gemini") {
@@ -740,6 +807,7 @@ export function providerMessagesForBackend(backend: GptelBackend, messages: Gpte
     }))
   }
   if (backend.kind === "ollama") return ollamaMessages(messages)
+  if (backend.kind === "bedrock") return bedrockMessages(messages)
   return openAiMessages(messages, backend.kind === "openai-responses")
 }
 
@@ -791,6 +859,19 @@ function requestBody(
     if (model.startsWith("summarize:")) return { text: prompt, engine: model.slice("summarize:".length), ...extra }
     return { query: prompt, ...extra }
   }
+  if (backend.kind === "bedrock") {
+    const system = messages.find(message => message.role === "system")?.content
+    return {
+      messages: providerMessagesForBackend(backend, messages),
+      system: system ? [{ text: system }] : undefined,
+      inferenceConfig: {
+        maxTokens: maxTokens || 4096,
+        temperature: temperature || undefined,
+      },
+      toolConfig: tools.length ? { toolChoice: { auto: {} }, tools: tools.map(bedrockTool) } : undefined,
+      ...extra,
+    }
+  }
   if (backend.kind === "openai-responses") {
     return {
       model,
@@ -825,6 +906,8 @@ function requestHeaders(backend: GptelBackend): Record<string, string> {
     if (key) headers["x-goog-api-key"] = key
   } else if (backend.kind === "kagi") {
     if (key) headers.authorization = `${backend.authorizationPrefix ?? "Bot"} ${key}`
+  } else if (backend.kind === "bedrock") {
+    if (key) headers.authorization = `${backend.authorizationPrefix ?? "Bearer"} ${key}`
   } else if (backend.apiKeyHeader) {
     if (key) headers[backend.apiKeyHeader] = key
   } else if (key) {
@@ -859,6 +942,12 @@ export function toolCallsFromJson(backend: GptelBackend, json: unknown): GptelTo
       .filter((item: any) => item.type === "function_call")
       .map((item: any) => ({ id: String(item.call_id ?? item.id), name: String(item.name), arguments: parseJsonMaybe(item.arguments) }))
   }
+  if (backend.kind === "bedrock") {
+    return (data.output?.message?.content ?? [])
+      .map((part: any) => part.toolUse)
+      .filter(Boolean)
+      .map((toolUse: any) => ({ id: String(toolUse.toolUseId), name: String(toolUse.name), arguments: toolUse.input ?? {} }))
+  }
   const calls = data.choices?.[0]?.message?.tool_calls ?? []
   return calls.map((call: any) => ({
     id: String(call.id),
@@ -891,6 +980,14 @@ export function usageFromJson(backend: GptelBackend, json: unknown): GptelTokenU
     return {
       input: numberOrUndefined(data.prompt_eval_count),
       output: numberOrUndefined(data.eval_count),
+    }
+  }
+  if (backend.kind === "bedrock") {
+    return {
+      input: (numberOrUndefined(usage.inputTokens) ?? 0) + (numberOrUndefined(usage.cacheWriteInputTokens) ?? 0),
+      output: numberOrUndefined(usage.outputTokens),
+      cached: numberOrUndefined(usage.cacheReadInputTokens),
+      cache: numberOrUndefined(usage.cacheWriteInputTokens),
     }
   }
   if (backend.kind === "kagi") {
@@ -946,6 +1043,9 @@ function textFromJson(backend: GptelBackend, json: unknown): string {
       return `[${index + 1}] ${title}${url}${snippet}`
     }).join("\n")
     return `${output}\n\n${refs}`
+  }
+  if (backend.kind === "bedrock") {
+    return data.output?.message?.content?.map((part: any) => part.text ?? "").join("") ?? ""
   }
   if (backend.kind === "openai-responses") {
     return data.output_text ?? data.output?.filter((o: any) => o.type !== "function_call").flatMap((o: any) => o.content ?? []).map((c: any) => c.text ?? "").join("") ?? ""
@@ -1751,6 +1851,46 @@ export function gptelMakeXAI(editor: Editor, name: string, options: Partial<Gpte
     endpoint: "/v1/chat/completions",
     models: ["grok-4-1-fast-reasoning", "grok-4-1-fast-non-reasoning", "grok-code-fast-1", "grok-4-fast-reasoning"],
     defaultModel: "grok-4-1-fast-reasoning",
+    stream: true,
+    ...options,
+  }))
+}
+
+export function gptelMakeBedrock(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  const region = options.host?.match(/^bedrock-runtime\.([^.]+)\.amazonaws\.com$/)?.[1] ?? "us-east-1"
+  return registerBackend(editor, makeBackend("bedrock", name, {
+    host: `bedrock-runtime.${region}.amazonaws.com`,
+    endpoint: "/model/{model}/converse",
+    models: ["claude-sonnet-4-5-20250929", "claude-opus-4-1-20250805", "nova-2-lite-v1", "llama-3-3-70b"],
+    defaultModel: "claude-sonnet-4-5-20250929",
+    stream: false,
+    ...options,
+  }))
+}
+
+export function gptelMakeGithubCopilot(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  return registerBackend(editor, makeBackend("openai", name, {
+    host: "api.githubcopilot.com",
+    endpoint: "/chat/completions",
+    models: ["gpt-5.2", "gpt-5.1-codex", "claude-sonnet-4-5", "gemini-2.5-pro"],
+    defaultModel: "gpt-5.2",
+    stream: true,
+    headers: {
+      "openai-intent": "conversation-panel",
+      "x-initiator": "user",
+      "copilot-integration-id": "vscode-chat",
+      ...(options.headers ?? {}),
+    },
+    ...options,
+  }))
+}
+
+export function gptelMakeOpenAIOAuth(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  return registerBackend(editor, makeBackend("openai-responses", name, {
+    host: "chatgpt.com",
+    endpoint: "/backend-api/codex/responses",
+    models: ["gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4-mini", "gpt-5.4", "gpt-5.5"],
+    defaultModel: "gpt-5.3-codex",
     stream: true,
     ...options,
   }))

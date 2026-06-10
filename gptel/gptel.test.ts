@@ -10,10 +10,13 @@ import {
   gptelAddPromptTransform,
   gptelAddResponseFilter,
   gptelMakeAzure,
+  gptelMakeBedrock,
   gptelMakeDeepSeek,
   gptelMakeKagi,
+  gptelMakeGithubCopilot,
   gptelMakeOllama,
   gptelMakeOpenAI,
+  gptelMakeOpenAIOAuth,
   gptelMakeOpenAIResponses,
   gptelMakePerplexity,
   gptelMakePrivateGPT,
@@ -52,6 +55,9 @@ test("backend factories cover upstream provider families", () => {
     gptelMakePerplexity(editor, "Perplexity"),
     gptelMakeDeepSeek(editor, "DeepSeek"),
     gptelMakeXAI(editor, "xAI"),
+    gptelMakeBedrock(editor, "Bedrock", { key: "bedrock-token" }),
+    gptelMakeGithubCopilot(editor, "Copilot", { key: "copilot-token" }),
+    gptelMakeOpenAIOAuth(editor, "ChatGPT OAuth", { key: "oauth-token" }),
   ]
   expect(backends.map(backend => backend.kind)).toEqual([
     "openai-responses",
@@ -62,12 +68,18 @@ test("backend factories cover upstream provider families", () => {
     "openai",
     "openai",
     "openai",
+    "bedrock",
+    "openai",
+    "openai-responses",
   ])
   expect(backends[1]!.apiKeyHeader).toBe("api-key")
   expect(backends[3]!.authorizationPrefix).toBe("Bot")
   const state = editor.locals.get("gptel-state") as { backends: Map<string, GptelBackend> }
   expect(state.backends.get("DeepSeek")?.defaultModel).toBe("deepseek-chat")
   expect(state.backends.get("xAI")?.host).toBe("api.x.ai")
+  expect(state.backends.get("Bedrock")?.endpoint).toBe("/model/{model}/converse")
+  expect(state.backends.get("Copilot")?.headers?.["copilot-integration-id"]).toBe("vscode-chat")
+  expect(state.backends.get("ChatGPT OAuth")?.host).toBe("chatgpt.com")
 })
 
 test("extractPrompt prefers active region", () => {
@@ -173,6 +185,13 @@ test("providerMessagesForBackend embeds media in provider-specific shapes", () =
     content: "describe",
     images: ["AQIDBA=="],
   }])
+  expect(providerMessagesForBackend({ name: "Bedrock", kind: "bedrock", models: ["claude"] }, messages)).toEqual([{
+    role: "user",
+    content: [
+      { text: "describe" },
+      { image: { format: "png", source: { bytes: "AQIDBA==" } } },
+    ],
+  }])
 })
 
 test("parseSseEvents joins data lines", () => {
@@ -205,6 +224,23 @@ test("toolCallsFromJson parses Anthropic tool_use blocks", () => {
   expect(toolCallsFromJson(backend, {
     content: [{ type: "tool_use", id: "toolu_1", name: "bash", input: { command: "pwd" } }],
   })).toEqual([{ id: "toolu_1", name: "bash", arguments: { command: "pwd" } }])
+})
+
+test("Bedrock response parsing supports text, tool calls, and usage", () => {
+  const backend = { name: "Bedrock", kind: "bedrock", models: ["claude"] } satisfies GptelBackend
+  const response = {
+    output: {
+      message: {
+        content: [
+          { text: "hello" },
+          { toolUse: { toolUseId: "tool_1", name: "lookup", input: { q: "jemacs" } } },
+        ],
+      },
+    },
+    usage: { inputTokens: 7, outputTokens: 3, cacheReadInputTokens: 2, cacheWriteInputTokens: 1 },
+  }
+  expect(toolCallsFromJson(backend, response)).toEqual([{ id: "tool_1", name: "lookup", arguments: { q: "jemacs" } }])
+  expect(usageFromJson(backend, response)).toEqual({ input: 8, output: 3, cached: 2, cache: 1 })
 })
 
 test("usageFromJson normalizes provider token usage", () => {
