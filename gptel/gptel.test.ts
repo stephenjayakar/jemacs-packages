@@ -9,7 +9,9 @@ import {
   formatToolResultBlock,
   gptelParseSchema,
   gptelAddPostResponseFunction,
+  gptelAddPostToolCallFunction,
   gptelAddPromptTransform,
+  gptelAddPreToolCallFunction,
   gptelAddResponseFilter,
   gptelMakeAnthropic,
   gptelMakeAzure,
@@ -550,6 +552,69 @@ test("gptel-send sends tools and inserts included tool results", async () => {
     editor.switchToBuffer(second.id)
     await editor.run("gptel-send")
     expect(bodies[0].tools).toBeUndefined()
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-tools", "")
+    setCustom("gptel-use-tools", true)
+    setCustom("gptel-include-tool-results", "auto")
+    setCustom("gptel-confirm-tool-calls", true)
+    setCustom("gptel-stream", true)
+  }
+})
+
+test("gptel pre and post tool call functions can alter calls and results", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "ToolHookBackend", { endpoint: "http://tool-hook.test/v1/chat/completions", models: ["tool-model"], defaultModel: "tool-model", stream: false })
+  const seen: string[] = []
+  gptelMakeTool(editor, {
+    name: "lookup",
+    description: "Lookup a value.",
+    confirm: false,
+    include: true,
+    parameters: { type: "object", properties: { q: { type: "string" } } },
+    function: args => `result:${(args as { q?: string }).q ?? ""}`,
+  })
+  gptelAddPreToolCallFunction(editor, call => {
+    seen.push(`pre:${call.name}`)
+    return { ...call, arguments: { q: "rewritten" } }
+  })
+  gptelAddPostToolCallFunction(editor, (_call, result) => {
+    seen.push(`post:${result.content}`)
+    return { ...result, content: `${result.content}:filtered` }
+  })
+  setCustom("gptel-backend", "ToolHookBackend")
+  setCustom("gptel-model", "tool-model")
+  setCustom("gptel-tools", "lookup")
+  setCustom("gptel-use-tools", true)
+  setCustom("gptel-include-tool-results", "auto")
+  setCustom("gptel-confirm-tool-calls", false)
+  setCustom("gptel-stream", false)
+  const originalFetch = globalThis.fetch
+  let callCount = 0
+  globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) => {
+    callCount += 1
+    if (callCount === 1) {
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: "",
+            tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{\"q\":\"original\"}" } }],
+          },
+        }],
+      }), { status: 200, headers: { "content-type": "application/json" } })
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200, headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  try {
+    const buffer = editor.scratch("*ChatGPT-tool-hooks*", "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    await editor.run("gptel-send")
+
+    expect(seen).toEqual(["pre:lookup", "post:result:rewritten"])
+    expect(buffer.text).toContain("result:rewritten:filtered")
+    expect(buffer.text).not.toContain("result:original")
   } finally {
     globalThis.fetch = originalFetch
     setCustom("gptel-tools", "")

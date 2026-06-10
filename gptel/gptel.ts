@@ -109,6 +109,8 @@ export type GptelRequestContext = {
 export type GptelPromptTransform = (prompt: string, ctx: GptelRequestContext) => string | Promise<string>
 export type GptelResponseFilter = (response: string, ctx: GptelRequestContext) => string | Promise<string>
 export type GptelPostResponseFunction = (start: number, end: number, ctx: GptelRequestContext) => void | Promise<void>
+export type GptelPreToolCallFunction = (call: GptelToolCall, tool: GptelTool | undefined, ctx: GptelRequestContext) => GptelToolCall | false | void | Promise<GptelToolCall | false | void>
+export type GptelPostToolCallFunction = (call: GptelToolCall, result: GptelMessage, tool: GptelTool | undefined, ctx: GptelRequestContext) => GptelMessage | void | Promise<GptelMessage | void>
 
 type GptelState = {
   backends: Map<string, GptelBackend>
@@ -117,6 +119,8 @@ type GptelState = {
   promptTransforms: GptelPromptTransform[]
   responseFilters: GptelResponseFilter[]
   postResponseFunctions: GptelPostResponseFunction[]
+  preToolCallFunctions: GptelPreToolCallFunction[]
+  postToolCallFunctions: GptelPostToolCallFunction[]
   context: GptelContextItem[]
   activeRequests: Map<string, AbortController>
   tokenUsage: GptelTokenUsage
@@ -309,6 +313,8 @@ function state(editor: Editor): GptelState {
     promptTransforms: [],
     responseFilters: [],
     postResponseFunctions: [],
+    preToolCallFunctions: [],
+    postToolCallFunctions: [],
     context: [],
     activeRequests: new Map(),
     tokenUsage: {},
@@ -1399,11 +1405,36 @@ async function confirmToolCalls(
   }
 }
 
+async function runPreToolCallFunctions(editor: Editor, deps: GptelDeps, buffer: BufferModel, backend: GptelBackend, model: string, call: GptelToolCall, tool: GptelTool | undefined): Promise<GptelToolCall | false> {
+  const ctx = { editor, buffer, backend, model }
+  let current = call
+  for (const fn of state(editor).preToolCallFunctions) {
+    const next = await fn(current, tool, ctx)
+    if (next === false) return false
+    if (next) current = next
+  }
+  await editor.runHook("gptel-pre-tool-call-functions", buffer)
+  return current
+}
+
+async function runPostToolCallFunctions(editor: Editor, deps: GptelDeps, buffer: BufferModel, backend: GptelBackend, model: string, call: GptelToolCall, result: GptelMessage, tool: GptelTool | undefined): Promise<GptelMessage> {
+  const ctx = { editor, buffer, backend, model }
+  let current = result
+  for (const fn of state(editor).postToolCallFunctions) {
+    const next = await fn(call, current, tool, ctx)
+    if (next) current = next
+  }
+  await editor.runHook("gptel-post-tool-call-functions", buffer)
+  return current
+}
+
 async function executeToolCalls(
   editor: Editor,
   deps: GptelDeps,
   buffer: BufferModel,
   toolCalls: readonly GptelToolCall[],
+  backend: GptelBackend,
+  model: string,
 ): Promise<GptelMessage[] | null> {
   const st = state(editor)
   const confirmed = await confirmToolCalls(editor, deps, toolCalls, st.tools)
@@ -1412,33 +1443,46 @@ async function executeToolCalls(
     return null
   }
   const results: GptelMessage[] = []
-  for (const call of toolCalls) {
-    const tool = st.tools.get(call.name)
+  for (const requestedCall of toolCalls) {
+    let call = requestedCall
+    let tool = st.tools.get(call.name)
+    const transformedCall = await runPreToolCallFunctions(editor, deps, buffer, backend, model, call, tool)
+    if (transformedCall === false) {
+      results.push(await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, {
+        role: "tool",
+        name: call.name,
+        toolCallId: call.id,
+        content: `Skipped gptel tool: ${call.name}`,
+      }, tool))
+      continue
+    }
+    call = transformedCall
+    tool = st.tools.get(call.name)
     if (!tool) {
-      results.push({
+      results.push(await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, {
         role: "tool",
         name: call.name,
         toolCallId: call.id,
         content: `No such gptel tool: ${call.name}`,
-      })
+      }, tool))
       continue
     }
     try {
       editor.message(`gptel tool: ${call.name}`)
       const value = await tool.function(call.arguments, { editor, buffer })
-      results.push({
+      results.push(await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, {
         role: "tool",
         name: call.name,
         toolCallId: call.id,
         content: toolResultString(value),
-      })
+      }, tool))
     } catch (error) {
-      results.push({
+      results.push(await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, {
         role: "tool",
         name: call.name,
         toolCallId: call.id,
         content: `Tool error: ${error instanceof Error ? error.message : String(error)}`,
-      })
+      }, tool))
     }
   }
   return results
@@ -1481,7 +1525,7 @@ async function requestWithTools(
       ...conversation,
       { role: "assistant", content: result.text, toolCalls: calls },
     ]
-    const toolResults = await executeToolCalls(editor, deps, buffer, calls)
+    const toolResults = await executeToolCalls(editor, deps, buffer, calls, backend, model)
     if (!toolResults) return { ...result, text: finalText }
     options.onToolResults?.(calls, toolResults, state(editor).tools)
     conversation.push(...toolResults)
@@ -2262,6 +2306,16 @@ export function gptelAddPostResponseFunction(editor: Editor, fn: GptelPostRespon
   return fn
 }
 
+export function gptelAddPreToolCallFunction(editor: Editor, fn: GptelPreToolCallFunction): GptelPreToolCallFunction {
+  state(editor).preToolCallFunctions.push(fn)
+  return fn
+}
+
+export function gptelAddPostToolCallFunction(editor: Editor, fn: GptelPostToolCallFunction): GptelPostToolCallFunction {
+  state(editor).postToolCallFunctions.push(fn)
+  return fn
+}
+
 async function applyPreset(editor: Editor, deps: GptelDeps, name: string): Promise<void> {
   const preset = state(editor).presets.get(name)
   if (!preset) {
@@ -2305,6 +2359,8 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-post-stream-hook", "string", "", "Hook run after each streaming response insertion.", "gptel")
   deps.defcustom("gptel-post-request-hook", "string", "", "Hook run after sending a gptel request.", "gptel")
   deps.defcustom("gptel-post-rewrite-functions", "string", "", "Hook run after a gptel rewrite is inserted.", "gptel")
+  deps.defcustom("gptel-pre-tool-call-functions", "string", "", "Hook run before gptel tool calls.", "gptel")
+  deps.defcustom("gptel-post-tool-call-functions", "string", "", "Hook run after gptel tool calls.", "gptel")
   deps.defcustom("gptel-org-convert-response", "boolean", true, "Convert Markdown responses to Org syntax in org-mode buffers.", "gptel")
 
   editor.command("gptel", async ({ editor, args }) => {
