@@ -88,10 +88,24 @@ export type GptelPreset = {
   tools?: string[]
 }
 
+export type GptelRequestContext = {
+  editor: Editor
+  buffer: BufferModel
+  backend: GptelBackend
+  model: string
+}
+
+export type GptelPromptTransform = (prompt: string, ctx: GptelRequestContext) => string | Promise<string>
+export type GptelResponseFilter = (response: string, ctx: GptelRequestContext) => string | Promise<string>
+export type GptelPostResponseFunction = (start: number, end: number, ctx: GptelRequestContext) => void | Promise<void>
+
 type GptelState = {
   backends: Map<string, GptelBackend>
   tools: Map<string, GptelTool>
   presets: Map<string, GptelPreset>
+  promptTransforms: GptelPromptTransform[]
+  responseFilters: GptelResponseFilter[]
+  postResponseFunctions: GptelPostResponseFunction[]
   context: GptelContextItem[]
   activeRequests: Map<string, AbortController>
   lastRequest?: {
@@ -247,6 +261,9 @@ function state(editor: Editor): GptelState {
     backends: new Map(defaultBackends().map(backend => [backend.name, backend])),
     tools: new Map(),
     presets: new Map(),
+    promptTransforms: [],
+    responseFilters: [],
+    postResponseFunctions: [],
     context: [],
     activeRequests: new Map(),
   }
@@ -429,7 +446,27 @@ function lastAssistantResponse(buffer: BufferModel): string | null {
   return messages.at(-1)?.content ?? null
 }
 
-function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferModel, prompt: string): GptelMessage[] {
+async function applyPromptTransforms(editor: Editor, buffer: BufferModel, backend: GptelBackend, model: string, prompt: string): Promise<string> {
+  let transformed = prompt
+  const ctx = { editor, buffer, backend, model }
+  for (const transform of state(editor).promptTransforms) transformed = await transform(transformed, ctx)
+  return transformed
+}
+
+async function applyResponseFilters(editor: Editor, buffer: BufferModel, backend: GptelBackend, model: string, response: string): Promise<string> {
+  let filtered = response
+  const ctx = { editor, buffer, backend, model }
+  for (const filter of state(editor).responseFilters) filtered = await filter(filtered, ctx)
+  return filtered
+}
+
+async function runPostResponseFunctions(editor: Editor, buffer: BufferModel, backend: GptelBackend, model: string, start: number, end: number): Promise<void> {
+  const ctx = { editor, buffer, backend, model }
+  for (const fn of state(editor).postResponseFunctions) await fn(start, end, ctx)
+  await editor.runHook("gptel-post-response-functions", buffer)
+}
+
+async function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferModel, prompt: string, backend: GptelBackend, model: string): Promise<GptelMessage[]> {
   const messages: GptelMessage[] = []
   const system = deps.getCustom<string>("gptel-system-message") || "You are a helpful assistant."
   if (system) messages.push({ role: "system", content: system })
@@ -439,7 +476,7 @@ function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferModel, pro
   const history = (buffer.mode === GPTEL_CHAT_MODE || buffer.minorModes.has(GPTEL_MODE)) ? chatHistory(buffer) : []
   messages.push(...history.slice(0, -1))
   const promptWithContext = context ? `${context}\n\nUser request:\n${prompt}` : prompt
-  messages.push({ role: "user", content: promptWithContext, media })
+  messages.push({ role: "user", content: await applyPromptTransforms(editor, buffer, backend, model, promptWithContext), media })
   return messages
 }
 
@@ -1015,7 +1052,7 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
   }
   const backend = backendByName(editor, deps)
   const model = currentModel(editor, deps, backend)
-  const messages = buildMessages(editor, deps, buffer, prompt)
+  const messages = await buildMessages(editor, deps, buffer, prompt, backend, model)
   const controller = new AbortController()
   state(editor).activeRequests.set(buffer.id, controller)
 
@@ -1024,16 +1061,22 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
   const responseStart = buffer.text.length
   editor.message(`gptel: ${backend.name}/${model}`)
   try {
+    await editor.runHook("gptel-pre-response-hook", buffer)
+    await editor.runHook("gptel-post-request-hook", buffer)
     const result = await requestWithTools(editor, deps, backend, model, messages, buffer, {
       signal: controller.signal,
       onDelta(delta) {
         appendWritable(buffer, delta)
         buffer.point = buffer.text.length
+        void editor.runHook("gptel-post-stream-hook", buffer)
       },
     })
     if (!buffer.text.slice(responseStart).trim() && result.text) appendWritable(buffer, result.text)
+    const filteredResponse = await applyResponseFilters(editor, buffer, backend, model, buffer.text.slice(responseStart))
+    if (filteredResponse !== buffer.text.slice(responseStart)) replaceWritable(buffer, responseStart, buffer.text.length, filteredResponse)
     const responseEnd = buffer.text.length
     const responseText = buffer.text.slice(responseStart, responseEnd)
+    await runPostResponseFunctions(editor, buffer, backend, model, responseStart, responseEnd)
     appendWritable(buffer, USER_BEGIN)
     buffer.point = buffer.text.length
     state(editor).lastRequest = {
@@ -1465,6 +1508,21 @@ export function gptelMakePreset(editor: Editor, preset: GptelPreset): GptelPrese
   return preset
 }
 
+export function gptelAddPromptTransform(editor: Editor, transform: GptelPromptTransform): GptelPromptTransform {
+  state(editor).promptTransforms.push(transform)
+  return transform
+}
+
+export function gptelAddResponseFilter(editor: Editor, filter: GptelResponseFilter): GptelResponseFilter {
+  state(editor).responseFilters.push(filter)
+  return filter
+}
+
+export function gptelAddPostResponseFunction(editor: Editor, fn: GptelPostResponseFunction): GptelPostResponseFunction {
+  state(editor).postResponseFunctions.push(fn)
+  return fn
+}
+
 async function applyPreset(editor: Editor, deps: GptelDeps, name: string): Promise<void> {
   const preset = state(editor).presets.get(name)
   if (!preset) {
@@ -1494,6 +1552,10 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-tools", "string", "", "Comma or space separated gptel tool names to include with requests.", "gptel")
   deps.defcustom("gptel-max-tool-rounds", "number", 3, "Maximum number of tool-call continuation rounds.", "gptel")
   deps.defcustom("gptel-confirm-tool-calls", "boolean", true, "Ask before running gptel tool calls.", "gptel")
+  deps.defcustom("gptel-pre-response-hook", "string", "", "Hook run before inserting a gptel response.", "gptel")
+  deps.defcustom("gptel-post-response-functions", "string", "", "Hook run after inserting a gptel response.", "gptel")
+  deps.defcustom("gptel-post-stream-hook", "string", "", "Hook run after each streaming response insertion.", "gptel")
+  deps.defcustom("gptel-post-request-hook", "string", "", "Hook run after sending a gptel request.", "gptel")
 
   editor.command("gptel", async ({ editor, args }) => {
     const name = args.join(" ") || GPTEL_BUFFER_PREFIX

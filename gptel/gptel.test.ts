@@ -5,6 +5,9 @@ import { tmpdir } from "node:os"
 import {
   defaultBackends,
   extractPrompt,
+  gptelAddPostResponseFunction,
+  gptelAddPromptTransform,
+  gptelAddResponseFilter,
   gptelMakeAzure,
   gptelMakeDeepSeek,
   gptelMakeKagi,
@@ -218,4 +221,24 @@ test("gptel variant commands switch the last response in place", async () => {
 
   expect(buffer.text.slice(state.lastRequest.responseStart, state.lastRequest.responseEnd)).toBe("alternate response")
   expect(state.lastRequest.variantIndex).toBe(1)
+})
+
+test("gptel prompt transforms, response filters, and post-response functions run", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  const seen: Array<string | number> = []
+  gptelAddPromptTransform(editor, prompt => `${prompt} transformed`)
+  gptelAddResponseFilter(editor, response => response.replace("transformed", "filtered"))
+  gptelAddPostResponseFunction(editor, (start, end) => {
+    seen.push(start, end)
+  })
+  const buffer = editor.scratch("*ChatGPT-hooks*", "User:\nhello", "gptel-chat")
+  buffer.point = buffer.text.length
+  editor.switchToBuffer(buffer.id)
+  await editor.run("gptel-send")
+
+  expect(buffer.text).toContain("Mock response to: hello filtered")
+  expect(seen).toHaveLength(2)
 })

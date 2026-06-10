@@ -2,6 +2,9 @@ export { install } from "./gptel"
 export {
   defaultBackends,
   extractPrompt,
+  gptelAddPostResponseFunction,
+  gptelAddPromptTransform,
+  gptelAddResponseFilter,
   gptelMakeAnthropic,
   gptelMakeAzure,
   gptelMakeDeepSeek,
@@ -26,7 +29,11 @@ export {
   type GptelBackend,
   type GptelContextItem,
   type GptelMessage,
+  type GptelPostResponseFunction,
+  type GptelPromptTransform,
   type GptelPreset,
+  type GptelRequestContext,
+  type GptelResponseFilter,
   type GptelTool,
   type GptelToolCall,
 } from "./gptel"
