@@ -23,6 +23,7 @@ import {
   providerMessagesForBackend,
   renderContext,
   renderContextBuffer,
+  responseRanges,
   toolCallsFromJson,
   install,
   type GptelBackend,
@@ -77,6 +78,14 @@ test("extractPrompt reads last gptel chat user turn", () => {
   const buffer = new BufferModel({ name: "*ChatGPT*", mode: "gptel-chat", text: "User:\nfirst\n\nAssistant:\nsecond\n\nUser:\nthird" })
   buffer.point = buffer.text.length
   expect(extractPrompt(buffer).prompt).toBe("third")
+})
+
+test("extractPrompt and responseRanges support custom chat markers", () => {
+  const markers = { promptPrefix: "Q> ", responsePrefix: "A> ", separator: "\n---\n" }
+  const buffer = new BufferModel({ name: "*ChatGPT*", mode: "gptel-chat", text: "Q> first\n---\nA> second\n---\nQ> third" })
+  buffer.point = buffer.text.length
+  expect(extractPrompt(buffer, markers).prompt).toBe("third")
+  expect(responseRanges(buffer, markers)).toEqual([{ start: 16, end: 22 }])
 })
 
 test("renderContext includes buffers and files", () => {
@@ -241,4 +250,43 @@ test("gptel prompt transforms, response filters, and post-response functions run
 
   expect(buffer.text).toContain("Mock response to: hello filtered")
   expect(seen).toHaveLength(2)
+})
+
+test("gptel-send honors custom prompt and response markers", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  setCustom("gptel-prompt-prefix", "Q> ")
+  setCustom("gptel-response-prefix", "A> ")
+  setCustom("gptel-response-separator", "\n---\n")
+  const buffer = editor.scratch("*ChatGPT-custom*", "Q> hello", "gptel-chat")
+  buffer.point = buffer.text.length
+  editor.switchToBuffer(buffer.id)
+  await editor.run("gptel-send")
+
+  expect(buffer.text).toContain("\n---\nA> Mock response to: hello\n---\nQ> ")
+  expect(extractPrompt(buffer, { promptPrefix: "Q> ", responsePrefix: "A> ", separator: "\n---\n" }).prompt).toBe("")
+
+  setCustom("gptel-prompt-prefix", "User:\n")
+  setCustom("gptel-response-prefix", "Assistant:\n")
+  setCustom("gptel-response-separator", "\n\n")
+})
+
+test("gptel response navigation and marking use response ranges", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const buffer = editor.scratch("*ChatGPT-nav*", "User:\none\n\nAssistant:\ntwo\n\nUser:\nthree\n\nAssistant:\nfour", "gptel-chat")
+  buffer.point = 0
+  editor.switchToBuffer(buffer.id)
+
+  await editor.run("gptel-end-of-response")
+  expect(buffer.point).toBe("User:\none\n\nAssistant:\ntwo".length)
+  await editor.run("gptel-end-of-response")
+  expect(buffer.point).toBe(buffer.text.length)
+  await editor.run("gptel-beginning-of-response")
+  expect(buffer.text.slice(buffer.point, buffer.point + 4)).toBe("four")
+  await editor.run("gptel-mark-response")
+  expect(buffer.markActive).toBe(true)
+  expect(buffer.text.slice(Math.min(buffer.point, buffer.mark!), Math.max(buffer.point, buffer.mark!))).toBe("four")
 })

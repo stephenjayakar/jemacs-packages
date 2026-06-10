@@ -135,8 +135,6 @@ const GPTEL_MODE = "gptel-mode"
 const GPTEL_CHAT_MODE = "gptel-chat"
 const GPTEL_CONTEXT_MODE = "gptel-context"
 const GPTEL_BUFFER_PREFIX = "*ChatGPT*"
-const RESPONSE_BEGIN = "\n\nAssistant:\n"
-const USER_BEGIN = "\n\nUser:\n"
 const CONTEXT_SECTIONS = "gptel-context-sections"
 const CONTEXT_FLAGGED = "gptel-context-flagged"
 
@@ -144,6 +142,12 @@ type GptelContextSection = {
   index: number
   start: number
   end: number
+}
+
+export type GptelChatMarkers = {
+  promptPrefix: string
+  responsePrefix: string
+  separator: string
 }
 
 function jemacsHome(): string {
@@ -354,14 +358,47 @@ function activeRegionText(buffer: BufferModel): string | null {
   return buffer.text.slice(bounds[0], bounds[1])
 }
 
-export function extractPrompt(buffer: BufferModel): { prompt: string; start: number; end: number } {
+function defaultChatMarkers(): GptelChatMarkers {
+  return { promptPrefix: "User:\n", responsePrefix: "Assistant:\n", separator: "\n\n" }
+}
+
+function chatMarkers(deps: GptelDeps): GptelChatMarkers {
+  const defaults = defaultChatMarkers()
+  return {
+    promptPrefix: deps.getCustom<string>("gptel-prompt-prefix") ?? defaults.promptPrefix,
+    responsePrefix: deps.getCustom<string>("gptel-response-prefix") ?? defaults.responsePrefix,
+    separator: deps.getCustom<string>("gptel-response-separator") ?? defaults.separator,
+  }
+}
+
+function markerText(markers: GptelChatMarkers, role: "user" | "assistant", atStart = false): string {
+  const prefix = role === "user" ? markers.promptPrefix : markers.responsePrefix
+  return `${atStart ? "" : markers.separator}${prefix}`
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function markerAlternatives(markers: GptelChatMarkers): string[] {
+  return [
+    markerText(markers, "user", true),
+    markerText(markers, "user"),
+    markerText(markers, "assistant", true),
+    markerText(markers, "assistant"),
+  ].filter((marker, index, all) => marker.length > 0 && all.indexOf(marker) === index)
+}
+
+export function extractPrompt(buffer: BufferModel, markers: GptelChatMarkers = defaultChatMarkers()): { prompt: string; start: number; end: number } {
   const bounds = regionBounds(buffer)
   if (bounds) return { prompt: buffer.text.slice(bounds[0], bounds[1]).trim(), start: bounds[0], end: bounds[1] }
   if (buffer.mode === GPTEL_CHAT_MODE || buffer.minorModes.has(GPTEL_MODE)) {
     const beforePoint = buffer.text.slice(0, buffer.point)
-    const user = beforePoint.lastIndexOf("User:\n")
-    const assistant = beforePoint.lastIndexOf("Assistant:\n")
-    const start = user >= 0 && user > assistant ? user + "User:\n".length : 0
+    const user = Math.max(beforePoint.lastIndexOf(markerText(markers, "user", true)), beforePoint.lastIndexOf(markerText(markers, "user")))
+    const assistant = Math.max(beforePoint.lastIndexOf(markerText(markers, "assistant", true)), beforePoint.lastIndexOf(markerText(markers, "assistant")))
+    const start = user >= 0 && user > assistant
+      ? user + (beforePoint.startsWith(markerText(markers, "user", true), user) ? markerText(markers, "user", true).length : markerText(markers, "user").length)
+      : 0
     return { prompt: beforePoint.slice(start).trim(), start, end: buffer.point }
   }
   return { prompt: buffer.text.slice(0, buffer.point).trim(), start: 0, end: buffer.point }
@@ -430,19 +467,42 @@ export function renderContextBuffer(items: readonly GptelContextItem[], flagged:
   return { text: chunks.join("\n"), sections }
 }
 
-function chatHistory(buffer: BufferModel): GptelMessage[] {
-  const messages: GptelMessage[] = []
-  const regex = /(?:^|\n\n)(User|Assistant):\n([\s\S]*?)(?=\n\n(?:User|Assistant):\n|$)/g
+export function responseRanges(buffer: BufferModel, markers: GptelChatMarkers = defaultChatMarkers()): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = []
+  const responseMarkers = [markerText(markers, "assistant", true), markerText(markers, "assistant")]
+    .filter((marker, index, all) => marker.length > 0 && all.indexOf(marker) === index)
+    .map(escapeRegExp)
+  if (!responseMarkers.length) return ranges
+  const nextMarkers = markerAlternatives(markers).map(escapeRegExp).join("|")
+  const regex = new RegExp(`(?:${responseMarkers.join("|")})([\\s\\S]*?)(?=${nextMarkers}|$)`, "g")
   for (const match of buffer.text.matchAll(regex)) {
-    const role = match[1] === "User" ? "user" : "assistant"
+    const full = match[0] ?? ""
+    const body = match[1] ?? ""
+    const end = (match.index ?? 0) + full.length
+    ranges.push({ start: end - body.length, end })
+  }
+  return ranges
+}
+
+function responseRangeAtPoint(buffer: BufferModel, markers: GptelChatMarkers): { start: number; end: number } | null {
+  return responseRanges(buffer, markers).find(range => buffer.point >= range.start && buffer.point <= range.end) ?? null
+}
+
+function chatHistory(buffer: BufferModel, markers: GptelChatMarkers = defaultChatMarkers()): GptelMessage[] {
+  const messages: GptelMessage[] = []
+  const alternatives = markerAlternatives(markers)
+  const regex = new RegExp(`(${alternatives.map(escapeRegExp).join("|")})([\\s\\S]*?)(?=${alternatives.map(escapeRegExp).join("|")}|$)`, "g")
+  for (const match of buffer.text.matchAll(regex)) {
+    const marker = match[1] ?? ""
+    const role = marker === markerText(markers, "user", true) || marker === markerText(markers, "user") ? "user" : "assistant"
     const content = (match[2] ?? "").trim()
     if (content) messages.push({ role, content })
   }
   return messages
 }
 
-function lastAssistantResponse(buffer: BufferModel): string | null {
-  const messages = chatHistory(buffer).filter(message => message.role === "assistant")
+function lastAssistantResponse(buffer: BufferModel, markers: GptelChatMarkers = defaultChatMarkers()): string | null {
+  const messages = chatHistory(buffer, markers).filter(message => message.role === "assistant")
   return messages.at(-1)?.content ?? null
 }
 
@@ -466,14 +526,14 @@ async function runPostResponseFunctions(editor: Editor, buffer: BufferModel, bac
   await editor.runHook("gptel-post-response-functions", buffer)
 }
 
-async function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferModel, prompt: string, backend: GptelBackend, model: string): Promise<GptelMessage[]> {
+async function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferModel, prompt: string, backend: GptelBackend, model: string, markers: GptelChatMarkers): Promise<GptelMessage[]> {
   const messages: GptelMessage[] = []
   const system = deps.getCustom<string>("gptel-system-message") || "You are a helpful assistant."
   if (system) messages.push({ role: "system", content: system })
   const st = state(editor)
   const context = renderContext(st.context)
   const media = mediaPartsFromContext(st.context)
-  const history = (buffer.mode === GPTEL_CHAT_MODE || buffer.minorModes.has(GPTEL_MODE)) ? chatHistory(buffer) : []
+  const history = (buffer.mode === GPTEL_CHAT_MODE || buffer.minorModes.has(GPTEL_MODE)) ? chatHistory(buffer, markers) : []
   messages.push(...history.slice(0, -1))
   const promptWithContext = context ? `${context}\n\nUser request:\n${prompt}` : prompt
   messages.push({ role: "user", content: await applyPromptTransforms(editor, buffer, backend, model, promptWithContext), media })
@@ -1000,14 +1060,14 @@ async function requestWithTools(
   return { text: finalText }
 }
 
-function ensureChatBuffer(editor: Editor, name = GPTEL_BUFFER_PREFIX): BufferModel {
+function ensureChatBuffer(editor: Editor, name = GPTEL_BUFFER_PREFIX, markers: GptelChatMarkers = defaultChatMarkers()): BufferModel {
   const existing = [...editor.buffers.values()].find(buffer => buffer.name === name)
   if (existing) {
     editor.switchToBuffer(existing.id)
     editor.enterMode(existing, GPTEL_CHAT_MODE)
     return existing
   }
-  const buffer = editor.scratch(name, "# Jemacs gptel\n\nUser:\n", GPTEL_CHAT_MODE)
+  const buffer = editor.scratch(name, `# Jemacs gptel\n\n${markerText(markers, "user", true)}`, GPTEL_CHAT_MODE)
   buffer.point = buffer.text.length
   return buffer
 }
@@ -1045,19 +1105,20 @@ function applyTransientArgs(editor: Editor, deps: GptelDeps, args: string[]): vo
 
 async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferModel, args: string[] = [], priorVariants: string[] = []): Promise<void> {
   applyTransientArgs(editor, deps, args)
-  const { prompt } = extractPrompt(buffer)
+  const markers = chatMarkers(deps)
+  const { prompt } = extractPrompt(buffer, markers)
   if (!prompt) {
     editor.message("gptel: empty prompt")
     return
   }
   const backend = backendByName(editor, deps)
   const model = currentModel(editor, deps, backend)
-  const messages = await buildMessages(editor, deps, buffer, prompt, backend, model)
+  const messages = await buildMessages(editor, deps, buffer, prompt, backend, model, markers)
   const controller = new AbortController()
   state(editor).activeRequests.set(buffer.id, controller)
 
   const insertionStart = buffer.text.length
-  appendWritable(buffer, RESPONSE_BEGIN)
+  appendWritable(buffer, markerText(markers, "assistant"))
   const responseStart = buffer.text.length
   editor.message(`gptel: ${backend.name}/${model}`)
   try {
@@ -1077,7 +1138,7 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
     const responseEnd = buffer.text.length
     const responseText = buffer.text.slice(responseStart, responseEnd)
     await runPostResponseFunctions(editor, buffer, backend, model, responseStart, responseEnd)
-    appendWritable(buffer, USER_BEGIN)
+    appendWritable(buffer, markerText(markers, "user"))
     buffer.point = buffer.text.length
     state(editor).lastRequest = {
       bufferId: buffer.id,
@@ -1095,7 +1156,7 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
     editor.message(`gptel: done (${backend.name}/${model})`)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    appendWritable(buffer, `\n\n[gptel error] ${message}${USER_BEGIN}`)
+    appendWritable(buffer, `${markers.separator}[gptel error] ${message}${markerText(markers, "user")}`)
     editor.message(`gptel failed: ${message}`)
   } finally {
     state(editor).activeRequests.delete(buffer.id)
@@ -1123,6 +1184,31 @@ function switchLastVariant(editor: Editor, direction: number): void {
   buffer.point = last.responseStart + next.length
   editor.message(`gptel: variant ${nextIndex + 1}/${last.variants.length}`)
   void editor.changed("gptel-variant")
+}
+
+function moveResponseBoundary(editor: Editor, deps: GptelDeps, buffer: BufferModel, boundary: "start" | "end", direction: number): void {
+  const markers = chatMarkers(deps)
+  const ranges = responseRanges(buffer, markers)
+  const current = direction >= 0
+    ? ranges.find(range => range[boundary] > buffer.point)
+    : [...ranges].reverse().find(range => range[boundary] < buffer.point)
+  if (!current) {
+    editor.message(`gptel: no ${direction >= 0 ? "next" : "previous"} response`)
+    return
+  }
+  buffer.point = current[boundary]
+}
+
+function markResponse(editor: Editor, deps: GptelDeps, buffer: BufferModel): void {
+  const range = responseRangeAtPoint(buffer, chatMarkers(deps))
+  if (!range) {
+    editor.message("gptel: no response at point")
+    return
+  }
+  buffer.point = range.start
+  buffer.mark = range.end
+  buffer.markActive = true
+  editor.message("gptel: marked response")
 }
 
 async function rewriteRegion(editor: Editor, deps: GptelDeps, buffer: BufferModel, instruction: string): Promise<void> {
@@ -1205,6 +1291,8 @@ function installModes(deps: GptelDeps): void {
   chatMap.bind("C-c C-c", "gptel-send")
   chatMap.bind("C-c C-k", "gptel-abort")
   chatMap.bind("C-c C-r", "gptel-rewrite")
+  chatMap.bind("M-p", "gptel-beginning-of-response")
+  chatMap.bind("M-n", "gptel-end-of-response")
   chatMap.bind("C-c C-v p", "gptel-previous-variant")
   chatMap.bind("C-c C-v n", "gptel-next-variant")
   chatMap.bind("C-c C-a", "gptel-add")
@@ -1228,6 +1316,8 @@ function installModes(deps: GptelDeps): void {
   minorMap.bind("C-c C-c", "gptel-send")
   minorMap.bind("C-c C-r", "gptel-rewrite")
   minorMap.bind("C-c C-a", "gptel-add")
+  minorMap.bind("M-p", "gptel-beginning-of-response")
+  minorMap.bind("M-n", "gptel-end-of-response")
   deps.defineMinorMode({ name: GPTEL_MODE, lighter: " GPTel", keymap: minorMap })
 }
 
@@ -1327,6 +1417,7 @@ function describeState(editor: Editor, deps: GptelDeps): string {
     "  gptel-rewrite          rewrite active region",
     "  gptel-regenerate       regenerate the last response",
     "  gptel-previous-variant cycle response variants",
+    "  gptel-mark-response    mark the response at point",
     "  gptel-menu             inspect and change backend/model",
     "  gptel-abort            abort active request",
   ].join("\n")
@@ -1361,6 +1452,7 @@ const gptelMenuDefinition: TransientDefinition = {
         { key: "R", label: "Regenerate", command: "gptel-regenerate" },
         { key: "v p", label: "Previous variant", command: "gptel-previous-variant" },
         { key: "v n", label: "Next variant", command: "gptel-next-variant" },
+        { key: "m", label: "Mark response", command: "gptel-mark-response" },
         { key: "y", label: "Copy response", command: "gptel-copy-last-response" },
         { key: "p", label: "Preset", command: "gptel-preset" },
         { key: "T", label: "Tools", command: "gptel-tools" },
@@ -1552,6 +1644,9 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-tools", "string", "", "Comma or space separated gptel tool names to include with requests.", "gptel")
   deps.defcustom("gptel-max-tool-rounds", "number", 3, "Maximum number of tool-call continuation rounds.", "gptel")
   deps.defcustom("gptel-confirm-tool-calls", "boolean", true, "Ask before running gptel tool calls.", "gptel")
+  deps.defcustom("gptel-prompt-prefix", "string", "User:\n", "String inserted before user prompts in gptel chat buffers.", "gptel")
+  deps.defcustom("gptel-response-prefix", "string", "Assistant:\n", "String inserted before assistant responses in gptel chat buffers.", "gptel")
+  deps.defcustom("gptel-response-separator", "string", "\n\n", "String inserted between gptel prompt and response sections.", "gptel")
   deps.defcustom("gptel-pre-response-hook", "string", "", "Hook run before inserting a gptel response.", "gptel")
   deps.defcustom("gptel-post-response-functions", "string", "", "Hook run after inserting a gptel response.", "gptel")
   deps.defcustom("gptel-post-stream-hook", "string", "", "Hook run after each streaming response insertion.", "gptel")
@@ -1559,7 +1654,7 @@ export async function install(editor: Editor): Promise<void> {
 
   editor.command("gptel", async ({ editor, args }) => {
     const name = args.join(" ") || GPTEL_BUFFER_PREFIX
-    ensureChatBuffer(editor, name)
+    ensureChatBuffer(editor, name, chatMarkers(deps))
   }, "Start or switch to a gptel chat buffer.")
 
   editor.command("gptel-send", async ({ editor, buffer, args }) => {
@@ -1702,8 +1797,22 @@ export async function install(editor: Editor): Promise<void> {
     switchLastVariant(editor, -1)
   }, "Switch the last gptel response to the next variant.")
 
+  editor.command("gptel-beginning-of-response", ({ editor, buffer, args }) => {
+    const count = Math.max(1, Number(args[0] ?? 1) || 1)
+    for (let i = 0; i < count; i++) moveResponseBoundary(editor, deps, buffer, "start", -1)
+  }, "Move point to the beginning of a gptel response.")
+
+  editor.command("gptel-end-of-response", ({ editor, buffer, args }) => {
+    const count = Math.max(1, Number(args[0] ?? 1) || 1)
+    for (let i = 0; i < count; i++) moveResponseBoundary(editor, deps, buffer, "end", 1)
+  }, "Move point to the end of a gptel response.")
+
+  editor.command("gptel-mark-response", ({ editor, buffer }) => {
+    markResponse(editor, deps, buffer)
+  }, "Mark the gptel response at point.")
+
   editor.command("gptel-copy-last-response", ({ editor, buffer }) => {
-    const response = lastAssistantResponse(buffer)
+    const response = lastAssistantResponse(buffer, chatMarkers(deps))
     if (!response) {
       editor.message("gptel: no assistant response in this buffer")
       return
