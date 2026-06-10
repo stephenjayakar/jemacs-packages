@@ -104,9 +104,18 @@ type RequestResult = {
 const STATE_KEY = "gptel-state"
 const GPTEL_MODE = "gptel-mode"
 const GPTEL_CHAT_MODE = "gptel-chat"
+const GPTEL_CONTEXT_MODE = "gptel-context"
 const GPTEL_BUFFER_PREFIX = "*ChatGPT*"
 const RESPONSE_BEGIN = "\n\nAssistant:\n"
 const USER_BEGIN = "\n\nUser:\n"
+const CONTEXT_SECTIONS = "gptel-context-sections"
+const CONTEXT_FLAGGED = "gptel-context-flagged"
+
+type GptelContextSection = {
+  index: number
+  start: number
+  end: number
+}
 
 function jemacsHome(): string {
   return process.env.JEMACS_HOME ?? join(homedir(), "programming", "jemacs", "jemacs-opentui")
@@ -298,6 +307,54 @@ export function renderContext(items: readonly GptelContextItem[]): string {
     } else parts.push(`\n--- ${item.name} ---\n${item.text}`)
   }
   return parts.join("\n")
+}
+
+function contextItemTitle(item: GptelContextItem, index: number): string {
+  if (item.type === "buffer") return `${index + 1}. Buffer: ${item.name}`
+  if (item.type === "region") return `${index + 1}. Region: ${item.name}:${item.start}-${item.end}`
+  if (item.type === "file") return `${index + 1}. File: ${item.path}`
+  if (item.type === "directory") return `${index + 1}. Directory: ${item.path} (${item.files.length} files)`
+  return `${index + 1}. ${item.name}`
+}
+
+function contextItemPreview(item: GptelContextItem): string {
+  const text = item.type === "directory"
+    ? item.files.map(file => `${file.path}\n${file.text}`).join("\n\n")
+    : item.type === "file" && item.binary
+      ? "[binary file omitted]"
+      : item.text
+  const lines = text.split("\n").slice(0, 12)
+  const preview = lines.join("\n")
+  return text.split("\n").length > lines.length ? `${preview}\n...` : preview
+}
+
+export function renderContextBuffer(items: readonly GptelContextItem[], flagged: ReadonlySet<number> = new Set()): {
+  text: string
+  sections: GptelContextSection[]
+} {
+  const sections: GptelContextSection[] = []
+  const chunks = [
+    "gptel context",
+    "",
+    "d: mark/unmark deletion   n/p: next/previous   RET: visit   C-c C-c: apply   C-c C-k: quit",
+    "",
+  ]
+  let offset = chunks.join("\n").length
+  if (items.length === 0) {
+    chunks.push("No gptel context.")
+    return { text: chunks.join("\n"), sections }
+  }
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index]!
+    const marker = flagged.has(index) ? "D" : " "
+    const body = `[${marker}] ${contextItemTitle(item, index)}\n${contextItemPreview(item)}\n`
+    const start = offset
+    const end = start + body.length
+    sections.push({ index, start, end })
+    chunks.push(body)
+    offset = end + 1
+  }
+  return { text: chunks.join("\n"), sections }
 }
 
 function chatHistory(buffer: BufferModel): GptelMessage[] {
@@ -870,12 +927,98 @@ function installModes(deps: GptelDeps): void {
   chatMap.bind("C-c C-n", "gptel-context-remove-all")
   deps.defineMode({ name: GPTEL_CHAT_MODE, parent: "markdown", keymap: chatMap, fontLock: gptelFontLock })
 
+  const contextMap = new deps.Keymap("gptel-context-map")
+  contextMap.bind("C-c C-c", "gptel-context-confirm")
+  contextMap.bind("C-c C-k", "gptel-context-quit")
+  contextMap.bind("RET", "gptel-context-visit")
+  contextMap.bind("return", "gptel-context-visit")
+  contextMap.bind("enter", "gptel-context-visit")
+  contextMap.bind("n", "gptel-context-next")
+  contextMap.bind("p", "gptel-context-previous")
+  contextMap.bind("d", "gptel-context-flag-deletion")
+  contextMap.bind("g", "gptel-context")
+  deps.defineMode({ name: GPTEL_CONTEXT_MODE, parent: "text", keymap: contextMap })
+
   const minorMap = new deps.Keymap("gptel-mode-map")
   minorMap.bind("C-c RET", "gptel-send")
   minorMap.bind("C-c C-c", "gptel-send")
   minorMap.bind("C-c C-r", "gptel-rewrite")
   minorMap.bind("C-c C-a", "gptel-add")
   deps.defineMinorMode({ name: GPTEL_MODE, lighter: " GPTel", keymap: minorMap })
+}
+
+function contextBuffer(editor: Editor): BufferModel {
+  const st = state(editor)
+  const existing = [...editor.buffers.values()].find(buffer => buffer.name === "*gptel-context*")
+  const flagged = existing?.locals.get(CONTEXT_FLAGGED) as Set<number> | undefined ?? new Set<number>()
+  const rendered = renderContextBuffer(st.context, flagged)
+  const buffer = existing
+    ? editor.switchToBuffer(existing.id)
+    : editor.scratch("*gptel-context*", "", GPTEL_CONTEXT_MODE)
+  const wasReadOnly = buffer.readOnly
+  buffer.readOnly = false
+  buffer.setText(rendered.text, false)
+  buffer.readOnly = true || wasReadOnly
+  buffer.locals.set(CONTEXT_SECTIONS, rendered.sections)
+  buffer.locals.set(CONTEXT_FLAGGED, flagged)
+  editor.enterMode(buffer, GPTEL_CONTEXT_MODE)
+  return buffer
+}
+
+function contextSections(buffer: BufferModel): GptelContextSection[] {
+  return (buffer.locals.get(CONTEXT_SECTIONS) as GptelContextSection[] | undefined) ?? []
+}
+
+function contextFlagged(buffer: BufferModel): Set<number> {
+  let flagged = buffer.locals.get(CONTEXT_FLAGGED) as Set<number> | undefined
+  if (!flagged) {
+    flagged = new Set()
+    buffer.locals.set(CONTEXT_FLAGGED, flagged)
+  }
+  return flagged
+}
+
+function contextSectionAtPoint(buffer: BufferModel): GptelContextSection | undefined {
+  const sections = contextSections(buffer)
+  return sections.find(section => buffer.point >= section.start && buffer.point <= section.end)
+    ?? sections.find(section => buffer.point < section.start)
+    ?? sections.at(-1)
+}
+
+function moveContextSection(buffer: BufferModel, delta: number): boolean {
+  const sections = contextSections(buffer)
+  if (!sections.length) return false
+  const current = contextSectionAtPoint(buffer)
+  const currentIndex = current ? sections.indexOf(current) : -1
+  const next = Math.max(0, Math.min(sections.length - 1, currentIndex + delta))
+  buffer.point = sections[next]!.start
+  return true
+}
+
+async function visitContextItem(editor: Editor, item: GptelContextItem): Promise<void> {
+  if (item.type === "buffer" || item.type === "region") {
+    const buffer = editor.buffers.get(item.bufferId)
+    if (!buffer) {
+      editor.message(`gptel: source buffer no longer exists: ${item.name}`)
+      return
+    }
+    editor.switchToBuffer(buffer.id)
+    if (item.type === "region") {
+      buffer.point = item.start
+      buffer.mark = item.end
+      buffer.markActive = true
+    }
+    return
+  }
+  if (item.type === "file") {
+    await editor.openFile(item.path)
+    return
+  }
+  if (item.type === "directory") {
+    await editor.openDirectory(item.path)
+    return
+  }
+  editor.message(`gptel: text context ${item.name} has no source to visit`)
 }
 
 function describeState(editor: Editor, deps: GptelDeps): string {
@@ -1043,8 +1186,73 @@ export async function install(editor: Editor): Promise<void> {
   }, "Remove all gptel context.")
 
   editor.command("gptel-context", ({ editor }) => {
-    editor.scratch("*gptel-context*", renderContext(state(editor).context) || "No gptel context.", "text")
+    contextBuffer(editor)
   }, "Show current gptel context.")
+
+  editor.command("gptel-context-next", ({ editor, buffer }) => {
+    if (buffer.mode !== GPTEL_CONTEXT_MODE || !moveContextSection(buffer, 1)) editor.message("gptel: no next context")
+  }, "Move to the next gptel context entry.")
+
+  editor.command("gptel-context-previous", ({ editor, buffer }) => {
+    if (buffer.mode !== GPTEL_CONTEXT_MODE || !moveContextSection(buffer, -1)) editor.message("gptel: no previous context")
+  }, "Move to the previous gptel context entry.")
+
+  editor.command("gptel-context-flag-deletion", ({ editor, buffer }) => {
+    if (buffer.mode !== GPTEL_CONTEXT_MODE) return
+    const section = contextSectionAtPoint(buffer)
+    if (!section) {
+      editor.message("gptel: no context entry here")
+      return
+    }
+    const flagged = contextFlagged(buffer)
+    if (flagged.has(section.index)) flagged.delete(section.index)
+    else flagged.add(section.index)
+    const point = buffer.point
+    contextBuffer(editor).point = point
+  }, "Mark or unmark the current context entry for deletion.")
+
+  editor.command("gptel-context-confirm", ({ editor, buffer }) => {
+    if (buffer.mode !== GPTEL_CONTEXT_MODE) return
+    const flagged = [...contextFlagged(buffer)].sort((a, b) => b - a)
+    const st = state(editor)
+    for (const index of flagged) st.context.splice(index, 1)
+    buffer.locals.set(CONTEXT_FLAGGED, new Set<number>())
+    contextBuffer(editor)
+    editor.message(`gptel: removed ${flagged.length} context item${flagged.length === 1 ? "" : "s"}`)
+  }, "Apply deletion marks in the gptel context buffer.")
+
+  editor.command("gptel-context-quit", ({ editor }) => {
+    const other = editor.otherBuffer()
+    if (other) editor.switchToBuffer(other.id)
+  }, "Quit the gptel context buffer.")
+
+  editor.command("gptel-context-visit", async ({ editor, buffer }) => {
+    if (buffer.mode !== GPTEL_CONTEXT_MODE) return
+    const section = contextSectionAtPoint(buffer)
+    const item = section ? state(editor).context[section.index] : undefined
+    if (!item) {
+      editor.message("gptel: no context entry here")
+      return
+    }
+    await visitContextItem(editor, item)
+  }, "Visit the source for the current gptel context entry.")
+
+  editor.command("gptel-context-remove", ({ editor, buffer }) => {
+    if (buffer.mode === GPTEL_CONTEXT_MODE) {
+      const section = contextSectionAtPoint(buffer)
+      if (section) {
+        state(editor).context.splice(section.index, 1)
+        contextBuffer(editor)
+        editor.message("gptel: removed context entry")
+      }
+      return
+    }
+    const st = state(editor)
+    const before = st.context.length
+    st.context = st.context.filter(item =>
+      !(("bufferId" in item) && item.bufferId === buffer.id))
+    editor.message(`gptel: removed ${before - st.context.length} context item${before - st.context.length === 1 ? "" : "s"}`)
+  }, "Remove gptel context for this buffer or current context entry.")
 
   editor.command("gptel-rewrite", async ({ editor, buffer, args }) => {
     const instruction = args.join(" ") || await editor.prompt("Rewrite instruction: ", "Improve clarity while preserving meaning.", "gptel-rewrite")

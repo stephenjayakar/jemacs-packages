@@ -8,6 +8,7 @@ export {
   gptelMakePreset,
   gptelMakeTool,
   parseSseEvents,
+  renderContextBuffer,
   renderContext,
   toolCallsFromJson,
   type GptelBackend,

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { defaultBackends, extractPrompt, parseSseEvents, renderContext, toolCallsFromJson, type GptelBackend } from "./gptel"
+import { defaultBackends, extractPrompt, parseSseEvents, renderContext, renderContextBuffer, toolCallsFromJson, type GptelBackend } from "./gptel"
 import { BufferModel } from "@jemacs/core"
 
 test("default backends include Stephen's configured Claude backend", () => {
@@ -29,6 +29,18 @@ test("renderContext includes buffers and files", () => {
   ])
   expect(text).toContain("Buffer: a.ts")
   expect(text).toContain("File: /tmp/b.ts")
+})
+
+test("renderContextBuffer creates navigable sections and deletion markers", () => {
+  const rendered = renderContextBuffer([
+    { type: "buffer", name: "a.ts", bufferId: "1", text: "alpha\nbeta" },
+    { type: "file", path: "/tmp/b.ts", text: "gamma" },
+  ], new Set([1]))
+  expect(rendered.text).toContain("[ ] 1. Buffer: a.ts")
+  expect(rendered.text).toContain("[D] 2. File: /tmp/b.ts")
+  expect(rendered.sections).toHaveLength(2)
+  expect(rendered.sections[0]!.start).toBeLessThan(rendered.sections[0]!.end)
+  expect(rendered.sections[1]!.start).toBeGreaterThan(rendered.sections[0]!.end)
 })
 
 test("parseSseEvents joins data lines", () => {
