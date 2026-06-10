@@ -28,6 +28,7 @@ export {
   renderContext,
   responseRanges,
   toolCallsFromJson,
+  usageFromJson,
   type GptelBackend,
   type GptelChatMarkers,
   type GptelContextItem,
@@ -37,6 +38,7 @@ export {
   type GptelPreset,
   type GptelRequestContext,
   type GptelResponseFilter,
+  type GptelTokenUsage,
   type GptelTool,
   type GptelToolCall,
 } from "./gptel"

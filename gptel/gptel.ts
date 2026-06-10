@@ -73,6 +73,13 @@ export type GptelToolCall = {
   arguments: unknown
 }
 
+export type GptelTokenUsage = {
+  input?: number
+  output?: number
+  cached?: number
+  cache?: number
+}
+
 export type GptelMediaPart = {
   path: string
   mime: string
@@ -109,6 +116,7 @@ type GptelState = {
   postResponseFunctions: GptelPostResponseFunction[]
   context: GptelContextItem[]
   activeRequests: Map<string, AbortController>
+  tokenUsage: GptelTokenUsage
   lastRequest?: {
     bufferId: string
     prompt: string
@@ -119,6 +127,7 @@ type GptelState = {
     insertionEnd: number
     backend: string
     model: string
+    usage?: GptelTokenUsage
     variants: string[]
     variantIndex: number
   }
@@ -135,7 +144,7 @@ type GptelState = {
 type RequestResult = {
   text: string
   raw?: unknown
-  usage?: Record<string, unknown>
+  usage?: GptelTokenUsage
   toolCalls?: GptelToolCall[]
 }
 
@@ -279,6 +288,7 @@ function state(editor: Editor): GptelState {
     postResponseFunctions: [],
     context: [],
     activeRequests: new Map(),
+    tokenUsage: {},
   }
   editor.locals.set(STATE_KEY, next)
   return next
@@ -857,6 +867,65 @@ export function toolCallsFromJson(backend: GptelBackend, json: unknown): GptelTo
   }))
 }
 
+function numberOrUndefined(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+export function usageFromJson(backend: GptelBackend, json: unknown): GptelTokenUsage | undefined {
+  const data = json as Record<string, any>
+  const usage = data.usage ?? data.response?.usage
+  if (!usage) return undefined
+  if (backend.kind === "anthropic") {
+    const input = (numberOrUndefined(usage.input_tokens) ?? 0) + (numberOrUndefined(usage.cache_creation_input_tokens) ?? 0)
+    const output = numberOrUndefined(usage.output_tokens)
+    const cached = numberOrUndefined(usage.cache_read_input_tokens)
+    return { input, output, cached, cache: numberOrUndefined(usage.cache_creation_input_tokens) }
+  }
+  if (backend.kind === "gemini") {
+    return {
+      input: numberOrUndefined(usage.promptTokenCount),
+      output: numberOrUndefined(usage.candidatesTokenCount),
+    }
+  }
+  if (backend.kind === "ollama") {
+    return {
+      input: numberOrUndefined(data.prompt_eval_count),
+      output: numberOrUndefined(data.eval_count),
+    }
+  }
+  if (backend.kind === "kagi") {
+    const tokens = numberOrUndefined(data.data?.tokens ?? data.tokens)
+    return tokens == null ? undefined : { input: tokens, output: tokens }
+  }
+  const inputTotal = numberOrUndefined(usage.prompt_tokens ?? usage.input_tokens)
+  const cached = numberOrUndefined(usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens)
+  return {
+    input: inputTotal == null ? undefined : inputTotal - (cached ?? 0),
+    output: numberOrUndefined(usage.completion_tokens ?? usage.output_tokens),
+    cached,
+  }
+}
+
+function addUsage(a: GptelTokenUsage, b: GptelTokenUsage | undefined): GptelTokenUsage {
+  if (!b) return a
+  return {
+    input: (a.input ?? 0) + (b.input ?? 0),
+    output: (a.output ?? 0) + (b.output ?? 0),
+    cached: (a.cached ?? 0) + (b.cached ?? 0),
+    cache: (a.cache ?? 0) + (b.cache ?? 0),
+  }
+}
+
+function formatUsage(usage: GptelTokenUsage | undefined): string {
+  if (!usage) return "(none)"
+  const parts: string[] = []
+  if (usage.input != null) parts.push(`${usage.input} in`)
+  if (usage.cached) parts.push(`${usage.cached} cached`)
+  if (usage.cache) parts.push(`${usage.cache} cache`)
+  if (usage.output != null) parts.push(`${usage.output} out`)
+  return parts.join(", ") || "(none)"
+}
+
 function textFromJson(backend: GptelBackend, json: unknown): string {
   const data = json as Record<string, any>
   if (backend.kind === "anthropic") {
@@ -933,13 +1002,14 @@ async function requestLlm(
   }
   if (!stream || !response.body) {
     const json = await response.json()
-    return { text: textFromJson(backend, json), raw: json, toolCalls: toolCallsFromJson(backend, json) }
+    return { text: textFromJson(backend, json), raw: json, usage: usageFromJson(backend, json), toolCalls: toolCallsFromJson(backend, json) }
   }
 
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let pending = ""
   let text = ""
+  let usage: GptelTokenUsage | undefined
   for (;;) {
     const { done, value } = await reader.read()
     if (done) break
@@ -947,6 +1017,8 @@ async function requestLlm(
     const complete = pending.split(/\n\n+/)
     pending = complete.pop() ?? ""
     for (const event of parseSseEvents(complete.join("\n\n"))) {
+      const parsed = parseJsonMaybe(event)
+      if (typeof parsed === "object" && parsed) usage = usageFromJson(backend, parsed) ?? usage
       const delta = textFromStreamEvent(backend, event)
       if (!delta) continue
       text += delta
@@ -955,11 +1027,13 @@ async function requestLlm(
     }
   }
   for (const event of parseSseEvents(pending)) {
+    const parsed = parseJsonMaybe(event)
+    if (typeof parsed === "object" && parsed) usage = usageFromJson(backend, parsed) ?? usage
     const delta = textFromStreamEvent(backend, event)
     text += delta
     options.onDelta?.(delta)
   }
-  return { text }
+  return { text, usage }
 }
 
 function toolResultString(result: unknown): string {
@@ -1182,10 +1256,12 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
     if (filteredResponse !== buffer.text.slice(responseStart)) replaceWritable(buffer, responseStart, buffer.text.length, filteredResponse)
     const responseEnd = buffer.text.length
     const responseText = buffer.text.slice(responseStart, responseEnd)
+    const st = state(editor)
+    st.tokenUsage = addUsage(st.tokenUsage, result.usage)
     await runPostResponseFunctions(editor, buffer, backend, model, responseStart, responseEnd)
     appendWritable(buffer, markerText(markers, "user"))
     buffer.point = buffer.text.length
-    state(editor).lastRequest = {
+    st.lastRequest = {
       bufferId: buffer.id,
       prompt,
       messages,
@@ -1195,6 +1271,7 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
       insertionEnd: buffer.text.length,
       backend: backend.name,
       model,
+      usage: result.usage,
       variants: [responseText, ...priorVariants.filter(variant => variant !== responseText)],
       variantIndex: 0,
     }
@@ -1488,6 +1565,8 @@ function describeState(editor: Editor, deps: GptelDeps): string {
     `Backend: ${backend.name}`,
     `Model: ${model}`,
     `Stream: ${deps.getCustom<boolean>("gptel-stream") !== false ? "yes" : "no"}`,
+    `Last usage: ${formatUsage(st.lastRequest?.usage)}`,
+    `Session usage: ${formatUsage(st.tokenUsage)}`,
     `Context items: ${st.context.length}`,
     `Presets: ${[...st.presets.keys()].join(", ") || "(none)"}`,
     `Tools: ${[...st.tools.keys()].join(", ") || "(none)"}`,

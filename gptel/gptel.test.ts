@@ -28,6 +28,7 @@ import {
   renderContextBuffer,
   responseRanges,
   toolCallsFromJson,
+  usageFromJson,
   install,
   type GptelBackend,
   type GptelMessage,
@@ -204,6 +205,15 @@ test("toolCallsFromJson parses Anthropic tool_use blocks", () => {
   expect(toolCallsFromJson(backend, {
     content: [{ type: "tool_use", id: "toolu_1", name: "bash", input: { command: "pwd" } }],
   })).toEqual([{ id: "toolu_1", name: "bash", arguments: { command: "pwd" } }])
+})
+
+test("usageFromJson normalizes provider token usage", () => {
+  expect(usageFromJson({ name: "OpenAI", kind: "openai", models: ["gpt-4.1"] }, {
+    usage: { prompt_tokens: 12, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 2 } },
+  })).toEqual({ input: 10, output: 5, cached: 2 })
+  expect(usageFromJson({ name: "Claude", kind: "anthropic", models: ["claude"] }, {
+    usage: { input_tokens: 8, output_tokens: 4, cache_creation_input_tokens: 3, cache_read_input_tokens: 2 },
+  })).toEqual({ input: 11, output: 4, cached: 2, cache: 3 })
 })
 
 test("gptelToolCallSummary formats tool confirmation details", () => {
@@ -390,6 +400,32 @@ test("gptel-send sends tools and inserts included tool results", async () => {
     setCustom("gptel-use-tools", true)
     setCustom("gptel-include-tool-results", "auto")
     setCustom("gptel-confirm-tool-calls", true)
+    setCustom("gptel-stream", true)
+  }
+})
+
+test("gptel inspect reports last and session token usage", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "UsageBackend", { endpoint: "http://usage.test/v1/chat/completions", models: ["usage-model"], defaultModel: "usage-model", stream: false })
+  setCustom("gptel-backend", "UsageBackend")
+  setCustom("gptel-model", "usage-model")
+  setCustom("gptel-stream", false)
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    choices: [{ message: { content: "usage done" } }],
+    usage: { prompt_tokens: 9, completion_tokens: 3, prompt_tokens_details: { cached_tokens: 1 } },
+  }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch
+  try {
+    const buffer = editor.scratch("*ChatGPT-usage*", "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    await editor.run("gptel-send")
+    await editor.run("gptel-inspect")
+    expect(editor.activeBuffer.text).toContain("Last usage: 8 in, 1 cached, 3 out")
+    expect(editor.activeBuffer.text).toContain("Session usage: 8 in, 1 cached, 3 out")
+  } finally {
+    globalThis.fetch = originalFetch
     setCustom("gptel-stream", true)
   }
 })
