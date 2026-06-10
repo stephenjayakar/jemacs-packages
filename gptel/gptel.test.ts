@@ -5,6 +5,14 @@ import { tmpdir } from "node:os"
 import {
   defaultBackends,
   extractPrompt,
+  gptelMakeAzure,
+  gptelMakeDeepSeek,
+  gptelMakeKagi,
+  gptelMakeOllama,
+  gptelMakeOpenAIResponses,
+  gptelMakePerplexity,
+  gptelMakePrivateGPT,
+  gptelMakeXAI,
   mediaPartsFromContext,
   mimeTypeForPath,
   parseSseEvents,
@@ -15,12 +23,41 @@ import {
   type GptelBackend,
   type GptelMessage,
 } from "./gptel"
-import { BufferModel } from "@jemacs/core"
+import { BufferModel, Editor } from "@jemacs/core"
 
 test("default backends include Stephen's configured Claude backend", () => {
   const claude = defaultBackends().find(backend => backend.name === "Claude")
   expect(claude?.kind).toBe("anthropic")
   expect(claude?.defaultModel).toBe("claude-sonnet-4-5-20250929")
+})
+
+test("backend factories cover upstream provider families", () => {
+  const editor = new Editor()
+  const backends = [
+    gptelMakeOpenAIResponses(editor, "Responses"),
+    gptelMakeAzure(editor, "Azure", { host: "example.openai.azure.com" }),
+    gptelMakeOllama(editor, "Local"),
+    gptelMakeKagi(editor, "Kagi", { key: "kagi-key" }),
+    gptelMakePrivateGPT(editor, "Private"),
+    gptelMakePerplexity(editor, "Perplexity"),
+    gptelMakeDeepSeek(editor, "DeepSeek"),
+    gptelMakeXAI(editor, "xAI"),
+  ]
+  expect(backends.map(backend => backend.kind)).toEqual([
+    "openai-responses",
+    "openai",
+    "ollama",
+    "kagi",
+    "openai",
+    "openai",
+    "openai",
+    "openai",
+  ])
+  expect(backends[1]!.apiKeyHeader).toBe("api-key")
+  expect(backends[3]!.authorizationPrefix).toBe("Bot")
+  const state = editor.locals.get("gptel-state") as { backends: Map<string, GptelBackend> }
+  expect(state.backends.get("DeepSeek")?.defaultModel).toBe("deepseek-chat")
+  expect(state.backends.get("xAI")?.host).toBe("api.x.ai")
 })
 
 test("extractPrompt prefers active region", () => {

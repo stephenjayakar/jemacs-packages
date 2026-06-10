@@ -46,6 +46,9 @@ export type GptelBackend = {
   defaultModel?: string
   stream?: boolean
   headers?: Record<string, string>
+  requestParams?: Record<string, unknown>
+  apiKeyHeader?: string
+  authorizationPrefix?: string
 }
 
 export type GptelContextItem =
@@ -272,7 +275,10 @@ function backendKey(backend: GptelBackend): string {
 function backendUrl(backend: GptelBackend, model: string): string {
   const protocol = backend.protocol ?? "https"
   const host = backend.host ?? "api.openai.com"
-  const endpoint = (backend.endpoint ?? "/v1/chat/completions").replace("{model}", encodeURIComponent(model))
+  const kagiAction = model === "fastgpt" ? "fastgpt" : "summarize"
+  const endpoint = (backend.endpoint ?? "/v1/chat/completions")
+    .replace("{model}", encodeURIComponent(model))
+    .replace("{kagiAction}", kagiAction)
   if (/^https?:\/\//.test(endpoint)) return endpoint
   return `${protocol}://${host}${endpoint}`
 }
@@ -596,7 +602,7 @@ function ollamaMessages(messages: GptelMessage[]): unknown[] {
   })
 }
 
-export function providerMessagesForBackend(backend: GptelBackend, messages: GptelMessage[]): unknown {
+export function providerMessagesForBackend(backend: GptelBackend, messages: GptelMessage[]): unknown[] {
   if (backend.kind === "anthropic") return anthropicMessages(messages)
   if (backend.kind === "gemini") {
     return messages.filter(m => m.role !== "system").map(m => ({
@@ -606,6 +612,10 @@ export function providerMessagesForBackend(backend: GptelBackend, messages: Gpte
   }
   if (backend.kind === "ollama") return ollamaMessages(messages)
   return openAiMessages(messages, backend.kind === "openai-responses")
+}
+
+function requestParams(backend: GptelBackend): Record<string, unknown> {
+  return backend.requestParams ?? {}
 }
 
 function requestBody(
@@ -618,6 +628,7 @@ function requestBody(
 ): unknown {
   const temperature = deps.getCustom<number>("gptel-temperature")
   const maxTokens = deps.getCustom<number>("gptel-max-tokens")
+  const extra = requestParams(backend)
   if (backend.kind === "anthropic") {
     const system = messages.find(m => m.role === "system")?.content
     return {
@@ -628,6 +639,7 @@ function requestBody(
       system,
       messages: anthropicMessages(messages),
       tools: tools.length ? tools.map(anthropicTool) : undefined,
+      ...extra,
     }
   }
   if (backend.kind === "gemini") {
@@ -638,10 +650,17 @@ function requestBody(
         temperature: temperature || undefined,
         maxOutputTokens: maxTokens || undefined,
       },
+      ...extra,
     }
   }
   if (backend.kind === "ollama") {
-    return { model, stream, messages: providerMessagesForBackend(backend, messages) }
+    return { model, stream, messages: providerMessagesForBackend(backend, messages), ...extra }
+  }
+  if (backend.kind === "kagi") {
+    const prompt = messages.filter(message => message.role === "user").at(-1)?.content ?? ""
+    if (model === "fastgpt") return { query: prompt, web_search: true, cache: true, ...extra }
+    if (model.startsWith("summarize:")) return { text: prompt, engine: model.slice("summarize:".length), ...extra }
+    return { query: prompt, ...extra }
   }
   if (backend.kind === "openai-responses") {
     return {
@@ -651,6 +670,7 @@ function requestBody(
       tools: tools.length ? tools.map(openAiTool) : undefined,
       temperature: temperature || undefined,
       max_output_tokens: maxTokens || undefined,
+      ...extra,
     }
   }
   return {
@@ -661,6 +681,7 @@ function requestBody(
     tool_choice: tools.length ? "auto" : undefined,
     temperature: temperature || undefined,
     max_tokens: maxTokens || undefined,
+    ...extra,
   }
 }
 
@@ -673,8 +694,12 @@ function requestHeaders(backend: GptelBackend): Record<string, string> {
     headers["anthropic-beta"] = "tools-2024-04-04"
   } else if (backend.kind === "gemini") {
     if (key) headers["x-goog-api-key"] = key
+  } else if (backend.kind === "kagi") {
+    if (key) headers.authorization = `${backend.authorizationPrefix ?? "Bot"} ${key}`
+  } else if (backend.apiKeyHeader) {
+    if (key) headers[backend.apiKeyHeader] = key
   } else if (key) {
-    headers.authorization = `Bearer ${key}`
+    headers.authorization = `${backend.authorizationPrefix ?? "Bearer"} ${key}`
   }
   return headers
 }
@@ -722,6 +747,18 @@ function textFromJson(backend: GptelBackend, json: unknown): string {
     return data.candidates?.flatMap((c: any) => c.content?.parts ?? []).map((p: any) => p.text ?? "").join("") ?? ""
   }
   if (backend.kind === "ollama") return data.message?.content ?? data.response ?? ""
+  if (backend.kind === "kagi") {
+    const output = data.data?.output ?? data.output ?? ""
+    const references = data.data?.references ?? data.references
+    if (!Array.isArray(references) || references.length === 0) return output
+    const refs = references.map((ref: any, index: number) => {
+      const title = ref.title ?? ref.url ?? `Reference ${index + 1}`
+      const url = ref.url ? ` (${ref.url})` : ""
+      const snippet = ref.snippet ? `: ${String(ref.snippet).replace(/<\/?b>/g, "*")}` : ""
+      return `[${index + 1}] ${title}${url}${snippet}`
+    }).join("\n")
+    return `${output}\n\n${refs}`
+  }
   if (backend.kind === "openai-responses") {
     return data.output_text ?? data.output?.filter((o: any) => o.type !== "function_call").flatMap((o: any) => o.content ?? []).map((c: any) => c.text ?? "").join("") ?? ""
   }
@@ -1222,22 +1259,122 @@ function makeBackend(kind: GptelBackendKind, name: string, options: Partial<Gpte
   }
 }
 
-export function gptelMakeOpenAI(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
-  const backend = makeBackend("openai", name, { host: "api.openai.com", endpoint: "/v1/chat/completions", stream: true, ...options })
-  state(editor).backends.set(name, backend)
+function registerBackend(editor: Editor, backend: GptelBackend): GptelBackend {
+  state(editor).backends.set(backend.name, backend)
   return backend
+}
+
+export function gptelMakeOpenAI(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  return registerBackend(editor, makeBackend("openai", name, {
+    host: "api.openai.com",
+    endpoint: "/v1/chat/completions",
+    stream: true,
+    ...options,
+  }))
+}
+
+export function gptelMakeOpenAIResponses(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  return registerBackend(editor, makeBackend("openai-responses", name, {
+    host: "api.openai.com",
+    endpoint: "/v1/responses",
+    stream: true,
+    ...options,
+  }))
+}
+
+export function gptelMakeAzure(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  return registerBackend(editor, makeBackend("openai", name, {
+    protocol: "https",
+    apiKeyHeader: "api-key",
+    endpoint: "/openai/deployments/{model}/chat/completions?api-version=2024-10-21",
+    stream: true,
+    ...options,
+  }))
+}
+
+export function gptelMakeOllama(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  return registerBackend(editor, makeBackend("ollama", name, {
+    protocol: "http",
+    host: "localhost:11434",
+    endpoint: "/api/chat",
+    stream: true,
+    ...options,
+  }))
 }
 
 export function gptelMakeAnthropic(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
-  const backend = makeBackend("anthropic", name, { host: "api.anthropic.com", endpoint: "/v1/messages", stream: true, ...options })
-  state(editor).backends.set(name, backend)
-  return backend
+  return registerBackend(editor, makeBackend("anthropic", name, {
+    host: "api.anthropic.com",
+    endpoint: "/v1/messages",
+    stream: true,
+    ...options,
+  }))
 }
 
 export function gptelMakeGemini(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
-  const backend = makeBackend("gemini", name, { host: "generativelanguage.googleapis.com", endpoint: "/v1beta/models/{model}:streamGenerateContent", stream: true, ...options })
-  state(editor).backends.set(name, backend)
-  return backend
+  return registerBackend(editor, makeBackend("gemini", name, {
+    host: "generativelanguage.googleapis.com",
+    endpoint: "/v1beta/models/{model}:streamGenerateContent",
+    stream: true,
+    ...options,
+  }))
+}
+
+export function gptelMakeKagi(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  return registerBackend(editor, makeBackend("kagi", name, {
+    host: "kagi.com",
+    endpoint: "/api/v0/{kagiAction}",
+    models: ["fastgpt", "summarize:cecil", "summarize:agnes", "summarize:daphne", "summarize:muriel"],
+    defaultModel: "fastgpt",
+    stream: false,
+    authorizationPrefix: "Bot",
+    ...options,
+  }))
+}
+
+export function gptelMakePrivateGPT(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  return registerBackend(editor, makeBackend("openai", name, {
+    protocol: "http",
+    host: "localhost:8001",
+    endpoint: "/v1/chat/completions",
+    models: ["private-gpt"],
+    defaultModel: "private-gpt",
+    stream: false,
+    ...options,
+  }))
+}
+
+export function gptelMakePerplexity(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  return registerBackend(editor, makeBackend("openai", name, {
+    host: "api.perplexity.ai",
+    endpoint: "/chat/completions",
+    models: ["sonar", "sonar-pro", "sonar-reasoning", "sonar-reasoning-pro", "sonar-deep-research"],
+    defaultModel: "sonar",
+    stream: true,
+    ...options,
+  }))
+}
+
+export function gptelMakeDeepSeek(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  return registerBackend(editor, makeBackend("openai", name, {
+    host: "api.deepseek.com",
+    endpoint: "/v1/chat/completions",
+    models: ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro"],
+    defaultModel: "deepseek-chat",
+    stream: true,
+    ...options,
+  }))
+}
+
+export function gptelMakeXAI(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  return registerBackend(editor, makeBackend("openai", name, {
+    host: "api.x.ai",
+    endpoint: "/v1/chat/completions",
+    models: ["grok-4-1-fast-reasoning", "grok-4-1-fast-non-reasoning", "grok-code-fast-1", "grok-4-fast-reasoning"],
+    defaultModel: "grok-4-1-fast-reasoning",
+    stream: true,
+    ...options,
+  }))
 }
 
 export function gptelMakeTool(editor: Editor, tool: GptelTool): GptelTool {
