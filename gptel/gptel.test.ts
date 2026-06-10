@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
+  convertMarkdownToOrg,
   defaultBackends,
   extractPrompt,
   formatToolResultBlock,
@@ -42,6 +43,27 @@ test("default backends include Stephen's configured Claude backend", () => {
   const claude = defaultBackends().find(backend => backend.name === "Claude")
   expect(claude?.kind).toBe("anthropic")
   expect(claude?.defaultModel).toBe("claude-sonnet-4-5-20250929")
+})
+
+test("convertMarkdownToOrg translates common gptel response syntax", () => {
+  const org = convertMarkdownToOrg([
+    "# Title",
+    "",
+    "* item",
+    "",
+    "```ts",
+    "const x = 1",
+    "```",
+    "",
+    "Use `code` and *em*.",
+  ].join("\n"))
+
+  expect(org).toContain("* Title")
+  expect(org).toContain("- item")
+  expect(org).toContain("#+begin_src ts")
+  expect(org).toContain("#+end_src")
+  expect(org).toContain("=code=")
+  expect(org).toContain("/em/")
 })
 
 test("backend factories cover upstream provider families", () => {
@@ -306,6 +328,27 @@ test("gptel prompt transforms, response filters, and post-response functions run
 
   expect(buffer.text).toContain("Mock response to: hello filtered")
   expect(seen).toHaveLength(2)
+})
+
+test("gptel-send converts markdown responses in org-mode buffers", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  gptelAddResponseFilter(editor, () => "# Title\n\n```ts\nconst x = 1\n```\n\n* item")
+  const buffer = editor.scratch("*gptel-org*", "hello", "org-mode")
+  buffer.mode = "org-mode"
+  buffer.mark = 0
+  buffer.markActive = true
+  buffer.point = buffer.text.length
+  editor.switchToBuffer(buffer.id)
+
+  await editor.run("gptel-send")
+
+  expect(buffer.text).toContain("* Title")
+  expect(buffer.text).toContain("#+begin_src ts")
+  expect(buffer.text).toContain("#+end_src")
+  expect(buffer.text).toContain("- item")
 })
 
 test("gptel-send honors custom prompt and response markers", async () => {

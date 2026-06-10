@@ -578,6 +578,45 @@ async function applyResponseFilters(editor: Editor, buffer: BufferModel, backend
   return filtered
 }
 
+export function convertMarkdownToOrg(markdown: string): string {
+  const lines = markdown.split("\n")
+  const converted: string[] = []
+  let inFence = false
+  for (const rawLine of lines) {
+    const fence = rawLine.match(/^(\s*)```+\s*([^`]*)\s*$/)
+    if (fence) {
+      const indent = fence[1] ?? ""
+      const info = (fence[2] ?? "").trim()
+      if (inFence) {
+        converted.push(`${indent}#+end_src`)
+        inFence = false
+      } else {
+        const language = info.split(/\s+/)[0] ?? ""
+        converted.push(`${indent}#+begin_src${language ? ` ${language}` : ""}`)
+        inFence = true
+      }
+      continue
+    }
+    if (inFence) {
+      converted.push(rawLine)
+      continue
+    }
+    let line = rawLine
+      .replace(/^(\s*)\*[ \t]+/, "$1- ")
+      .replace(/^(\s{0,3})(#{1,6})[ \t]+(.+)$/, (_match, indent: string, hashes: string, title: string) => `${indent}${"*".repeat(hashes.length)} ${title}`)
+      .replace(/`([^`\n]+)`/g, "=$1=")
+      .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1/$2/")
+      .replace(/(^|[^\w_])_([^_\n]+)_(?![\w_])/g, "$1/$2/")
+    converted.push(line)
+  }
+  if (inFence) converted.push("#+end_src")
+  return converted.join("\n")
+}
+
+function shouldConvertResponseToOrg(deps: GptelDeps, buffer: BufferModel): boolean {
+  return buffer.mode === "org-mode" && deps.getCustom<boolean>("gptel-org-convert-response") !== false
+}
+
 async function runPostResponseFunctions(editor: Editor, buffer: BufferModel, backend: GptelBackend, model: string, start: number, end: number): Promise<void> {
   const ctx = { editor, buffer, backend, model }
   for (const fn of state(editor).postResponseFunctions) await fn(start, end, ctx)
@@ -1372,8 +1411,9 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
     })
     const insertedResponse = buffer.text.slice(responseStart)
     if (result.text && !insertedResponse.includes(result.text)) appendWritable(buffer, result.text)
-    const filteredResponse = await applyResponseFilters(editor, buffer, backend, model, buffer.text.slice(responseStart))
-    if (filteredResponse !== buffer.text.slice(responseStart)) replaceWritable(buffer, responseStart, buffer.text.length, filteredResponse)
+    let finalResponse = await applyResponseFilters(editor, buffer, backend, model, buffer.text.slice(responseStart))
+    if (shouldConvertResponseToOrg(deps, buffer)) finalResponse = convertMarkdownToOrg(finalResponse)
+    if (finalResponse !== buffer.text.slice(responseStart)) replaceWritable(buffer, responseStart, buffer.text.length, finalResponse)
     const responseEnd = buffer.text.length
     const responseText = buffer.text.slice(responseStart, responseEnd)
     const st = state(editor)
@@ -1984,6 +2024,7 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-post-stream-hook", "string", "", "Hook run after each streaming response insertion.", "gptel")
   deps.defcustom("gptel-post-request-hook", "string", "", "Hook run after sending a gptel request.", "gptel")
   deps.defcustom("gptel-post-rewrite-functions", "string", "", "Hook run after a gptel rewrite is inserted.", "gptel")
+  deps.defcustom("gptel-org-convert-response", "boolean", true, "Convert Markdown responses to Org syntax in org-mode buffers.", "gptel")
 
   editor.command("gptel", async ({ editor, args }) => {
     const name = args.join(" ") || GPTEL_BUFFER_PREFIX

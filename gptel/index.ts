@@ -1,5 +1,6 @@
 export { install } from "./gptel"
 export {
+  convertMarkdownToOrg,
   defaultBackends,
   extractPrompt,
   formatToolResultBlock,
