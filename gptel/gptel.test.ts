@@ -399,6 +399,81 @@ test("gptel-send converts markdown responses in org-mode buffers", async () => {
   expect(buffer.text).toContain("- item")
 })
 
+test("gptel org commands save, restore, and scope heading properties", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "OrgInspect", { endpoint: "http://org.test/v1/chat/completions", models: ["org-model"], defaultModel: "org-model", stream: false })
+  setCustom("gptel-backend", "OrgInspect")
+  setCustom("gptel-model", "org-model")
+  setCustom("gptel-system-message", "Org system\nsecond")
+  setCustom("gptel-tools", "lookup")
+  setCustom("gptel-temperature", 0.2)
+  setCustom("gptel-max-tokens", 321)
+  const buffer = editor.scratch("*org-gptel*", "* Work\nUser:\nhello", "org-mode")
+  buffer.mode = "org-mode"
+  buffer.point = buffer.text.length
+  editor.switchToBuffer(buffer.id)
+
+  await editor.run("gptel-org-set-topic", ["work-topic"])
+  await editor.run("gptel-org-set-properties")
+  expect(buffer.text).toContain(":GPTEL_TOPIC: work-topic")
+  expect(buffer.text).toContain(":GPTEL_BACKEND: OrgInspect")
+  expect(buffer.text).toContain(":GPTEL_SYSTEM: Org system\\nsecond")
+
+  setCustom("gptel-backend", "Claude")
+  setCustom("gptel-model", "changed")
+  setCustom("gptel-system-message", "changed")
+  setCustom("gptel-tools", "")
+  setCustom("gptel-temperature", 0.9)
+  setCustom("gptel-max-tokens", 999)
+  await editor.run("gptel-restore-state")
+  expect(getCustom<string>("gptel-backend")).toBe("OrgInspect")
+  expect(getCustom<string>("gptel-model")).toBe("org-model")
+  expect(getCustom<string>("gptel-system-message")).toBe("Org system\nsecond")
+  expect(getCustom<string>("gptel-tools")).toBe("lookup")
+  expect(getCustom<number>("gptel-temperature")).toBe(0.2)
+  expect(getCustom<number>("gptel-max-tokens")).toBe(321)
+
+  await editor.run("gptel-inspect-query-json")
+  const body = JSON.parse(editor.activeBuffer.text)
+  expect(body.messages.at(-1).content).toContain("* Work")
+  expect(body.messages.at(-1).content).toContain("hello")
+  expect(body.messages.at(-1).content).not.toContain(":PROPERTIES:")
+})
+
+test("gptel org branching context keeps only the active heading lineage", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "OrgBranch", { endpoint: "http://org-branch.test/v1/chat/completions", models: ["org-model"], defaultModel: "org-model", stream: false })
+  setCustom("gptel-backend", "OrgBranch")
+  setCustom("gptel-model", "org-model")
+  setCustom("gptel-org-branching-context", true)
+  const buffer = editor.scratch("*org-branch*", [
+    "Intro",
+    "* Parent",
+    "parent body",
+    "** One",
+    "one body",
+    "** Two",
+    "two body",
+  ].join("\n"), "org-mode")
+  buffer.mode = "org-mode"
+  buffer.point = buffer.text.length
+  editor.switchToBuffer(buffer.id)
+
+  await editor.run("gptel-inspect-query-json")
+  const body = JSON.parse(editor.activeBuffer.text)
+  const content = body.messages.at(-1).content
+  expect(content).toContain("Intro")
+  expect(content).toContain("* Parent")
+  expect(content).toContain("parent body")
+  expect(content).toContain("** Two")
+  expect(content).toContain("two body")
+  expect(content).not.toContain("** One")
+  expect(content).not.toContain("one body")
+  setCustom("gptel-org-branching-context", false)
+})
+
 test("gptel-send honors custom prompt and response markers", async () => {
   const editor = new Editor()
   await install(editor)

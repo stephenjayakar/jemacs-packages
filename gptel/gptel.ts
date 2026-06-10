@@ -198,7 +198,6 @@ const CONTEXT_FLAGGED = "gptel-context-flagged"
 const STATE_BLOCK_START = "<!-- gptel-state:"
 const STATE_BLOCK_END = "-->"
 const STATE_RESTORED = "gptel-state-restored"
-
 type GptelContextSection = {
   index: number
   start: number
@@ -222,6 +221,14 @@ type GptelSavedState = {
     variants: string[]
     variantIndex: number
   }
+}
+
+type OrgHeading = {
+  start: number
+  end: number
+  level: number
+  title: string
+  contentStart: number
 }
 
 export type GptelChatMarkers = {
@@ -695,7 +702,175 @@ function restoreGptelState(editor: Editor, deps: GptelDeps, buffer: BufferModel)
 
 function restoreGptelStateOnce(editor: Editor, deps: GptelDeps, buffer: BufferModel): void {
   if (buffer.locals.get(STATE_RESTORED)) return
-  restoreGptelState(editor, deps, buffer)
+  if (!restoreOrgGptelProperties(editor, deps, buffer)) restoreGptelState(editor, deps, buffer)
+}
+
+function orgHeadings(buffer: BufferModel): OrgHeading[] {
+  const headings: OrgHeading[] = []
+  const regex = /^(\*+)\s+(.+)$/gm
+  for (const match of buffer.text.matchAll(regex)) {
+    const start = match.index ?? 0
+    const lineEnd = buffer.text.indexOf("\n", start)
+    headings.push({
+      start,
+      end: buffer.text.length,
+      level: match[1]!.length,
+      title: match[2]!.trim(),
+      contentStart: lineEnd < 0 ? buffer.text.length : lineEnd + 1,
+    })
+  }
+  for (let i = 0; i < headings.length; i++) {
+    const heading = headings[i]!
+    const next = headings.slice(i + 1).find(candidate => candidate.level <= heading.level)
+    heading.end = next?.start ?? buffer.text.length
+  }
+  return headings
+}
+
+function orgHeadingAt(buffer: BufferModel, point = buffer.point): OrgHeading | null {
+  return orgHeadings(buffer)
+    .filter(heading => point >= heading.start && point <= heading.end)
+    .sort((a, b) => b.level - a.level)[0] ?? null
+}
+
+function orgPropertyDrawerBounds(buffer: BufferModel, heading: OrgHeading): { start: number; end: number } | null {
+  const text = buffer.text.slice(heading.contentStart, heading.end)
+  const match = text.match(/^:PROPERTIES:\n[\s\S]*?^:END:\n?/m)
+  if (!match || match.index == null) return null
+  return { start: heading.contentStart + match.index, end: heading.contentStart + match.index + match[0].length }
+}
+
+function orgPropertiesAt(buffer: BufferModel, heading: OrgHeading | null): Record<string, string> {
+  if (!heading) return {}
+  const bounds = orgPropertyDrawerBounds(buffer, heading)
+  if (!bounds) return {}
+  const props: Record<string, string> = {}
+  const drawer = buffer.text.slice(bounds.start, bounds.end)
+  for (const match of drawer.matchAll(/^:([A-Za-z0-9_]+):\s*(.*)$/gm)) {
+    const key = match[1]!
+    if (key === "PROPERTIES" || key === "END") continue
+    props[key] = match[2] ?? ""
+  }
+  return props
+}
+
+function inheritedOrgProperties(buffer: BufferModel, point = buffer.point): Record<string, string> {
+  const headings = orgHeadings(buffer)
+  const current = orgHeadingAt(buffer, point)
+  if (!current) return {}
+  const lineage = headings.filter(heading =>
+    heading.start <= current.start
+    && heading.end >= current.end
+    && heading.level <= current.level
+  ).sort((a, b) => a.level - b.level)
+  return Object.assign({}, ...lineage.map(heading => orgPropertiesAt(buffer, heading)))
+}
+
+function setOrgProperties(buffer: BufferModel, heading: OrgHeading, props: Record<string, string | undefined>): void {
+  const existing = orgPropertiesAt(buffer, heading)
+  for (const [key, value] of Object.entries(props)) {
+    if (value == null || value === "") delete existing[key]
+    else existing[key] = value
+  }
+  const lines = Object.entries(existing).map(([key, value]) => `:${key}: ${value}`)
+  const drawer = lines.length ? `:PROPERTIES:\n${lines.join("\n")}\n:END:\n` : ""
+  const bounds = orgPropertyDrawerBounds(buffer, heading)
+  const oldPoint = buffer.point
+  const start = bounds?.start ?? heading.contentStart
+  const end = bounds?.end ?? heading.contentStart
+  if (bounds) replaceWritable(buffer, bounds.start, bounds.end, drawer)
+  else if (drawer) replaceWritable(buffer, heading.contentStart, heading.contentStart, drawer)
+  const delta = drawer.length - (end - start)
+  if (oldPoint >= end) buffer.point = oldPoint + delta
+  else if (oldPoint >= start) buffer.point = start + drawer.length
+  else buffer.point = oldPoint
+}
+
+function orgTopicDefault(heading: OrgHeading): string {
+  return heading.title.toLowerCase().replace(/\s+/g, "-").slice(0, 50)
+}
+
+function orgTopicStart(buffer: BufferModel, point = buffer.point): number | null {
+  const headings = orgHeadings(buffer)
+  const current = orgHeadingAt(buffer, point)
+  if (!current) return null
+  const lineage = headings.filter(heading =>
+    heading.start <= current.start
+    && heading.end >= current.end
+    && heading.level <= current.level
+  ).sort((a, b) => b.level - a.level)
+  return lineage.find(heading => orgPropertiesAt(buffer, heading).GPTEL_TOPIC != null)?.start ?? null
+}
+
+function orgPromptSlice(buffer: BufferModel, start: number, end: number): string {
+  return stripOrgPromptMetadata(buffer.text.slice(start, end))
+}
+
+function stripOrgPromptMetadata(text: string): string {
+  return text
+    .replace(/^:PROPERTIES:\n[\s\S]*?^:END:\n?/gm, "")
+    .trim()
+}
+
+function orgBranchPrompt(buffer: BufferModel, promptEnd: number): string | null {
+  const headings = orgHeadings(buffer)
+  const current = orgHeadingAt(buffer, promptEnd)
+  if (!current) return null
+  const lineage = new Set(headings
+    .filter(heading => heading.start <= current.start && heading.end >= current.end && heading.level <= current.level)
+    .map(heading => heading.start))
+  const firstHeading = headings[0]?.start ?? promptEnd
+  const pieces: string[] = []
+  if (firstHeading > 0) pieces.push(buffer.text.slice(0, Math.min(firstHeading, promptEnd)))
+  for (let i = 0; i < headings.length; i++) {
+    const heading = headings[i]!
+    if (heading.start >= promptEnd) break
+    const next = headings[i + 1]?.start ?? promptEnd
+    if (lineage.has(heading.start)) pieces.push(buffer.text.slice(heading.start, Math.min(next, promptEnd)))
+  }
+  return stripOrgPromptMetadata(pieces.join(""))
+}
+
+function orgScopedPromptForDeps(deps: GptelDeps, buffer: BufferModel, prompt: string, promptEnd: number): string {
+  if (buffer.mode !== "org-mode") return prompt
+  const topicStart = orgTopicStart(buffer, promptEnd)
+  if (topicStart != null) return orgPromptSlice(buffer, topicStart, promptEnd)
+  if (deps.getCustom<boolean>("gptel-org-branching-context")) return orgBranchPrompt(buffer, promptEnd) ?? prompt
+  return stripOrgPromptMetadata(prompt)
+}
+
+function saveOrgGptelProperties(deps: GptelDeps, buffer: BufferModel): boolean {
+  if (buffer.mode !== "org-mode") return false
+  const heading = orgHeadingAt(buffer, buffer.point) ?? orgHeadings(buffer)[0]
+  if (!heading) return false
+  const existing = orgPropertiesAt(buffer, heading)
+  const existingTopic = existing.GPTEL_TOPIC ?? buffer.text.slice(heading.start, heading.end).match(/^:GPTEL_TOPIC:\s*(.*)$/m)?.[1]
+  setOrgProperties(buffer, heading, {
+    GPTEL_TOPIC: existingTopic,
+    GPTEL_SYSTEM: (deps.getCustom<string>("gptel-system-message") ?? "").replace(/\n/g, "\\n"),
+    GPTEL_BACKEND: deps.getCustom<string>("gptel-backend"),
+    GPTEL_MODEL: deps.getCustom<string>("gptel-model"),
+    GPTEL_TEMPERATURE: String(deps.getCustom<number>("gptel-temperature") ?? ""),
+    GPTEL_MAX_TOKENS: String(deps.getCustom<number>("gptel-max-tokens") ?? ""),
+    GPTEL_TOOLS: deps.getCustom<string>("gptel-tools"),
+    GPTEL_PRESET: undefined,
+  })
+  buffer.locals.set(STATE_RESTORED, true)
+  return true
+}
+
+function restoreOrgGptelProperties(_editor: Editor, deps: GptelDeps, buffer: BufferModel): boolean {
+  if (buffer.mode !== "org-mode") return false
+  const props = inheritedOrgProperties(buffer)
+  if (!Object.keys(props).some(key => key.startsWith("GPTEL_"))) return false
+  if (props.GPTEL_BACKEND) deps.setCustom("gptel-backend", props.GPTEL_BACKEND)
+  if (props.GPTEL_MODEL) deps.setCustom("gptel-model", props.GPTEL_MODEL)
+  if (props.GPTEL_SYSTEM) deps.setCustom("gptel-system-message", props.GPTEL_SYSTEM.replace(/\\n/g, "\n"))
+  if (props.GPTEL_TOOLS != null) deps.setCustom("gptel-tools", props.GPTEL_TOOLS)
+  if (props.GPTEL_TEMPERATURE && Number.isFinite(Number(props.GPTEL_TEMPERATURE))) deps.setCustom("gptel-temperature", Number(props.GPTEL_TEMPERATURE))
+  if (props.GPTEL_MAX_TOKENS && Number.isFinite(Number(props.GPTEL_MAX_TOKENS))) deps.setCustom("gptel-max-tokens", Number(props.GPTEL_MAX_TOKENS))
+  buffer.locals.set(STATE_RESTORED, true)
+  return true
 }
 
 function chatHistory(buffer: BufferModel, markers: GptelChatMarkers = defaultChatMarkers()): GptelMessage[] {
@@ -1855,7 +2030,8 @@ function positionalArgs(args: string[]): string[] {
 async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferModel, args: string[] = [], priorVariants: string[] = []): Promise<void> {
   applyTransientArgs(editor, deps, args)
   const markers = chatMarkers(deps)
-  const { prompt } = extractPrompt(buffer, markers)
+  const extracted = extractPrompt(buffer, markers)
+  const prompt = orgScopedPromptForDeps(deps, buffer, extracted.prompt, extracted.end)
   if (!prompt) {
     editor.message("gptel: empty prompt")
     return
@@ -1924,7 +2100,8 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
 async function inspectQueryFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferModel, args: string[], format: "json" | "object"): Promise<void> {
   applyTransientArgs(editor, deps, args)
   const markers = chatMarkers(deps)
-  const { prompt } = extractPrompt(buffer, markers)
+  const extracted = extractPrompt(buffer, markers)
+  const prompt = orgScopedPromptForDeps(deps, buffer, extracted.prompt, extracted.end)
   if (!prompt) {
     editor.message("gptel: empty prompt")
     return
@@ -2239,6 +2416,8 @@ function describeState(editor: Editor, deps: GptelDeps): string {
     "  gptel-menu             inspect and change backend/model",
     "  gptel-mcp-connect      activate tools from registered MCP servers",
     "  gptel-mcp-disconnect   remove MCP tools and disconnect servers",
+    "  gptel-org-set-topic    set GPTEL_TOPIC on the current Org heading",
+    "  gptel-org-set-properties save gptel options as Org properties",
     "  gptel-save-state       persist gptel metadata in this buffer",
     "  gptel-restore-state    restore gptel metadata from this buffer",
     "  gptel-abort            abort active request",
@@ -2759,6 +2938,7 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-pre-tool-call-functions", "string", "", "Hook run before gptel tool calls.", "gptel")
   deps.defcustom("gptel-post-tool-call-functions", "string", "", "Hook run after gptel tool calls.", "gptel")
   deps.defcustom("gptel-org-convert-response", "boolean", true, "Convert Markdown responses to Org syntax in org-mode buffers.", "gptel")
+  deps.defcustom("gptel-org-branching-context", "boolean", false, "Use heading lineage as gptel context in Org buffers.", "gptel")
 
   editor.command("gptel", async ({ editor, args }) => {
     const name = args.join(" ") || GPTEL_BUFFER_PREFIX
@@ -2849,6 +3029,27 @@ export async function install(editor: Editor): Promise<void> {
     }
     await visitContextItem(editor, item)
   }, "Visit the source for the current gptel context entry.")
+
+  editor.command("gptel-org-set-topic", async ({ editor, buffer, args }) => {
+    if (buffer.mode !== "org-mode") {
+      editor.message("gptel: topics are only supported in org-mode buffers")
+      return
+    }
+    const heading = orgHeadingAt(buffer)
+    if (!heading) {
+      editor.message("gptel: no Org heading at point")
+      return
+    }
+    const topic = args.join(" ") || await editor.prompt("Set topic as: ", orgTopicDefault(heading), "gptel-org-topic")
+    if (!topic) return
+    setOrgProperties(buffer, heading, { GPTEL_TOPIC: topic })
+    editor.message(`gptel: topic ${topic}`)
+  }, "Set GPTEL_TOPIC on the current Org heading.")
+
+  editor.command("gptel-org-set-properties", ({ editor, buffer }) => {
+    if (saveOrgGptelProperties(deps, buffer)) editor.message("gptel: added configuration to current Org headline")
+    else editor.message("gptel: no Org heading for properties")
+  }, "Store active gptel configuration as Org properties.")
 
   editor.command("gptel-context-remove", ({ editor, buffer }) => {
     if (buffer.mode === GPTEL_CONTEXT_MODE) {
@@ -3057,12 +3258,19 @@ export async function install(editor: Editor): Promise<void> {
   }, "Open the gptel log buffer.")
 
   editor.command("gptel-save-state", ({ editor, buffer }) => {
-    saveGptelState(editor, deps, buffer)
-    editor.message("gptel: state saved")
+    if (saveOrgGptelProperties(deps, buffer)) editor.message("gptel: org state saved")
+    else {
+      saveGptelState(editor, deps, buffer)
+      editor.message("gptel: state saved")
+    }
   }, "Persist gptel state in the current buffer.")
 
   editor.command("gptel-restore-state", ({ editor, buffer }) => {
-    editor.message(restoreGptelState(editor, deps, buffer) ? "gptel: state restored" : "gptel: no saved state")
+    editor.message(
+      restoreOrgGptelProperties(editor, deps, buffer) || restoreGptelState(editor, deps, buffer)
+        ? "gptel: state restored"
+        : "gptel: no saved state",
+    )
   }, "Restore gptel state from the current buffer.")
 
   editor.defineKey("global", "s-m", "gptel-menu")
