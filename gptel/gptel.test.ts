@@ -782,6 +782,67 @@ test("gptel inspect reports last and session token usage", async () => {
   }
 })
 
+test("gptel inspect-query builds request payload without sending it", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "InspectBackend", { endpoint: "http://inspect.test/v1/chat/completions", models: ["inspect-model"], defaultModel: "inspect-model", stream: false })
+  setCustom("gptel-backend", "InspectBackend")
+  setCustom("gptel-model", "inspect-model")
+  setCustom("gptel-stream", false)
+  const originalFetch = globalThis.fetch
+  let fetchCalled = false
+  globalThis.fetch = (async () => {
+    fetchCalled = true
+    return new Response("{}")
+  }) as unknown as typeof fetch
+  try {
+    const buffer = editor.scratch("*ChatGPT-inspect-query*", "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    await editor.run("gptel-inspect-query-json")
+
+    expect(fetchCalled).toBe(false)
+    const body = JSON.parse(editor.activeBuffer.text)
+    expect(editor.activeBuffer.name).toBe("*gptel-query*")
+    expect(body.model).toBe("inspect-model")
+    expect(body.messages.at(-1).content).toBe("hello")
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-stream", true)
+  }
+})
+
+test("gptel-log-level records request and response data", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "LogBackend", { endpoint: "http://log.test/v1/chat/completions", models: ["log-model"], defaultModel: "log-model", stream: false })
+  setCustom("gptel-backend", "LogBackend")
+  setCustom("gptel-model", "log-model")
+  setCustom("gptel-stream", false)
+  setCustom("gptel-log-level", "debug")
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    choices: [{ message: { content: "logged" } }],
+  }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch
+  try {
+    const buffer = editor.scratch("*ChatGPT-log*", "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    await editor.run("gptel-send")
+    await editor.run("gptel-log")
+
+    expect(editor.activeBuffer.name).toBe("*gptel-log*")
+    expect(editor.activeBuffer.text).toContain("\"gptel\":\"request headers\"")
+    expect(editor.activeBuffer.text).toContain("\"gptel\":\"request body\"")
+    expect(editor.activeBuffer.text).toContain("\"gptel\":\"response body\"")
+    expect(editor.activeBuffer.text).toContain("logged")
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-log-level", "")
+    setCustom("gptel-stream", true)
+  }
+})
+
 test("oauth login commands save upstream-compatible token files", async () => {
   const home = mkdtempSync(join(tmpdir(), "gptel-home-"))
   const oldHome = process.env.HOME

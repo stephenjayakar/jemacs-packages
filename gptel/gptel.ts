@@ -155,6 +155,13 @@ type RequestResult = {
   toolCalls?: GptelToolCall[]
 }
 
+type GptelRequestPayload = {
+  url: string
+  headers: Record<string, string>
+  body: unknown
+  stream: boolean
+}
+
 const STATE_KEY = "gptel-state"
 const GPTEL_MODE = "gptel-mode"
 const GPTEL_CHAT_MODE = "gptel-chat"
@@ -1107,6 +1114,48 @@ function requestHeaders(backend: GptelBackend): Record<string, string> {
   return headers
 }
 
+function requestPayload(backend: GptelBackend, model: string, messages: GptelMessage[], deps: GptelDeps, tools: GptelTool[] = []): GptelRequestPayload {
+  const stream = backend.stream !== false && deps.getCustom<boolean>("gptel-stream") !== false && !tools.length
+  return {
+    url: backendUrl(backend, model),
+    headers: requestHeaders(backend),
+    body: requestBody(backend, model, messages, deps, stream, tools),
+    stream,
+  }
+}
+
+function logLevel(deps: GptelDeps): string | false {
+  const value = deps.getCustom<boolean | string>("gptel-log-level")
+  if (!value || value === "off" || value === "nil" || value === "false") return false
+  return value === true ? "info" : String(value)
+}
+
+function logBuffer(editor: Editor, text: string): BufferModel {
+  const buffer = [...editor.buffers.values()].find(candidate => candidate.name === "*gptel-log*")
+    ?? editor.scratch("*gptel-log*", "", "text")
+  if (text) appendWritable(buffer, text)
+  return buffer
+}
+
+function logJson(editor: Editor, deps: GptelDeps, type: string, data: unknown, noJson = false): void {
+  if (!logLevel(deps)) return
+  const body = noJson
+    ? String(data)
+    : typeof data === "string" ? data : JSON.stringify(data, null, 2)
+  const existing = [...editor.buffers.values()].find(buffer => buffer.name === "*gptel-log*")
+  logBuffer(editor, `${existing?.text ? "\n" : ""}{"gptel":"${type}","timestamp":"${new Date().toISOString()}"}\n${body}\n`)
+}
+
+function inspectPayloadBuffer(editor: Editor, payload: GptelRequestPayload, format: "json" | "object" = "object"): BufferModel {
+  const body = format === "json"
+    ? JSON.stringify(payload.body, null, 2)
+    : JSON.stringify(payload, null, 2)
+  const buffer = editor.scratch("*gptel-query*", body, format === "json" ? "json" : "text")
+  buffer.point = 0
+  editor.switchToBuffer(buffer.id)
+  return buffer
+}
+
 export function parseSseEvents(chunk: string): string[] {
   const events: string[] = []
   for (const event of chunk.split(/\n\n+/)) {
@@ -1309,11 +1358,14 @@ async function requestLlm(
     return { text: response }
   }
 
-  const stream = backend.stream !== false && deps.getCustom<boolean>("gptel-stream") !== false && !(options.tools?.length)
-  const response = await fetch(backendUrl(backend, model), {
+  const payload = requestPayload(backend, model, messages, deps, options.tools)
+  const level = logLevel(deps)
+  if (level === "debug") logJson(editor, deps, "request headers", payload.headers)
+  logJson(editor, deps, "request body", payload.body)
+  const response = await fetch(payload.url, {
     method: "POST",
-    headers: requestHeaders(backend),
-    body: JSON.stringify(requestBody(backend, model, messages, deps, stream, options.tools)),
+    headers: payload.headers,
+    body: JSON.stringify(payload.body),
     signal: options.signal,
   })
   if (!response.ok) {
@@ -1321,8 +1373,9 @@ async function requestLlm(
     throw new Error(`${backend.name} ${response.status}: ${body || response.statusText}`)
   }
   const includeReasoning = includeReasoningSetting(deps)
-  if (!stream || !response.body) {
+  if (!payload.stream || !response.body) {
     const json = await response.json()
+    if (level === "debug") logJson(editor, deps, "response body", json)
     return { text: textFromJson(backend, json, includeReasoning), raw: json, usage: usageFromJson(backend, json), toolCalls: toolCallsFromJson(backend, json) }
   }
 
@@ -1338,6 +1391,7 @@ async function requestLlm(
     const complete = pending.split(/\n\n+/)
     pending = complete.pop() ?? ""
     for (const event of parseSseEvents(complete.join("\n\n"))) {
+      logJson(editor, deps, "response body", event, true)
       const parsed = parseJsonMaybe(event)
       if (typeof parsed === "object" && parsed) usage = usageFromJson(backend, parsed) ?? usage
       const delta = textFromStreamEvent(backend, event, includeReasoning)
@@ -1348,6 +1402,7 @@ async function requestLlm(
     }
   }
   for (const event of parseSseEvents(pending)) {
+    logJson(editor, deps, "response body", event, true)
     const parsed = parseJsonMaybe(event)
     if (typeof parsed === "object" && parsed) usage = usageFromJson(backend, parsed) ?? usage
     const delta = textFromStreamEvent(backend, event, includeReasoning)
@@ -1576,6 +1631,9 @@ function applyTransientArgs(editor: Editor, deps: GptelDeps, args: string[]): vo
     } else if (arg === "--use-context") {
       const value = args[++i]
       if (value != null) deps.setCustom("gptel-use-context", value)
+    } else if (arg === "--log-level") {
+      const value = args[++i]
+      if (value != null) deps.setCustom("gptel-log-level", value)
     } else if (arg === "--no-stream") {
       deps.setCustom("gptel-stream", false)
     } else if (arg === "--stream") {
@@ -1672,6 +1730,22 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
     state(editor).activeRequests.delete(buffer.id)
     void editor.changed("gptel-send")
   }
+}
+
+async function inspectQueryFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferModel, args: string[], format: "json" | "object"): Promise<void> {
+  applyTransientArgs(editor, deps, args)
+  const markers = chatMarkers(deps)
+  const { prompt } = extractPrompt(buffer, markers)
+  if (!prompt) {
+    editor.message("gptel: empty prompt")
+    return
+  }
+  const backend = backendByName(editor, deps)
+  const model = currentModel(editor, deps, backend)
+  const messages = await buildMessages(editor, deps, buffer, prompt, backend, model, markers)
+  const payload = requestPayload(backend, model, messages, deps, selectedTools(editor, deps))
+  inspectPayloadBuffer(editor, payload, format)
+  editor.message("gptel: query inspected")
 }
 
 function switchLastVariant(editor: Editor, direction: number): void {
@@ -2083,6 +2157,7 @@ const gptelMenuDefinition: TransientDefinition = {
         { key: "-C", label: "Context", argument: "--use-context", kind: "value" },
         { key: "-S", label: "Schema", argument: "--schema", kind: "value" },
         { key: "-v", label: "Reasoning", argument: "--reasoning", kind: "value" },
+        { key: "-l", label: "Log level", argument: "--log-level", kind: "value" },
         { key: "-x", label: "No stream", argument: "--no-stream", kind: "toggle" },
       ],
     },
@@ -2106,6 +2181,9 @@ const gptelMenuDefinition: TransientDefinition = {
         { key: "p", label: "Preset", command: "gptel-preset" },
         { key: "T", label: "Tools", command: "gptel-tools" },
         { key: "i", label: "Inspect", command: "gptel-inspect" },
+        { key: "I", label: "Inspect query", command: "gptel-inspect-query" },
+        { key: "J", label: "Inspect query JSON", command: "gptel-inspect-query-json" },
+        { key: "L", label: "Inspect log", command: "gptel-log" },
         { key: "A", label: "Abort", command: "gptel-abort" },
       ],
     },
@@ -2343,6 +2421,7 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-temperature", "number", 0.7, "Sampling temperature for gptel requests.", "gptel")
   deps.defcustom("gptel-max-tokens", "number", 4096, "Maximum output tokens for gptel requests.", "gptel")
   deps.defcustom("gptel-stream", "boolean", true, "Stream gptel responses into the current buffer.", "gptel")
+  deps.defcustom("gptel-log-level", "string", "", "Logging level for gptel requests: off, info, or debug.", "gptel")
   deps.defcustom("gptel-use-tools", "boolean", true, "Whether selected gptel tools are made available to models.", "gptel")
   deps.defcustom("gptel-tools", "string", "", "Comma or space separated gptel tool names to include with requests.", "gptel")
   deps.defcustom("gptel-include-tool-results", "string", "auto", "Whether tool results are inserted in gptel buffers: auto, true, or false.", "gptel")
@@ -2628,6 +2707,19 @@ export async function install(editor: Editor): Promise<void> {
   editor.command("gptel-inspect", ({ editor }) => {
     editor.scratch("*gptel*", describeState(editor, deps), "text")
   }, "Inspect gptel state.")
+
+  editor.command("gptel-inspect-query", async ({ editor, buffer, args }) => {
+    await inspectQueryFromBuffer(editor, deps, buffer, args, "object")
+  }, "Dry-run the current gptel request and inspect the request object.")
+
+  editor.command("gptel-inspect-query-json", async ({ editor, buffer, args }) => {
+    await inspectQueryFromBuffer(editor, deps, buffer, args, "json")
+  }, "Dry-run the current gptel request and inspect the JSON body.")
+
+  editor.command("gptel-log", ({ editor }) => {
+    const buffer = logBuffer(editor, "")
+    editor.switchToBuffer(buffer.id)
+  }, "Open the gptel log buffer.")
 
   editor.defineKey("global", "s-m", "gptel-menu")
   editor.defineKey("global", "s-g", "gptel")
