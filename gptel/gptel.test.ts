@@ -290,3 +290,31 @@ test("gptel response navigation and marking use response ranges", async () => {
   expect(buffer.markActive).toBe(true)
   expect(buffer.text.slice(Math.min(buffer.point, buffer.mark!), Math.max(buffer.point, buffer.mark!))).toBe("four")
 })
+
+test("gptel rewrite accept and reject manage pending rewrite state", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  const buffer = editor.scratch("rewrite.txt", "alpha beta gamma", "text")
+  buffer.mark = 6
+  buffer.point = 10
+  buffer.markActive = true
+  editor.switchToBuffer(buffer.id)
+  await editor.run("gptel-rewrite", ["shorten"])
+
+  expect(buffer.text).not.toBe("alpha beta gamma")
+  const state = editor.locals.get("gptel-state") as { lastRewrite?: { original: string } }
+  expect(state.lastRewrite?.original).toBe("beta")
+  await editor.run("gptel-rewrite-reject")
+  expect(buffer.text).toBe("alpha beta gamma")
+  expect(state.lastRewrite).toBeUndefined()
+
+  buffer.mark = 6
+  buffer.point = 10
+  buffer.markActive = true
+  await editor.run("gptel-rewrite", ["shorten"])
+  expect(state.lastRewrite?.original).toBe("beta")
+  await editor.run("gptel-rewrite-accept")
+  expect(state.lastRewrite).toBeUndefined()
+})

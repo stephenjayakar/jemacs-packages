@@ -121,6 +121,14 @@ type GptelState = {
     variants: string[]
     variantIndex: number
   }
+  lastRewrite?: {
+    bufferId: string
+    start: number
+    end: number
+    original: string
+    replacement: string
+    instruction: string
+  }
 }
 
 type RequestResult = {
@@ -1228,8 +1236,46 @@ async function rewriteRegion(editor: Editor, deps: GptelDeps, buffer: BufferMode
   const result = await requestWithTools(editor, deps, backend, model, messages, buffer)
   const replacement = result.text.trim()
   replaceWritable(buffer, bounds[0], bounds[1], replacement)
-  editor.message("gptel-rewrite: replaced region")
+  state(editor).lastRewrite = {
+    bufferId: buffer.id,
+    start: bounds[0],
+    end: bounds[0] + replacement.length,
+    original,
+    replacement,
+    instruction,
+  }
+  await editor.runHook("gptel-post-rewrite-functions", buffer)
+  editor.message("gptel-rewrite: replaced region; use gptel-rewrite-reject to restore")
   void editor.changed("gptel-rewrite")
+}
+
+function acceptRewrite(editor: Editor): void {
+  const st = state(editor)
+  if (!st.lastRewrite) {
+    editor.message("gptel-rewrite: no pending rewrite")
+    return
+  }
+  st.lastRewrite = undefined
+  editor.message("gptel-rewrite: accepted")
+}
+
+function rejectRewrite(editor: Editor): void {
+  const st = state(editor)
+  const rewrite = st.lastRewrite
+  if (!rewrite) {
+    editor.message("gptel-rewrite: no pending rewrite")
+    return
+  }
+  const buffer = editor.buffers.get(rewrite.bufferId)
+  if (!buffer) {
+    st.lastRewrite = undefined
+    return
+  }
+  replaceWritable(buffer, rewrite.start, rewrite.end, rewrite.original)
+  buffer.point = rewrite.start + rewrite.original.length
+  st.lastRewrite = undefined
+  editor.message("gptel-rewrite: restored original text")
+  void editor.changed("gptel-rewrite-reject")
 }
 
 async function collectDirectory(path: string, limit = 24): Promise<Array<{ path: string; text: string }>> {
@@ -1415,6 +1461,8 @@ function describeState(editor: Editor, deps: GptelDeps): string {
     "  gptel-add              add region/current buffer to context",
     "  gptel-add-file         add a file or directory to context",
     "  gptel-rewrite          rewrite active region",
+    "  gptel-rewrite-accept   accept the last rewrite",
+    "  gptel-rewrite-reject   reject the last rewrite",
     "  gptel-regenerate       regenerate the last response",
     "  gptel-previous-variant cycle response variants",
     "  gptel-mark-response    mark the response at point",
@@ -1449,6 +1497,8 @@ const gptelMenuDefinition: TransientDefinition = {
         { key: "c", label: "Show context", command: "gptel-context" },
         { key: "x", label: "Clear context", command: "gptel-context-remove-all" },
         { key: "r", label: "Rewrite region", command: "gptel-rewrite" },
+        { key: "u a", label: "Accept rewrite", command: "gptel-rewrite-accept" },
+        { key: "u r", label: "Reject rewrite", command: "gptel-rewrite-reject" },
         { key: "R", label: "Regenerate", command: "gptel-regenerate" },
         { key: "v p", label: "Previous variant", command: "gptel-previous-variant" },
         { key: "v n", label: "Next variant", command: "gptel-next-variant" },
@@ -1651,6 +1701,7 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-post-response-functions", "string", "", "Hook run after inserting a gptel response.", "gptel")
   deps.defcustom("gptel-post-stream-hook", "string", "", "Hook run after each streaming response insertion.", "gptel")
   deps.defcustom("gptel-post-request-hook", "string", "", "Hook run after sending a gptel request.", "gptel")
+  deps.defcustom("gptel-post-rewrite-functions", "string", "", "Hook run after a gptel rewrite is inserted.", "gptel")
 
   editor.command("gptel", async ({ editor, args }) => {
     const name = args.join(" ") || GPTEL_BUFFER_PREFIX
@@ -1763,6 +1814,14 @@ export async function install(editor: Editor): Promise<void> {
     if (!instruction) return
     await rewriteRegion(editor, deps, buffer, instruction)
   }, "Rewrite the active region using gptel.")
+
+  editor.command("gptel-rewrite-accept", ({ editor }) => {
+    acceptRewrite(editor)
+  }, "Accept the last gptel rewrite.")
+
+  editor.command("gptel-rewrite-reject", ({ editor }) => {
+    rejectRewrite(editor)
+  }, "Reject the last gptel rewrite and restore the original text.")
 
   editor.command("gptel-abort", ({ editor, buffer }) => {
     const controller = state(editor).activeRequests.get(buffer.id)
