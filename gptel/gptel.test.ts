@@ -583,6 +583,42 @@ test("gptel-send injects structured output schemas for provider families", async
   }
 })
 
+test("gptel include-reasoning ignore displays reasoning but omits it from follow-up history", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "ReasoningBackend", { endpoint: "http://reasoning.test/openai", models: ["m"], defaultModel: "m", stream: false })
+  setCustom("gptel-backend", "ReasoningBackend")
+  setCustom("gptel-model", "m")
+  setCustom("gptel-stream", false)
+  setCustom("gptel-include-reasoning", "ignore")
+  const bodies: any[] = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body ?? "{}")))
+    return new Response(JSON.stringify({
+      choices: [{ message: { reasoning_content: "private chain", content: "final answer" } }],
+    }), { status: 200, headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  try {
+    const buffer = editor.scratch("*Reasoning*", "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    await editor.run("gptel-send")
+    expect(buffer.text).toContain("``` reasoning\nprivate chain\n```")
+    expect(buffer.text).toContain("final answer")
+
+    buffer.point = buffer.text.length
+    buffer.insert("again")
+    await editor.run("gptel-send")
+    expect(JSON.stringify(bodies[1].messages)).not.toContain("private chain")
+    expect(JSON.stringify(bodies[1].messages)).toContain("final answer")
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-include-reasoning", "ignore")
+    setCustom("gptel-stream", true)
+  }
+})
+
 test("gptel inspect reports last and session token usage", async () => {
   const editor = new Editor()
   await install(editor)

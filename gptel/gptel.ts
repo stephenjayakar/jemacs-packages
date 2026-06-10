@@ -560,6 +560,13 @@ function chatHistory(buffer: BufferModel, markers: GptelChatMarkers = defaultCha
   return messages
 }
 
+function stripReasoningBlocks(text: string): string {
+  return text
+    .replace(/```[ \t]*reasoning[^\n]*\n[\s\S]*?```[ \t]*(?:\n{0,2})/g, "")
+    .replace(/^#\+begin_reasoning\n[\s\S]*?^#\+end_reasoning[ \t]*(?:\n{0,2})/gmi, "")
+    .trim()
+}
+
 function lastAssistantResponse(buffer: BufferModel, markers: GptelChatMarkers = defaultChatMarkers()): string | null {
   const messages = chatHistory(buffer, markers).filter(message => message.role === "assistant")
   return messages.at(-1)?.content ?? null
@@ -632,7 +639,12 @@ async function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferMode
   const context = renderContext(st.context)
   const media = mediaPartsFromContext(st.context)
   const history = (buffer.mode === GPTEL_CHAT_MODE || buffer.minorModes.has(GPTEL_MODE)) ? chatHistory(buffer, markers) : []
-  messages.push(...history.slice(0, -1))
+  const includeReasoning = deps.getCustom<boolean | string>("gptel-include-reasoning")
+  messages.push(...history.slice(0, -1).map(message =>
+    message.role === "assistant" && includeReasoning === "ignore"
+      ? { ...message, content: stripReasoningBlocks(message.content) }
+      : message
+  ))
   const promptWithContext = context ? `${context}\n\nUser request:\n${prompt}` : prompt
   messages.push({ role: "user", content: await applyPromptTransforms(editor, buffer, backend, model, promptWithContext), media })
   return messages
@@ -942,6 +954,18 @@ function currentSchema(deps: GptelDeps): Record<string, unknown> | undefined {
   return gptelParseSchema(deps.getCustom<unknown>("gptel-schema"))
 }
 
+function includeReasoningSetting(deps: GptelDeps): boolean | "ignore" | string {
+  const value = deps.getCustom<boolean | string>("gptel-include-reasoning") ?? "ignore"
+  if (value === false || value === "false" || value === "nil" || value === "no") return false
+  if (value === true || value === "true" || value === "t" || value === "yes") return true
+  return value
+}
+
+function reasoningBlock(reasoning: string, include: boolean | "ignore" | string): string {
+  if (!reasoning || include === false) return ""
+  return `\`\`\` reasoning\n${reasoning.trim()}\n\`\`\`\n\n`
+}
+
 function schemaName(): string {
   return "gptel_schema"
 }
@@ -996,6 +1020,7 @@ function requestBody(
       generationConfig: {
         temperature: temperature || undefined,
         maxOutputTokens: maxTokens || undefined,
+        ...(includeReasoningSetting(deps) ? { thinkingConfig: { includeThoughts: true } } : {}),
         ...(schema ? { responseMimeType: "application/json", responseSchema: schema } : {}),
       },
       ...extra,
@@ -1176,56 +1201,82 @@ function formatUsage(usage: GptelTokenUsage | undefined): string {
   return parts.join(", ") || "(none)"
 }
 
-function textFromJson(backend: GptelBackend, json: unknown): string {
+function reasoningFromJson(backend: GptelBackend, json: unknown): string {
   const data = json as Record<string, any>
+  if (backend.kind === "anthropic") return data.content?.filter((part: any) => part.type === "thinking").map((part: any) => part.thinking ?? "").join("") ?? ""
+  if (backend.kind === "gemini") return data.candidates?.flatMap((c: any) => c.content?.parts ?? []).filter((part: any) => part.thought).map((part: any) => part.text ?? "").join("") ?? ""
+  if (backend.kind === "ollama") return data.message?.thinking ?? data.thinking ?? ""
+  if (backend.kind === "openai-responses") {
+    return data.output?.filter((part: any) => part.type === "reasoning")
+      .flatMap((part: any) => part.summary ?? part.content ?? [])
+      .map((part: any) => typeof part === "string" ? part : part.text ?? "")
+      .join("") ?? ""
+  }
+  const message = data.choices?.[0]?.message
+  return message?.reasoning ?? message?.reasoning_content ?? ""
+}
+
+function textFromJson(backend: GptelBackend, json: unknown, includeReasoning: boolean | "ignore" | string = false): string {
+  const data = json as Record<string, any>
+  const reasoning = reasoningBlock(reasoningFromJson(backend, json), includeReasoning)
   if (backend.kind === "anthropic") {
-    const text = data.content?.filter((part: any) => part.type !== "tool_use").map((part: any) => part.text ?? "").join("") ?? ""
-    if (text) return text
+    const text = data.content?.filter((part: any) => part.type !== "tool_use" && part.type !== "thinking").map((part: any) => part.text ?? "").join("") ?? ""
+    if (text) return `${reasoning}${text}`
     const structured = data.content?.find((part: any) => part.type === "tool_use" && part.name === "response_json")?.input
-    return structured == null ? "" : JSON.stringify(structured, null, 2)
+    return structured == null ? reasoning : `${reasoning}${JSON.stringify(structured, null, 2)}`
   }
   if (backend.kind === "gemini") {
-    return data.candidates?.flatMap((c: any) => c.content?.parts ?? []).map((p: any) => p.text ?? "").join("") ?? ""
+    const text = data.candidates?.flatMap((c: any) => c.content?.parts ?? []).filter((part: any) => !part.thought).map((p: any) => p.text ?? "").join("") ?? ""
+    return `${reasoning}${text}`
   }
-  if (backend.kind === "ollama") return data.message?.content ?? data.response ?? ""
+  if (backend.kind === "ollama") return `${reasoning}${data.message?.content ?? data.response ?? ""}`
   if (backend.kind === "kagi") {
     const output = data.data?.output ?? data.output ?? ""
     const references = data.data?.references ?? data.references
-    if (!Array.isArray(references) || references.length === 0) return output
+    if (!Array.isArray(references) || references.length === 0) return `${reasoning}${output}`
     const refs = references.map((ref: any, index: number) => {
       const title = ref.title ?? ref.url ?? `Reference ${index + 1}`
       const url = ref.url ? ` (${ref.url})` : ""
       const snippet = ref.snippet ? `: ${String(ref.snippet).replace(/<\/?b>/g, "*")}` : ""
       return `[${index + 1}] ${title}${url}${snippet}`
     }).join("\n")
-    return `${output}\n\n${refs}`
+    return `${reasoning}${output}\n\n${refs}`
   }
   if (backend.kind === "bedrock") {
-    return data.output?.message?.content?.map((part: any) => part.text ?? "").join("") ?? ""
+    return `${reasoning}${data.output?.message?.content?.map((part: any) => part.text ?? "").join("") ?? ""}`
   }
   if (backend.kind === "openai-responses") {
-    return data.output_text ?? data.output?.filter((o: any) => o.type !== "function_call").flatMap((o: any) => o.content ?? []).map((c: any) => c.text ?? "").join("") ?? ""
+    return `${reasoning}${data.output_text ?? data.output?.filter((o: any) => o.type !== "function_call" && o.type !== "reasoning").flatMap((o: any) => o.content ?? []).map((c: any) => c.text ?? "").join("") ?? ""}`
   }
-  return data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text ?? ""
+  return `${reasoning}${data.choices?.[0]?.message?.content ?? data.choices?.[0]?.text ?? ""}`
 }
 
-function textFromStreamEvent(backend: GptelBackend, data: string): string {
+function textFromStreamEvent(backend: GptelBackend, data: string, includeReasoning: boolean | "ignore" | string = false): string {
   if (!data || data === "[DONE]") return ""
   let json: any
   try { json = JSON.parse(data) } catch { return "" }
   if (backend.kind === "anthropic") {
+    const thinking = json.delta?.thinking ?? ""
+    if (thinking) return reasoningBlock(thinking, includeReasoning)
     if (json.type === "content_block_delta") return json.delta?.text ?? ""
     if (json.type === "message_delta") return ""
   }
   if (backend.kind === "gemini") {
-    return json.candidates?.flatMap((c: any) => c.content?.parts ?? []).map((p: any) => p.text ?? "").join("") ?? ""
+    const parts = json.candidates?.flatMap((c: any) => c.content?.parts ?? []) ?? []
+    const thought = parts.filter((part: any) => part.thought).map((part: any) => part.text ?? "").join("")
+    const text = parts.filter((part: any) => !part.thought).map((part: any) => part.text ?? "").join("")
+    return `${reasoningBlock(thought, includeReasoning)}${text}`
   }
-  if (backend.kind === "ollama") return json.message?.content ?? json.response ?? ""
+  if (backend.kind === "ollama") return `${reasoningBlock(json.message?.thinking ?? json.thinking ?? "", includeReasoning)}${json.message?.content ?? json.response ?? ""}`
   if (backend.kind === "openai-responses") {
+    if (json.type === "response.reasoning_summary_text.delta" || json.type === "response.reasoning.delta") return reasoningBlock(json.delta ?? "", includeReasoning)
     if (json.type === "response.output_text.delta") return json.delta ?? ""
     if (json.type === "response.refusal.delta") return json.delta ?? ""
   }
-  return json.choices?.[0]?.delta?.content ?? json.choices?.[0]?.text ?? ""
+  const choice = json.choices?.[0]
+  const reasoning = choice?.delta?.reasoning ?? choice?.delta?.reasoning_content ?? ""
+  if (reasoning) return reasoningBlock(reasoning, includeReasoning)
+  return choice?.delta?.content ?? choice?.text ?? ""
 }
 
 async function requestLlm(
@@ -1256,9 +1307,10 @@ async function requestLlm(
     const body = await response.text().catch(() => "")
     throw new Error(`${backend.name} ${response.status}: ${body || response.statusText}`)
   }
+  const includeReasoning = includeReasoningSetting(deps)
   if (!stream || !response.body) {
     const json = await response.json()
-    return { text: textFromJson(backend, json), raw: json, usage: usageFromJson(backend, json), toolCalls: toolCallsFromJson(backend, json) }
+    return { text: textFromJson(backend, json, includeReasoning), raw: json, usage: usageFromJson(backend, json), toolCalls: toolCallsFromJson(backend, json) }
   }
 
   const reader = response.body.getReader()
@@ -1275,7 +1327,7 @@ async function requestLlm(
     for (const event of parseSseEvents(complete.join("\n\n"))) {
       const parsed = parseJsonMaybe(event)
       if (typeof parsed === "object" && parsed) usage = usageFromJson(backend, parsed) ?? usage
-      const delta = textFromStreamEvent(backend, event)
+      const delta = textFromStreamEvent(backend, event, includeReasoning)
       if (!delta) continue
       text += delta
       options.onDelta?.(delta)
@@ -1285,7 +1337,7 @@ async function requestLlm(
   for (const event of parseSseEvents(pending)) {
     const parsed = parseJsonMaybe(event)
     if (typeof parsed === "object" && parsed) usage = usageFromJson(backend, parsed) ?? usage
-    const delta = textFromStreamEvent(backend, event)
+    const delta = textFromStreamEvent(backend, event, includeReasoning)
     text += delta
     options.onDelta?.(delta)
   }
@@ -1467,6 +1519,9 @@ function applyTransientArgs(editor: Editor, deps: GptelDeps, args: string[]): vo
     } else if (arg === "--schema") {
       const value = args[++i]
       if (value != null) deps.setCustom("gptel-schema", value)
+    } else if (arg === "--reasoning") {
+      const value = args[++i]
+      if (value != null) deps.setCustom("gptel-include-reasoning", value)
     } else if (arg === "--no-stream") {
       deps.setCustom("gptel-stream", false)
     } else if (arg === "--stream") {
@@ -1864,6 +1919,7 @@ const gptelMenuDefinition: TransientDefinition = {
         { key: "-n", label: "Max tokens", argument: "--max-tokens", kind: "value" },
         { key: "-T", label: "Tools", argument: "--tools", kind: "value" },
         { key: "-S", label: "Schema", argument: "--schema", kind: "value" },
+        { key: "-v", label: "Reasoning", argument: "--reasoning", kind: "value" },
         { key: "-S", label: "No stream", argument: "--no-stream", kind: "toggle" },
       ],
     },
@@ -2120,6 +2176,7 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-max-tool-rounds", "number", 3, "Maximum number of tool-call continuation rounds.", "gptel")
   deps.defcustom("gptel-confirm-tool-calls", "boolean", true, "Ask before running gptel tool calls.", "gptel")
   deps.defcustom("gptel-schema", "string", "", "Structured JSON output schema as JSON or gptel shorthand.", "gptel")
+  deps.defcustom("gptel-include-reasoning", "string", "ignore", "Reasoning handling: ignore, true, false, or a buffer name.", "gptel")
   deps.defcustom("gptel-prompt-prefix", "string", "User:\n", "String inserted before user prompts in gptel chat buffers.", "gptel")
   deps.defcustom("gptel-response-prefix", "string", "Assistant:\n", "String inserted before assistant responses in gptel chat buffers.", "gptel")
   deps.defcustom("gptel-response-separator", "string", "\n\n", "String inserted between gptel prompt and response sections.", "gptel")
