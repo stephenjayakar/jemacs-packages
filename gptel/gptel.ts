@@ -63,6 +63,7 @@ export type GptelTool = {
   description: string
   parameters?: unknown
   confirm?: boolean
+  include?: boolean
   function: (args: unknown, ctx: { editor: Editor; buffer: BufferModel }) => unknown | Promise<unknown>
 }
 
@@ -564,6 +565,7 @@ function replaceWritable(buffer: BufferModel, start: number, end: number, text: 
 }
 
 function selectedTools(editor: Editor, deps: GptelDeps): GptelTool[] {
+  if (deps.getCustom<boolean | string>("gptel-use-tools") === false) return []
   const st = state(editor)
   const names = deps.getCustom<string>("gptel-tools")
     ?.split(/[, ]+/)
@@ -571,6 +573,13 @@ function selectedTools(editor: Editor, deps: GptelDeps): GptelTool[] {
     .filter(Boolean)
   if (!names?.length) return []
   return names.map(name => st.tools.get(name)).filter((tool): tool is GptelTool => Boolean(tool))
+}
+
+function includeToolResult(deps: GptelDeps, tool: GptelTool | undefined): boolean {
+  const setting = deps.getCustom<boolean | string>("gptel-include-tool-results") ?? "auto"
+  if (setting === true || setting === "true") return true
+  if (setting === false || setting === "false") return false
+  return tool?.include === true
 }
 
 function openAiTool(tool: GptelTool): unknown {
@@ -966,6 +975,18 @@ export function gptelToolCallSummary(toolCalls: readonly GptelToolCall[]): strin
   }).join("\n\n")
 }
 
+export function formatToolResultBlock(call: GptelToolCall, result: GptelMessage): string {
+  const args = toolResultString(call.arguments).replace(/\n/g, " ")
+  return [
+    `\`\`\` tool (${call.name} ${args})`,
+    `(:name ${call.name} :args ${toolResultString(call.arguments)})`,
+    "",
+    result.content,
+    "```",
+    "",
+  ].join("\n")
+}
+
 async function confirmToolCalls(
   editor: Editor,
   deps: GptelDeps,
@@ -1034,6 +1055,17 @@ async function executeToolCalls(
   return results
 }
 
+function insertIncludedToolResults(deps: GptelDeps, buffer: BufferModel, calls: readonly GptelToolCall[], results: readonly GptelMessage[], tools: ReadonlyMap<string, GptelTool>): void {
+  const blocks: string[] = []
+  for (let index = 0; index < results.length; index++) {
+    const result = results[index]!
+    const call = calls.find(candidate => candidate.id === result.toolCallId) ?? calls[index]
+    if (!call || !includeToolResult(deps, tools.get(call.name))) continue
+    blocks.push(formatToolResultBlock(call, result))
+  }
+  if (blocks.length) appendWritable(buffer, `\n${blocks.join("\n")}`)
+}
+
 async function requestWithTools(
   editor: Editor,
   deps: GptelDeps,
@@ -1041,7 +1073,7 @@ async function requestWithTools(
   model: string,
   messages: GptelMessage[],
   buffer: BufferModel,
-  options: { onDelta?: (delta: string) => void; signal?: AbortSignal } = {},
+  options: { onDelta?: (delta: string) => void; onToolResults?: (calls: GptelToolCall[], results: GptelMessage[], tools: ReadonlyMap<string, GptelTool>) => void; signal?: AbortSignal } = {},
 ): Promise<RequestResult> {
   const tools = selectedTools(editor, deps)
   const maxRounds = Math.max(0, deps.getCustom<number>("gptel-max-tool-rounds") ?? 3)
@@ -1062,6 +1094,7 @@ async function requestWithTools(
     ]
     const toolResults = await executeToolCalls(editor, deps, buffer, calls)
     if (!toolResults) return { ...result, text: finalText }
+    options.onToolResults?.(calls, toolResults, state(editor).tools)
     conversation.push(...toolResults)
     if (round === 0 && options.onDelta && result.text) options.onDelta("\n")
   }
@@ -1134,13 +1167,17 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
     await editor.runHook("gptel-post-request-hook", buffer)
     const result = await requestWithTools(editor, deps, backend, model, messages, buffer, {
       signal: controller.signal,
+      onToolResults(calls, results, tools) {
+        insertIncludedToolResults(deps, buffer, calls, results, tools)
+      },
       onDelta(delta) {
         appendWritable(buffer, delta)
         buffer.point = buffer.text.length
         void editor.runHook("gptel-post-stream-hook", buffer)
       },
     })
-    if (!buffer.text.slice(responseStart).trim() && result.text) appendWritable(buffer, result.text)
+    const insertedResponse = buffer.text.slice(responseStart)
+    if (result.text && !insertedResponse.includes(result.text)) appendWritable(buffer, result.text)
     const filteredResponse = await applyResponseFilters(editor, buffer, backend, model, buffer.text.slice(responseStart))
     if (filteredResponse !== buffer.text.slice(responseStart)) replaceWritable(buffer, responseStart, buffer.text.length, filteredResponse)
     const responseEnd = buffer.text.length
@@ -1691,7 +1728,9 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-temperature", "number", 0.7, "Sampling temperature for gptel requests.", "gptel")
   deps.defcustom("gptel-max-tokens", "number", 4096, "Maximum output tokens for gptel requests.", "gptel")
   deps.defcustom("gptel-stream", "boolean", true, "Stream gptel responses into the current buffer.", "gptel")
+  deps.defcustom("gptel-use-tools", "boolean", true, "Whether selected gptel tools are made available to models.", "gptel")
   deps.defcustom("gptel-tools", "string", "", "Comma or space separated gptel tool names to include with requests.", "gptel")
+  deps.defcustom("gptel-include-tool-results", "string", "auto", "Whether tool results are inserted in gptel buffers: auto, true, or false.", "gptel")
   deps.defcustom("gptel-max-tool-rounds", "number", 3, "Maximum number of tool-call continuation rounds.", "gptel")
   deps.defcustom("gptel-confirm-tool-calls", "boolean", true, "Ask before running gptel tool calls.", "gptel")
   deps.defcustom("gptel-prompt-prefix", "string", "User:\n", "String inserted before user prompts in gptel chat buffers.", "gptel")

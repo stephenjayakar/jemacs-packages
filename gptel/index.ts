@@ -2,6 +2,7 @@ export { install } from "./gptel"
 export {
   defaultBackends,
   extractPrompt,
+  formatToolResultBlock,
   gptelAddPostResponseFunction,
   gptelAddPromptTransform,
   gptelAddResponseFilter,

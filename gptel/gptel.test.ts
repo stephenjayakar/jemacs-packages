@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import {
   defaultBackends,
   extractPrompt,
+  formatToolResultBlock,
   gptelAddPostResponseFunction,
   gptelAddPromptTransform,
   gptelAddResponseFilter,
@@ -12,9 +13,11 @@ import {
   gptelMakeDeepSeek,
   gptelMakeKagi,
   gptelMakeOllama,
+  gptelMakeOpenAI,
   gptelMakeOpenAIResponses,
   gptelMakePerplexity,
   gptelMakePrivateGPT,
+  gptelMakeTool,
   gptelMakeXAI,
   gptelToolCallSummary,
   mediaPartsFromContext,
@@ -212,6 +215,13 @@ test("gptelToolCallSummary formats tool confirmation details", () => {
   expect(summary).toContain("2. read_file")
 })
 
+test("formatToolResultBlock renders markdown tool results", () => {
+  expect(formatToolResultBlock(
+    { id: "1", name: "lookup", arguments: { q: "jemacs" } },
+    { role: "tool", toolCallId: "1", name: "lookup", content: "found it" },
+  )).toContain("``` tool (lookup {")
+})
+
 test("gptel variant commands switch the last response in place", async () => {
   const editor = new Editor()
   await install(editor)
@@ -317,4 +327,69 @@ test("gptel rewrite accept and reject manage pending rewrite state", async () =>
   expect(state.lastRewrite?.original).toBe("beta")
   await editor.run("gptel-rewrite-accept")
   expect(state.lastRewrite).toBeUndefined()
+})
+
+test("gptel-send sends tools and inserts included tool results", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "ToolBackend", { endpoint: "http://tool.test/v1/chat/completions", models: ["tool-model"], defaultModel: "tool-model", stream: false })
+  gptelMakeTool(editor, {
+    name: "lookup",
+    description: "Lookup a value.",
+    confirm: false,
+    include: true,
+    parameters: { type: "object", properties: { q: { type: "string" } } },
+    function: args => `result:${(args as { q?: string }).q ?? ""}`,
+  })
+  setCustom("gptel-backend", "ToolBackend")
+  setCustom("gptel-model", "tool-model")
+  setCustom("gptel-tools", "lookup")
+  setCustom("gptel-use-tools", true)
+  setCustom("gptel-include-tool-results", "auto")
+  setCustom("gptel-confirm-tool-calls", false)
+  setCustom("gptel-stream", false)
+  const bodies: any[] = []
+  const originalFetch = globalThis.fetch
+  let callCount = 0
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body ?? "{}")))
+    callCount += 1
+    if (callCount === 1) {
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: "",
+            tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{\"q\":\"jemacs\"}" } }],
+          },
+        }],
+      }), { status: 200, headers: { "content-type": "application/json" } })
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200, headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  try {
+    const buffer = editor.scratch("*ChatGPT-tools*", "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    await editor.run("gptel-send")
+    expect(bodies[0].tools).toHaveLength(1)
+    expect(buffer.text).toContain("``` tool (lookup")
+    expect(buffer.text).toContain("result:jemacs")
+    expect(buffer.text).toContain("done")
+
+    setCustom("gptel-use-tools", false)
+    bodies.length = 0
+    callCount = 1
+    const second = editor.scratch("*ChatGPT-no-tools*", "User:\nhello", "gptel-chat")
+    second.point = second.text.length
+    editor.switchToBuffer(second.id)
+    await editor.run("gptel-send")
+    expect(bodies[0].tools).toBeUndefined()
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-tools", "")
+    setCustom("gptel-use-tools", true)
+    setCustom("gptel-include-tool-results", "auto")
+    setCustom("gptel-confirm-tool-calls", true)
+    setCustom("gptel-stream", true)
+  }
 })
