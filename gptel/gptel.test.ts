@@ -20,6 +20,7 @@ import {
   gptelMakeGemini,
   gptelMakeKagi,
   gptelMakeGithubCopilot,
+  gptelMakeDirective,
   gptelMakeOllama,
   gptelMakeOpenAI,
   gptelMakeOpenAIOAuth,
@@ -430,10 +431,19 @@ test("gptel transient commands expose submenus and apply selected values", async
   expect(menuKeys.filter(key => key === "-S")).toHaveLength(1)
   expect(menuKeys).toContain("-x")
 
+  gptelMakeDirective(editor, { name: "review", prompt: "Review the code for correctness." })
+  setCustom("gptel-directives", JSON.stringify({ teach: "Explain this as a teacher." }))
   await editor.run("gptel-system-prompt")
   expect(editor.transient?.definition.name).toBe("gptel-system-prompt")
+  const directiveLabels = editor.transient?.definition.groups.flatMap(group => group.suffixes?.map(suffix => suffix.label) ?? []) ?? []
+  expect(directiveLabels).toContain("review")
+  expect(directiveLabels).toContain("teach")
   await editor.run("gptel-system-prompt-set", ["shell"])
   expect(getCustom<string>("gptel-system-message")).toBe("Reply only with shell commands and no prose.")
+  await editor.run("gptel-system-prompt-set", ["review"])
+  expect(getCustom<string>("gptel-system-message")).toBe("Review the code for correctness.")
+  await editor.run("gptel-system-prompt-set", ["teach"])
+  expect(getCustom<string>("gptel-system-message")).toBe("Explain this as a teacher.")
 
   gptelMakeTool(editor, {
     name: "lookup",
@@ -450,6 +460,7 @@ test("gptel transient commands expose submenus and apply selected values", async
   editor.switchToBuffer(buffer.id)
   await editor.run("gptel-rewrite")
   expect(editor.transient?.definition.name).toBe("gptel-rewrite")
+  setCustom("gptel-directives", "")
 })
 
 test("gptel response navigation and marking use response ranges", async () => {
