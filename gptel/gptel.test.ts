@@ -560,6 +560,45 @@ test("gptel-send sends tools and inserts included tool results", async () => {
   }
 })
 
+test("gptel-use-context controls request context placement", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "ContextBackend", { endpoint: "http://context.test/v1/chat/completions", models: ["m"], defaultModel: "m", stream: false })
+  setCustom("gptel-backend", "ContextBackend")
+  setCustom("gptel-model", "m")
+  setCustom("gptel-stream", false)
+  const contextBuffer = editor.scratch("*context-source*", "context text", "text")
+  contextBuffer.mark = 0
+  contextBuffer.markActive = true
+  contextBuffer.point = contextBuffer.text.length
+  editor.switchToBuffer(contextBuffer.id)
+  await editor.run("gptel-add")
+  const bodies: any[] = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body ?? "{}")))
+    return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200, headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  try {
+    for (const mode of ["system", "user", "false"]) {
+      setCustom("gptel-use-context", mode)
+      const buffer = editor.scratch(`*context-${mode}*`, "User:\nhello", "gptel-chat")
+      buffer.point = buffer.text.length
+      editor.switchToBuffer(buffer.id)
+      await editor.run("gptel-send")
+    }
+    expect(bodies[0].messages.find((message: any) => message.role === "system")?.content).toContain("Additional context:")
+    expect(bodies[0].messages.find((message: any) => message.role === "user")?.content).not.toContain("Additional context:")
+    expect(bodies[1].messages.find((message: any) => message.role === "system")?.content).not.toContain("Additional context:")
+    expect(bodies[1].messages.find((message: any) => message.role === "user")?.content).toContain("Additional context:")
+    expect(JSON.stringify(bodies[2].messages)).not.toContain("context text")
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-use-context", "system")
+    setCustom("gptel-stream", true)
+  }
+})
+
 test("gptel-send injects structured output schemas for provider families", async () => {
   const editor = new Editor()
   await install(editor)

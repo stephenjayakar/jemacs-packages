@@ -636,8 +636,15 @@ async function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferMode
   const system = deps.getCustom<string>("gptel-system-message") || "You are a helpful assistant."
   if (system) messages.push({ role: "system", content: system })
   const st = state(editor)
-  const context = renderContext(st.context)
-  const media = mediaPartsFromContext(st.context)
+  const contextMode = deps.getCustom<boolean | string>("gptel-use-context") ?? "system"
+  const useContext = contextMode !== false && contextMode !== "false" && contextMode !== "nil" && contextMode !== "no"
+  const context = useContext ? renderContext(st.context) : ""
+  const media = useContext ? mediaPartsFromContext(st.context) : []
+  if (context && contextMode === "system") {
+    const systemIndex = messages.findIndex(message => message.role === "system")
+    if (systemIndex >= 0) messages[systemIndex] = { ...messages[systemIndex]!, content: `${messages[systemIndex]!.content}\n\n${context}` }
+    else messages.push({ role: "system", content: context })
+  }
   const history = (buffer.mode === GPTEL_CHAT_MODE || buffer.minorModes.has(GPTEL_MODE)) ? chatHistory(buffer, markers) : []
   const includeReasoning = deps.getCustom<boolean | string>("gptel-include-reasoning")
   messages.push(...history.slice(0, -1).map(message =>
@@ -645,7 +652,7 @@ async function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferMode
       ? { ...message, content: stripReasoningBlocks(message.content) }
       : message
   ))
-  const promptWithContext = context ? `${context}\n\nUser request:\n${prompt}` : prompt
+  const promptWithContext = context && contextMode !== "system" ? `${context}\n\nUser request:\n${prompt}` : prompt
   messages.push({ role: "user", content: await applyPromptTransforms(editor, buffer, backend, model, promptWithContext), media })
   return messages
 }
@@ -1522,6 +1529,9 @@ function applyTransientArgs(editor: Editor, deps: GptelDeps, args: string[]): vo
     } else if (arg === "--reasoning") {
       const value = args[++i]
       if (value != null) deps.setCustom("gptel-include-reasoning", value)
+    } else if (arg === "--use-context") {
+      const value = args[++i]
+      if (value != null) deps.setCustom("gptel-use-context", value)
     } else if (arg === "--no-stream") {
       deps.setCustom("gptel-stream", false)
     } else if (arg === "--stream") {
@@ -2026,6 +2036,7 @@ const gptelMenuDefinition: TransientDefinition = {
         { key: "-t", label: "Temperature", argument: "--temperature", kind: "value" },
         { key: "-n", label: "Max tokens", argument: "--max-tokens", kind: "value" },
         { key: "-T", label: "Tools", argument: "--tools", kind: "value" },
+        { key: "-C", label: "Context", argument: "--use-context", kind: "value" },
         { key: "-S", label: "Schema", argument: "--schema", kind: "value" },
         { key: "-v", label: "Reasoning", argument: "--reasoning", kind: "value" },
         { key: "-x", label: "No stream", argument: "--no-stream", kind: "toggle" },
@@ -2283,6 +2294,7 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-include-tool-results", "string", "auto", "Whether tool results are inserted in gptel buffers: auto, true, or false.", "gptel")
   deps.defcustom("gptel-max-tool-rounds", "number", 3, "Maximum number of tool-call continuation rounds.", "gptel")
   deps.defcustom("gptel-confirm-tool-calls", "boolean", true, "Ask before running gptel tool calls.", "gptel")
+  deps.defcustom("gptel-use-context", "string", "system", "How gptel sends context: system, user, or false.", "gptel")
   deps.defcustom("gptel-schema", "string", "", "Structured JSON output schema as JSON or gptel shorthand.", "gptel")
   deps.defcustom("gptel-include-reasoning", "string", "ignore", "Reasoning handling: ignore, true, false, or a buffer name.", "gptel")
   deps.defcustom("gptel-prompt-prefix", "string", "User:\n", "String inserted before user prompts in gptel chat buffers.", "gptel")
