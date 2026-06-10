@@ -15,6 +15,7 @@ export {
   gptelMakePrivateGPT,
   gptelMakeTool,
   gptelMakeXAI,
+  gptelToolCallSummary,
   mediaPartsFromContext,
   mimeTypeForPath,
   parseSseEvents,

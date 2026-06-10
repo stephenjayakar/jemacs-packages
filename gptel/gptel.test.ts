@@ -13,6 +13,7 @@ import {
   gptelMakePerplexity,
   gptelMakePrivateGPT,
   gptelMakeXAI,
+  gptelToolCallSummary,
   mediaPartsFromContext,
   mimeTypeForPath,
   parseSseEvents,
@@ -187,4 +188,13 @@ test("toolCallsFromJson parses Anthropic tool_use blocks", () => {
   expect(toolCallsFromJson(backend, {
     content: [{ type: "tool_use", id: "toolu_1", name: "bash", input: { command: "pwd" } }],
   })).toEqual([{ id: "toolu_1", name: "bash", arguments: { command: "pwd" } }])
+})
+
+test("gptelToolCallSummary formats tool confirmation details", () => {
+  const summary = gptelToolCallSummary([
+    { id: "1", name: "lookup", arguments: { q: "jemacs" } },
+    { id: "2", name: "read_file", arguments: { path: "/tmp/a.ts" } },
+  ])
+  expect(summary).toContain("1. lookup\n{\n  \"q\": \"jemacs\"\n}")
+  expect(summary).toContain("2. read_file")
 })

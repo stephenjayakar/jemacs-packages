@@ -62,6 +62,7 @@ export type GptelTool = {
   name: string
   description: string
   parameters?: unknown
+  confirm?: boolean
   function: (args: unknown, ctx: { editor: Editor; buffer: BufferModel }) => unknown | Promise<unknown>
 }
 
@@ -849,12 +850,48 @@ function toolResultString(result: unknown): string {
   try { return JSON.stringify(result, null, 2) } catch { return String(result) }
 }
 
+export function gptelToolCallSummary(toolCalls: readonly GptelToolCall[]): string {
+  return toolCalls.map((call, index) => {
+    const args = toolResultString(call.arguments)
+    return `${index + 1}. ${call.name}\n${args}`
+  }).join("\n\n")
+}
+
+async function confirmToolCalls(
+  editor: Editor,
+  deps: GptelDeps,
+  toolCalls: readonly GptelToolCall[],
+  tools: ReadonlyMap<string, GptelTool>,
+): Promise<boolean> {
+  if (deps.getCustom<boolean>("gptel-confirm-tool-calls") === false) return true
+  const callsNeedingConfirmation = toolCalls.filter(call => tools.get(call.name)?.confirm !== false)
+  if (!callsNeedingConfirmation.length) return true
+  const names = callsNeedingConfirmation.map(call => call.name).join(", ")
+  for (;;) {
+    const answer = (await editor.prompt(`Run gptel tool call${callsNeedingConfirmation.length > 1 ? "s" : ""} (${names})? y, n, or i: `, "n", "gptel-tool-confirm"))?.trim().toLowerCase()
+    if (answer === "y" || answer === "yes") return true
+    if (answer === "i" || answer === "inspect") {
+      const buffer = editor.scratch("*gptel tool calls*", `${gptelToolCallSummary(toolCalls)}\n`, "gptel-inspect")
+      buffer.readOnly = true
+      editor.switchToBuffer(buffer.id)
+      continue
+    }
+    return false
+  }
+}
+
 async function executeToolCalls(
   editor: Editor,
+  deps: GptelDeps,
   buffer: BufferModel,
   toolCalls: readonly GptelToolCall[],
-): Promise<GptelMessage[]> {
+): Promise<GptelMessage[] | null> {
   const st = state(editor)
+  const confirmed = await confirmToolCalls(editor, deps, toolCalls, st.tools)
+  if (!confirmed) {
+    editor.message("gptel: tool calls cancelled")
+    return null
+  }
   const results: GptelMessage[] = []
   for (const call of toolCalls) {
     const tool = st.tools.get(call.name)
@@ -913,8 +950,10 @@ async function requestWithTools(
     conversation = [
       ...conversation,
       { role: "assistant", content: result.text, toolCalls: calls },
-      ...await executeToolCalls(editor, buffer, calls),
     ]
+    const toolResults = await executeToolCalls(editor, deps, buffer, calls)
+    if (!toolResults) return { ...result, text: finalText }
+    conversation.push(...toolResults)
     if (round === 0 && options.onDelta && result.text) options.onDelta("\n")
   }
   return { text: finalText }
@@ -1415,6 +1454,7 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-stream", "boolean", true, "Stream gptel responses into the current buffer.", "gptel")
   deps.defcustom("gptel-tools", "string", "", "Comma or space separated gptel tool names to include with requests.", "gptel")
   deps.defcustom("gptel-max-tool-rounds", "number", 3, "Maximum number of tool-call continuation rounds.", "gptel")
+  deps.defcustom("gptel-confirm-tool-calls", "boolean", true, "Ask before running gptel tool calls.", "gptel")
 
   editor.command("gptel", async ({ editor, args }) => {
     const name = args.join(" ") || GPTEL_BUFFER_PREFIX
