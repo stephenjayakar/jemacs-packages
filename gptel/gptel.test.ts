@@ -782,6 +782,51 @@ test("gptel inspect reports last and session token usage", async () => {
   }
 })
 
+test("gptel save and restore state round-trips buffer metadata and variants", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  setCustom("gptel-system-message", "Saved system")
+  setCustom("gptel-tools", "lookup")
+  setCustom("gptel-temperature", 0.25)
+  setCustom("gptel-max-tokens", 123)
+  const buffer = editor.scratch("*stateful-gptel*", "User:\nhello", "gptel-chat")
+  buffer.point = buffer.text.length
+  editor.switchToBuffer(buffer.id)
+  await editor.run("gptel-send")
+  const originalState = editor.locals.get("gptel-state") as {
+    lastRequest?: { responseStart: number; responseEnd: number; variants: string[]; variantIndex: number }
+  }
+  originalState.lastRequest!.variants.push("alternate saved response")
+  await editor.run("gptel-save-state")
+
+  expect(buffer.text).toContain("<!-- gptel-state:")
+  expect(extractPrompt(buffer).prompt).toBe("")
+  setCustom("gptel-backend", "Claude")
+  setCustom("gptel-model", "changed")
+  setCustom("gptel-system-message", "Changed system")
+  setCustom("gptel-tools", "")
+  setCustom("gptel-temperature", 0.9)
+  setCustom("gptel-max-tokens", 999)
+  delete originalState.lastRequest
+
+  await editor.run("gptel-restore-state")
+  expect(getCustom<string>("gptel-backend")).toBe("Mock")
+  expect(getCustom<string>("gptel-model")).toBe("mock")
+  expect(getCustom<string>("gptel-system-message")).toBe("Saved system")
+  expect(getCustom<string>("gptel-tools")).toBe("lookup")
+  expect(getCustom<number>("gptel-temperature")).toBe(0.25)
+  expect(getCustom<number>("gptel-max-tokens")).toBe(123)
+
+  await editor.run("gptel-previous-variant")
+  const restoredState = editor.locals.get("gptel-state") as {
+    lastRequest: { responseStart: number; responseEnd: number; variantIndex: number }
+  }
+  expect(buffer.text.slice(restoredState.lastRequest.responseStart, restoredState.lastRequest.responseEnd)).toBe("alternate saved response")
+  expect(restoredState.lastRequest.variantIndex).toBe(1)
+})
+
 test("gptel inspect-query builds request payload without sending it", async () => {
   const editor = new Editor()
   await install(editor)

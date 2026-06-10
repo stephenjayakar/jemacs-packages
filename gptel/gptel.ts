@@ -169,11 +169,33 @@ const GPTEL_CONTEXT_MODE = "gptel-context"
 const GPTEL_BUFFER_PREFIX = "*ChatGPT*"
 const CONTEXT_SECTIONS = "gptel-context-sections"
 const CONTEXT_FLAGGED = "gptel-context-flagged"
+const STATE_BLOCK_START = "<!-- gptel-state:"
+const STATE_BLOCK_END = "-->"
+const STATE_RESTORED = "gptel-state-restored"
 
 type GptelContextSection = {
   index: number
   start: number
   end: number
+}
+
+type GptelSavedState = {
+  backend?: string
+  model?: string
+  system?: string
+  tools?: string
+  temperature?: number
+  maxTokens?: number
+  useContext?: string | boolean
+  includeReasoning?: string | boolean
+  schema?: string
+  responseRanges?: Array<{ start: number; end: number }>
+  lastRequest?: {
+    responseStart: number
+    responseEnd: number
+    variants: string[]
+    variantIndex: number
+  }
 }
 
 export type GptelChatMarkers = {
@@ -461,9 +483,13 @@ function markerAlternatives(markers: GptelChatMarkers): string[] {
   ].filter((marker, index, all) => marker.length > 0 && all.indexOf(marker) === index)
 }
 
+function stripStateBlocks(text: string): string {
+  return text.replace(stateBlockRegex(), "").trim()
+}
+
 export function extractPrompt(buffer: BufferModel, markers: GptelChatMarkers = defaultChatMarkers()): { prompt: string; start: number; end: number } {
   const bounds = regionBounds(buffer)
-  if (bounds) return { prompt: buffer.text.slice(bounds[0], bounds[1]).trim(), start: bounds[0], end: bounds[1] }
+  if (bounds) return { prompt: stripStateBlocks(buffer.text.slice(bounds[0], bounds[1])), start: bounds[0], end: bounds[1] }
   if (buffer.mode === GPTEL_CHAT_MODE || buffer.minorModes.has(GPTEL_MODE)) {
     const beforePoint = buffer.text.slice(0, buffer.point)
     const user = Math.max(beforePoint.lastIndexOf(markerText(markers, "user", true)), beforePoint.lastIndexOf(markerText(markers, "user")))
@@ -471,9 +497,9 @@ export function extractPrompt(buffer: BufferModel, markers: GptelChatMarkers = d
     const start = user >= 0 && user > assistant
       ? user + (beforePoint.startsWith(markerText(markers, "user", true), user) ? markerText(markers, "user", true).length : markerText(markers, "user").length)
       : 0
-    return { prompt: beforePoint.slice(start).trim(), start, end: buffer.point }
+    return { prompt: stripStateBlocks(beforePoint.slice(start)), start, end: buffer.point }
   }
-  return { prompt: buffer.text.slice(0, buffer.point).trim(), start: 0, end: buffer.point }
+  return { prompt: stripStateBlocks(buffer.text.slice(0, buffer.point)), start: 0, end: buffer.point }
 }
 
 export function renderContext(items: readonly GptelContextItem[]): string {
@@ -560,6 +586,90 @@ function responseRangeAtPoint(buffer: BufferModel, markers: GptelChatMarkers): {
   return responseRanges(buffer, markers).find(range => buffer.point >= range.start && buffer.point <= range.end) ?? null
 }
 
+function stateBlockRegex(): RegExp {
+  return new RegExp(`${escapeRegExp(STATE_BLOCK_START)}\\n[\\s\\S]*?\\n${escapeRegExp(STATE_BLOCK_END)}\\n?`, "m")
+}
+
+function parseSavedState(buffer: BufferModel): GptelSavedState | null {
+  const match = buffer.text.match(stateBlockRegex())
+  if (!match) return null
+  const json = match[0]
+    .replace(STATE_BLOCK_START, "")
+    .replace(STATE_BLOCK_END, "")
+    .trim()
+  try {
+    return JSON.parse(json) as GptelSavedState
+  } catch {
+    return null
+  }
+}
+
+function savedStatePayload(editor: Editor, deps: GptelDeps, buffer: BufferModel): GptelSavedState {
+  const last = state(editor).lastRequest
+  return {
+    backend: deps.getCustom<string>("gptel-backend"),
+    model: deps.getCustom<string>("gptel-model"),
+    system: deps.getCustom<string>("gptel-system-message"),
+    tools: deps.getCustom<string>("gptel-tools"),
+    temperature: deps.getCustom<number>("gptel-temperature"),
+    maxTokens: deps.getCustom<number>("gptel-max-tokens"),
+    useContext: deps.getCustom<string | boolean>("gptel-use-context"),
+    includeReasoning: deps.getCustom<string | boolean>("gptel-include-reasoning"),
+    schema: deps.getCustom<string>("gptel-schema"),
+    responseRanges: responseRanges(buffer, chatMarkers(deps)),
+    lastRequest: last?.bufferId === buffer.id ? {
+      responseStart: last.responseStart,
+      responseEnd: last.responseEnd,
+      variants: last.variants,
+      variantIndex: last.variantIndex,
+    } : undefined,
+  }
+}
+
+function saveGptelState(editor: Editor, deps: GptelDeps, buffer: BufferModel): void {
+  const block = `${STATE_BLOCK_START}\n${JSON.stringify(savedStatePayload(editor, deps, buffer), null, 2)}\n${STATE_BLOCK_END}\n`
+  const match = buffer.text.match(stateBlockRegex())
+  if (match?.index != null) replaceWritable(buffer, match.index, match.index + match[0].length, block)
+  else appendWritable(buffer, `${buffer.text.endsWith("\n") ? "" : "\n"}${block}`)
+  buffer.locals.set(STATE_RESTORED, true)
+}
+
+function restoreGptelState(editor: Editor, deps: GptelDeps, buffer: BufferModel): boolean {
+  const saved = parseSavedState(buffer)
+  if (!saved) return false
+  if (saved.backend) deps.setCustom("gptel-backend", saved.backend)
+  if (saved.model) deps.setCustom("gptel-model", saved.model)
+  if (saved.system) deps.setCustom("gptel-system-message", saved.system)
+  if (saved.tools != null) deps.setCustom("gptel-tools", saved.tools)
+  if (typeof saved.temperature === "number") deps.setCustom("gptel-temperature", saved.temperature)
+  if (typeof saved.maxTokens === "number") deps.setCustom("gptel-max-tokens", saved.maxTokens)
+  if (saved.useContext != null) deps.setCustom("gptel-use-context", saved.useContext)
+  if (saved.includeReasoning != null) deps.setCustom("gptel-include-reasoning", saved.includeReasoning)
+  if (saved.schema != null) deps.setCustom("gptel-schema", saved.schema)
+  if (saved.lastRequest) {
+    state(editor).lastRequest = {
+      bufferId: buffer.id,
+      prompt: "",
+      messages: [],
+      insertionStart: saved.lastRequest.responseStart,
+      responseStart: saved.lastRequest.responseStart,
+      responseEnd: saved.lastRequest.responseEnd,
+      insertionEnd: saved.lastRequest.responseEnd,
+      backend: saved.backend ?? deps.getCustom<string>("gptel-backend") ?? "",
+      model: saved.model ?? deps.getCustom<string>("gptel-model") ?? "",
+      variants: saved.lastRequest.variants,
+      variantIndex: saved.lastRequest.variantIndex,
+    }
+  }
+  buffer.locals.set(STATE_RESTORED, true)
+  return true
+}
+
+function restoreGptelStateOnce(editor: Editor, deps: GptelDeps, buffer: BufferModel): void {
+  if (buffer.locals.get(STATE_RESTORED)) return
+  restoreGptelState(editor, deps, buffer)
+}
+
 function chatHistory(buffer: BufferModel, markers: GptelChatMarkers = defaultChatMarkers()): GptelMessage[] {
   const messages: GptelMessage[] = []
   const alternatives = markerAlternatives(markers)
@@ -567,7 +677,7 @@ function chatHistory(buffer: BufferModel, markers: GptelChatMarkers = defaultCha
   for (const match of buffer.text.matchAll(regex)) {
     const marker = match[1] ?? ""
     const role = marker === markerText(markers, "user", true) || marker === markerText(markers, "user") ? "user" : "assistant"
-    const content = (match[2] ?? "").trim()
+    const content = stripStateBlocks(match[2] ?? "")
     if (content) messages.push({ role, content })
   }
   return messages
@@ -2048,6 +2158,8 @@ function describeState(editor: Editor, deps: GptelDeps): string {
     "  gptel-openai-oauth-login save OpenAI OAuth token",
     "  gptel-gh-login         save GitHub Copilot token",
     "  gptel-menu             inspect and change backend/model",
+    "  gptel-save-state       persist gptel metadata in this buffer",
+    "  gptel-restore-state    restore gptel metadata from this buffer",
     "  gptel-abort            abort active request",
   ].join("\n")
 }
@@ -2449,6 +2561,7 @@ export async function install(editor: Editor): Promise<void> {
 
   editor.command("gptel-send", async ({ editor, buffer, args }) => {
     if (buffer.mode !== GPTEL_CHAT_MODE && !buffer.minorModes.has(GPTEL_MODE)) editor.enableMinorMode(GPTEL_MODE, { buffer })
+    restoreGptelStateOnce(editor, deps, buffer)
     await sendFromBuffer(editor, deps, buffer, args)
   }, "Send the active region, chat prompt, or buffer prefix to the configured LLM.")
 
@@ -2720,6 +2833,15 @@ export async function install(editor: Editor): Promise<void> {
     const buffer = logBuffer(editor, "")
     editor.switchToBuffer(buffer.id)
   }, "Open the gptel log buffer.")
+
+  editor.command("gptel-save-state", ({ editor, buffer }) => {
+    saveGptelState(editor, deps, buffer)
+    editor.message("gptel: state saved")
+  }, "Persist gptel state in the current buffer.")
+
+  editor.command("gptel-restore-state", ({ editor, buffer }) => {
+    editor.message(restoreGptelState(editor, deps, buffer) ? "gptel: state restored" : "gptel: no saved state")
+  }, "Restore gptel state from the current buffer.")
 
   editor.defineKey("global", "s-m", "gptel-menu")
   editor.defineKey("global", "s-g", "gptel")
