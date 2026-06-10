@@ -895,6 +895,67 @@ test("gptel inspect-query builds request payload without sending it", async () =
   }
 })
 
+test("gptel-cache marks Anthropic system, tool, and message payload sections", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeAnthropic(editor, "CacheClaude", { models: ["claude-test"], defaultModel: "claude-test", stream: false })
+  gptelMakeTool(editor, {
+    name: "lookup",
+    description: "Lookup a value.",
+    parameters: { type: "object", properties: { q: { type: "string" } } },
+    function: () => "ok",
+  })
+  setCustom("gptel-backend", "CacheClaude")
+  setCustom("gptel-model", "claude-test")
+  setCustom("gptel-system-message", "cache me")
+  setCustom("gptel-tools", "lookup")
+  setCustom("gptel-cache", "system tool message")
+  setCustom("gptel-stream", false)
+
+  const buffer = editor.scratch("*ChatGPT-cache-anthropic*", "User:\nhello", "gptel-chat")
+  buffer.point = buffer.text.length
+  editor.switchToBuffer(buffer.id)
+  await editor.run("gptel-inspect-query-json")
+
+  const body = JSON.parse(editor.activeBuffer.text)
+  expect(body.system[0].cache_control).toEqual({ type: "ephemeral" })
+  expect(body.tools.at(-1).cache_control).toEqual({ type: "ephemeral" })
+  expect(body.messages.at(-1).content.at(-1).cache_control).toEqual({ type: "ephemeral" })
+  setCustom("gptel-tools", "")
+  setCustom("gptel-cache", "")
+  setCustom("gptel-stream", true)
+})
+
+test("gptel-cache marks Bedrock system and tool payload sections", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeBedrock(editor, "CacheBedrock", { models: ["claude-sonnet-4-5-20250929"], defaultModel: "claude-sonnet-4-5-20250929", stream: false })
+  gptelMakeTool(editor, {
+    name: "lookup",
+    description: "Lookup a value.",
+    parameters: { type: "object", properties: { q: { type: "string" } } },
+    function: () => "ok",
+  })
+  setCustom("gptel-backend", "CacheBedrock")
+  setCustom("gptel-model", "claude-sonnet-4-5-20250929")
+  setCustom("gptel-system-message", "cache bedrock")
+  setCustom("gptel-tools", "lookup")
+  setCustom("gptel-cache", "system tool")
+  setCustom("gptel-stream", false)
+
+  const buffer = editor.scratch("*ChatGPT-cache-bedrock*", "User:\nhello", "gptel-chat")
+  buffer.point = buffer.text.length
+  editor.switchToBuffer(buffer.id)
+  await editor.run("gptel-inspect-query-json")
+
+  const body = JSON.parse(editor.activeBuffer.text)
+  expect(body.system.at(-1)).toEqual({ cachePoint: { type: "default" } })
+  expect(body.toolConfig.tools.at(-1)).toEqual({ cachePoint: { type: "default" } })
+  setCustom("gptel-tools", "")
+  setCustom("gptel-cache", "")
+  setCustom("gptel-stream", true)
+})
+
 test("gptel-log-level records request and response data", async () => {
   const editor = new Editor()
   await install(editor)

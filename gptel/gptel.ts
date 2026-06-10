@@ -1112,6 +1112,13 @@ function includeReasoningSetting(deps: GptelDeps): boolean | "ignore" | string {
   return value
 }
 
+function cacheEnabled(deps: GptelDeps, part: "system" | "tool" | "message"): boolean {
+  const value = deps.getCustom<boolean | string>("gptel-cache")
+  if (value === true || value === "true" || value === "t" || value === "yes") return true
+  if (value === false || value === "false" || value === "nil" || value === "no" || value == null || value === "") return false
+  return String(value).split(/[, ()]+/).map(item => item.trim()).filter(Boolean).includes(part)
+}
+
 function reasoningBlock(reasoning: string, include: boolean | "ignore" | string): string {
   if (!reasoning || include === false) return ""
   return `\`\`\` reasoning\n${reasoning.trim()}\n\`\`\`\n\n`
@@ -1137,6 +1144,46 @@ function anthropicSchemaTool(schema: Record<string, unknown>): unknown {
   }
 }
 
+function anthropicCacheControl(): Record<string, unknown> {
+  return { type: "ephemeral" }
+}
+
+function anthropicSystem(system: string | undefined, cached: boolean): unknown {
+  if (!system) return undefined
+  return cached ? [{ type: "text", text: system, cache_control: anthropicCacheControl() }] : system
+}
+
+function anthropicToolsWithCache(tools: unknown[], cached: boolean): unknown[] {
+  if (!cached || !tools.length) return tools
+  return tools.map((tool, index) => index === tools.length - 1 && tool && typeof tool === "object" && !Array.isArray(tool)
+    ? { ...(tool as Record<string, unknown>), cache_control: anthropicCacheControl() }
+    : tool)
+}
+
+function anthropicMessagesWithCache(messages: unknown[], cached: boolean): unknown[] {
+  if (!cached || !messages.length) return messages
+  const lastIndex = messages.length - 1
+  return messages.map((message, index) => {
+    if (index !== lastIndex || !message || typeof message !== "object" || Array.isArray(message)) return message
+    const record = { ...(message as Record<string, unknown>) }
+    if (typeof record.content === "string") {
+      record.content = [{ type: "text", text: record.content, cache_control: anthropicCacheControl() }]
+    } else if (Array.isArray(record.content) && record.content.length) {
+      const content = [...record.content]
+      const last = content[content.length - 1]
+      if (last && typeof last === "object" && !Array.isArray(last)) {
+        content[content.length - 1] = { ...(last as Record<string, unknown>), cache_control: anthropicCacheControl() }
+        record.content = content
+      }
+    }
+    return record
+  })
+}
+
+function bedrockToolsWithCache(tools: unknown[], cached: boolean): unknown[] {
+  return cached && tools.length ? [...tools, { cachePoint: { type: "default" } }] : tools
+}
+
 function requestBody(
   backend: GptelBackend,
   model: string,
@@ -1151,15 +1198,18 @@ function requestBody(
   const schema = currentSchema(deps)
   if (backend.kind === "anthropic") {
     const system = messages.find(m => m.role === "system")?.content
-    const backendTools = tools.map(anthropicTool)
+    const backendTools = anthropicToolsWithCache(
+      [...(schema ? [anthropicSchemaTool(schema)] : []), ...tools.map(anthropicTool)],
+      cacheEnabled(deps, "tool"),
+    )
     return {
       model,
       max_tokens: maxTokens || 4096,
       temperature: temperature || undefined,
       stream,
-      system,
-      messages: anthropicMessages(messages),
-      tools: schema || backendTools.length ? [...(schema ? [anthropicSchemaTool(schema)] : []), ...backendTools] : undefined,
+      system: anthropicSystem(system, cacheEnabled(deps, "system")),
+      messages: anthropicMessagesWithCache(anthropicMessages(messages), cacheEnabled(deps, "message")),
+      tools: backendTools.length ? backendTools : undefined,
       tool_choice: schema ? { type: "tool", name: "response_json" } : undefined,
       ...extra,
     }
@@ -1188,14 +1238,15 @@ function requestBody(
   }
   if (backend.kind === "bedrock") {
     const system = messages.find(message => message.role === "system")?.content
+    const backendTools = bedrockToolsWithCache(tools.map(bedrockTool), cacheEnabled(deps, "tool"))
     return {
       messages: providerMessagesForBackend(backend, messages),
-      system: system ? [{ text: system }] : undefined,
+      system: system ? [{ text: system }, ...(cacheEnabled(deps, "system") ? [{ cachePoint: { type: "default" } }] : [])] : undefined,
       inferenceConfig: {
         maxTokens: maxTokens || 4096,
         temperature: temperature || undefined,
       },
-      toolConfig: tools.length ? { toolChoice: { auto: {} }, tools: tools.map(bedrockTool) } : undefined,
+      toolConfig: backendTools.length ? { toolChoice: { auto: {} }, tools: backendTools } : undefined,
       ...extra,
     }
   }
@@ -2649,6 +2700,7 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-max-tokens", "number", 4096, "Maximum output tokens for gptel requests.", "gptel")
   deps.defcustom("gptel-stream", "boolean", true, "Stream gptel responses into the current buffer.", "gptel")
   deps.defcustom("gptel-log-level", "string", "", "Logging level for gptel requests: off, info, or debug.", "gptel")
+  deps.defcustom("gptel-cache", "string", "", "Prompt caching controls: true/t for all, or space/comma separated system, tool, message.", "gptel")
   deps.defcustom("gptel-use-tools", "boolean", true, "Whether selected gptel tools are made available to models.", "gptel")
   deps.defcustom("gptel-tools", "string", "", "Comma or space separated gptel tool names to include with requests.", "gptel")
   deps.defcustom("gptel-include-tool-results", "string", "auto", "Whether tool results are inserted in gptel buffers: auto, true, or false.", "gptel")
