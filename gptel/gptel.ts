@@ -22,6 +22,7 @@ export type GptelMessage = {
   name?: string
   toolCallId?: string
   toolCalls?: GptelToolCall[]
+  media?: GptelMediaPart[]
 }
 
 export type GptelBackendKind =
@@ -50,7 +51,7 @@ export type GptelBackend = {
 export type GptelContextItem =
   | { type: "buffer"; name: string; bufferId: string; text: string }
   | { type: "region"; name: string; bufferId: string; start: number; end: number; text: string }
-  | { type: "file"; path: string; text: string; binary?: boolean }
+  | { type: "file"; path: string; text: string; binary?: boolean; mime?: string }
   | { type: "directory"; path: string; files: Array<{ path: string; text: string }> }
   | { type: "text"; name: string; text: string }
 
@@ -65,6 +66,12 @@ export type GptelToolCall = {
   id: string
   name: string
   arguments: unknown
+}
+
+export type GptelMediaPart = {
+  path: string
+  mime: string
+  base64: string
 }
 
 export type GptelPreset = {
@@ -270,6 +277,44 @@ function backendUrl(backend: GptelBackend, model: string): string {
   return `${protocol}://${host}${endpoint}`
 }
 
+export function mimeTypeForPath(path: string): string | null {
+  const lower = path.toLowerCase()
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg"
+  if (lower.endsWith(".png")) return "image/png"
+  if (lower.endsWith(".gif")) return "image/gif"
+  if (lower.endsWith(".webp")) return "image/webp"
+  if (lower.endsWith(".heic")) return "image/heic"
+  if (lower.endsWith(".heif")) return "image/heif"
+  if (lower.endsWith(".pdf")) return "application/pdf"
+  if (lower.endsWith(".txt")) return "text/plain"
+  if (lower.endsWith(".md") || lower.endsWith(".markdown")) return "text/markdown"
+  if (lower.endsWith(".json")) return "application/json"
+  if (lower.endsWith(".csv")) return "text/csv"
+  return null
+}
+
+function isTextMime(mime: string | undefined): boolean {
+  return Boolean(mime?.startsWith("text/") || mime === "application/json")
+}
+
+function isImageMime(mime: string): boolean {
+  return mime.startsWith("image/")
+}
+
+function base64File(path: string): string | null {
+  try { return readFileSync(path).toString("base64") } catch { return null }
+}
+
+export function mediaPartsFromContext(items: readonly GptelContextItem[]): GptelMediaPart[] {
+  const media: GptelMediaPart[] = []
+  for (const item of items) {
+    if (item.type !== "file" || !item.mime || isTextMime(item.mime)) continue
+    const base64 = base64File(item.path)
+    if (base64) media.push({ path: item.path, mime: item.mime, base64 })
+  }
+  return media
+}
+
 function regionBounds(buffer: BufferModel): [number, number] | null {
   if (buffer.mark == null || buffer.mark === buffer.point) return null
   return [Math.min(buffer.mark, buffer.point), Math.max(buffer.mark, buffer.point)]
@@ -377,11 +422,13 @@ function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferModel, pro
   const messages: GptelMessage[] = []
   const system = deps.getCustom<string>("gptel-system-message") || "You are a helpful assistant."
   if (system) messages.push({ role: "system", content: system })
-  const context = renderContext(state(editor).context)
+  const st = state(editor)
+  const context = renderContext(st.context)
+  const media = mediaPartsFromContext(st.context)
   const history = (buffer.mode === GPTEL_CHAT_MODE || buffer.minorModes.has(GPTEL_MODE)) ? chatHistory(buffer) : []
   messages.push(...history.slice(0, -1))
   const promptWithContext = context ? `${context}\n\nUser request:\n${prompt}` : prompt
-  messages.push({ role: "user", content: promptWithContext })
+  messages.push({ role: "user", content: promptWithContext, media })
   return messages
 }
 
@@ -429,7 +476,35 @@ function anthropicTool(tool: GptelTool): unknown {
   }
 }
 
-function openAiMessages(messages: GptelMessage[]): unknown[] {
+function openAiContent(message: GptelMessage): unknown {
+  if (!message.media?.length) return message.content
+  const parts: unknown[] = []
+  if (message.content) parts.push({ type: "text", text: message.content })
+  for (const media of message.media) {
+    if (!isImageMime(media.mime)) continue
+    parts.push({
+      type: "image_url",
+      image_url: { url: `data:${media.mime};base64,${media.base64}` },
+    })
+  }
+  return parts
+}
+
+function openAiResponsesContent(message: GptelMessage): unknown {
+  if (!message.media?.length) return message.content
+  const parts: unknown[] = []
+  if (message.content) parts.push({ type: "input_text", text: message.content })
+  for (const media of message.media) {
+    if (!isImageMime(media.mime)) continue
+    parts.push({
+      type: "input_image",
+      image_url: `data:${media.mime};base64,${media.base64}`,
+    })
+  }
+  return parts
+}
+
+function openAiMessages(messages: GptelMessage[], responsesApi = false): unknown[] {
   return messages.map(message => {
     if (message.role === "tool") {
       return {
@@ -439,7 +514,10 @@ function openAiMessages(messages: GptelMessage[]): unknown[] {
         content: message.content,
       }
     }
-    const base: Record<string, unknown> = { role: message.role, content: message.content }
+    const base: Record<string, unknown> = {
+      role: message.role,
+      content: responsesApi ? openAiResponsesContent(message) : openAiContent(message),
+    }
     if (message.toolCalls?.length) {
       base.tool_calls = message.toolCalls.map(call => ({
         id: call.id,
@@ -471,8 +549,63 @@ function anthropicMessages(messages: GptelMessage[]): unknown[] {
       }
       return { role: "assistant", content }
     }
+    if (message.media?.length) {
+      const content: unknown[] = []
+      if (message.content) content.push({ type: "text", text: message.content })
+      for (const media of message.media) {
+        if (isImageMime(media.mime)) {
+          content.push({
+            type: "image",
+            source: { type: "base64", media_type: media.mime, data: media.base64 },
+          })
+        } else if (media.mime === "application/pdf") {
+          content.push({
+            type: "document",
+            source: { type: "base64", media_type: media.mime, data: media.base64 },
+          })
+        }
+      }
+      return { role: message.role === "assistant" ? "assistant" : "user", content }
+    }
     return { role: message.role === "assistant" ? "assistant" : "user", content: message.content }
   })
+}
+
+function geminiParts(message: GptelMessage): unknown[] {
+  const parts: unknown[] = []
+  if (message.content) parts.push({ text: message.content })
+  for (const media of message.media ?? []) {
+    parts.push({
+      inline_data: {
+        mime_type: media.mime,
+        data: media.base64,
+      },
+    })
+  }
+  return parts.length ? parts : [{ text: "" }]
+}
+
+function ollamaMessages(messages: GptelMessage[]): unknown[] {
+  return messages.map(message => {
+    const images = message.media?.filter(media => isImageMime(media.mime)).map(media => media.base64) ?? []
+    return {
+      role: message.role,
+      content: message.content,
+      ...(images.length ? { images } : {}),
+    }
+  })
+}
+
+export function providerMessagesForBackend(backend: GptelBackend, messages: GptelMessage[]): unknown {
+  if (backend.kind === "anthropic") return anthropicMessages(messages)
+  if (backend.kind === "gemini") {
+    return messages.filter(m => m.role !== "system").map(m => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: geminiParts(m),
+    }))
+  }
+  if (backend.kind === "ollama") return ollamaMessages(messages)
+  return openAiMessages(messages, backend.kind === "openai-responses")
 }
 
 function requestBody(
@@ -499,10 +632,7 @@ function requestBody(
   }
   if (backend.kind === "gemini") {
     return {
-      contents: messages.filter(m => m.role !== "system").map(m => ({
-        role: m.role === "assistant" ? "model" : "user",
-        parts: [{ text: m.content }],
-      })),
+      contents: providerMessagesForBackend(backend, messages),
       systemInstruction: messages.find(m => m.role === "system") ? { parts: [{ text: messages.find(m => m.role === "system")!.content }] } : undefined,
       generationConfig: {
         temperature: temperature || undefined,
@@ -511,13 +641,13 @@ function requestBody(
     }
   }
   if (backend.kind === "ollama") {
-    return { model, stream, messages: messages.map(m => ({ role: m.role, content: m.content })) }
+    return { model, stream, messages: providerMessagesForBackend(backend, messages) }
   }
   if (backend.kind === "openai-responses") {
     return {
       model,
       stream,
-      input: openAiMessages(messages).map((m: any) => ({ ...m, role: m.role === "system" ? "developer" : m.role })),
+      input: (providerMessagesForBackend(backend, messages) as any[]).map((m: any) => ({ ...m, role: m.role === "system" ? "developer" : m.role })),
       tools: tools.length ? tools.map(openAiTool) : undefined,
       temperature: temperature || undefined,
       max_output_tokens: maxTokens || undefined,
@@ -526,7 +656,7 @@ function requestBody(
   return {
     model,
     stream,
-    messages: openAiMessages(messages),
+    messages: providerMessagesForBackend(backend, messages),
     tools: tools.length ? tools.map(openAiTool) : undefined,
     tool_choice: tools.length ? "auto" : undefined,
     temperature: temperature || undefined,
@@ -892,9 +1022,10 @@ async function addPathContext(editor: Editor, path: string): Promise<void> {
     state(editor).context.push({ type: "directory", path: full, files: await collectDirectory(full) })
     editor.message(`gptel: added directory context ${full}`)
   } else {
-    const binary = st.size > 200_000
+    const mime = mimeTypeForPath(full) ?? undefined
+    const binary = st.size > 200_000 || (mime ? !isTextMime(mime) : false)
     const text = binary ? "" : await readFile(full, "utf8").catch(() => "")
-    state(editor).context.push({ type: "file", path: full, text, binary })
+    state(editor).context.push({ type: "file", path: full, text, binary, mime })
     editor.message(`gptel: added file context ${full}`)
   }
 }

@@ -1,5 +1,20 @@
 import { expect, test } from "bun:test"
-import { defaultBackends, extractPrompt, parseSseEvents, renderContext, renderContextBuffer, toolCallsFromJson, type GptelBackend } from "./gptel"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
+import { tmpdir } from "node:os"
+import {
+  defaultBackends,
+  extractPrompt,
+  mediaPartsFromContext,
+  mimeTypeForPath,
+  parseSseEvents,
+  providerMessagesForBackend,
+  renderContext,
+  renderContextBuffer,
+  toolCallsFromJson,
+  type GptelBackend,
+  type GptelMessage,
+} from "./gptel"
 import { BufferModel } from "@jemacs/core"
 
 test("default backends include Stephen's configured Claude backend", () => {
@@ -41,6 +56,68 @@ test("renderContextBuffer creates navigable sections and deletion markers", () =
   expect(rendered.sections).toHaveLength(2)
   expect(rendered.sections[0]!.start).toBeLessThan(rendered.sections[0]!.end)
   expect(rendered.sections[1]!.start).toBeGreaterThan(rendered.sections[0]!.end)
+})
+
+test("mimeTypeForPath identifies common gptel media types", () => {
+  expect(mimeTypeForPath("x.png")).toBe("image/png")
+  expect(mimeTypeForPath("x.jpeg")).toBe("image/jpeg")
+  expect(mimeTypeForPath("x.pdf")).toBe("application/pdf")
+  expect(mimeTypeForPath("x.unknown")).toBeNull()
+})
+
+test("mediaPartsFromContext reads binary file context as base64", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gptel-media-"))
+  try {
+    const path = join(dir, "tiny.png")
+    writeFileSync(path, Buffer.from([1, 2, 3, 4]))
+    expect(mediaPartsFromContext([{ type: "file", path, text: "", binary: true, mime: "image/png" }])).toEqual([
+      { path, mime: "image/png", base64: "AQIDBA==" },
+    ])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("providerMessagesForBackend embeds media in provider-specific shapes", () => {
+  const messages: GptelMessage[] = [{
+    role: "user",
+    content: "describe",
+    media: [{ path: "/tmp/tiny.png", mime: "image/png", base64: "AQIDBA==" }],
+  }]
+
+  expect(providerMessagesForBackend({ name: "OpenAI", kind: "openai", models: ["gpt-4.1"] }, messages)).toEqual([{
+    role: "user",
+    content: [
+      { type: "text", text: "describe" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AQIDBA==" } },
+    ],
+  }])
+  expect(providerMessagesForBackend({ name: "Responses", kind: "openai-responses", models: ["gpt-4.1"] }, messages)).toEqual([{
+    role: "user",
+    content: [
+      { type: "input_text", text: "describe" },
+      { type: "input_image", image_url: "data:image/png;base64,AQIDBA==" },
+    ],
+  }])
+  expect(providerMessagesForBackend({ name: "Claude", kind: "anthropic", models: ["claude"] }, messages)).toEqual([{
+    role: "user",
+    content: [
+      { type: "text", text: "describe" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "AQIDBA==" } },
+    ],
+  }])
+  expect(providerMessagesForBackend({ name: "Gemini", kind: "gemini", models: ["gemini"] }, messages)).toEqual([{
+    role: "user",
+    parts: [
+      { text: "describe" },
+      { inline_data: { mime_type: "image/png", data: "AQIDBA==" } },
+    ],
+  }])
+  expect(providerMessagesForBackend({ name: "Ollama", kind: "ollama", models: ["llava"] }, messages)).toEqual([{
+    role: "user",
+    content: "describe",
+    images: ["AQIDBA=="],
+  }])
 })
 
 test("parseSseEvents joins data lines", () => {
