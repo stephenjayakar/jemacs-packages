@@ -1,6 +1,6 @@
 import { readFileSync, statSync } from "node:fs"
-import { readdir, readFile, stat } from "node:fs/promises"
-import { join, resolve } from "node:path"
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises"
+import { dirname, join, resolve } from "node:path"
 import { homedir } from "node:os"
 import type { BufferModel } from "../../jemacs-opentui/src/kernel/buffer"
 import type { Editor, TransientDefinition } from "../../jemacs-opentui/src/kernel/editor"
@@ -203,6 +203,26 @@ function readSecret(path: string): string {
   } catch {
     return ""
   }
+}
+
+function emacsCachePath(...parts: string[]): string {
+  return join(process.env.HOME || homedir(), ".emacs.d", ".cache", ...parts)
+}
+
+function tokenFromFile(path: string): string {
+  const raw = readSecret(path)
+  if (!raw) return ""
+  try {
+    const json = JSON.parse(raw)
+    return String(json.token ?? json.access_token ?? json.id_token ?? raw).trim()
+  } catch {
+    return raw
+  }
+}
+
+async function writeTokenFile(path: string, token: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, JSON.stringify({ token, updatedAt: new Date().toISOString() }, null, 2), "utf8")
 }
 
 function apiKey(...names: string[]): string {
@@ -1682,6 +1702,8 @@ function describeState(editor: Editor, deps: GptelDeps): string {
     "  gptel-regenerate       regenerate the last response",
     "  gptel-previous-variant cycle response variants",
     "  gptel-mark-response    mark the response at point",
+    "  gptel-openai-oauth-login save OpenAI OAuth token",
+    "  gptel-gh-login         save GitHub Copilot token",
     "  gptel-menu             inspect and change backend/model",
     "  gptel-abort            abort active request",
   ].join("\n")
@@ -1875,6 +1897,7 @@ export function gptelMakeGithubCopilot(editor: Editor, name: string, options: Pa
     models: ["gpt-5.2", "gpt-5.1-codex", "claude-sonnet-4-5", "gemini-2.5-pro"],
     defaultModel: "gpt-5.2",
     stream: true,
+    key: () => apiKey("GITHUB_COPILOT_TOKEN") || tokenFromFile(emacsCachePath("copilot-chat", "token")),
     headers: {
       "openai-intent": "conversation-panel",
       "x-initiator": "user",
@@ -1892,6 +1915,7 @@ export function gptelMakeOpenAIOAuth(editor: Editor, name: string, options: Part
     models: ["gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4-mini", "gpt-5.4", "gpt-5.5"],
     defaultModel: "gpt-5.3-codex",
     stream: true,
+    key: () => apiKey("OPENAI_OAUTH_TOKEN") || tokenFromFile(emacsCachePath("gptel-openai", "openai-oauth-token")),
     ...options,
   }))
 }
@@ -2159,6 +2183,20 @@ export async function install(editor: Editor): Promise<void> {
     if (value != null) deps.setCustom("gptel-tools", value)
     editor.message(`gptel tools: ${deps.getCustom<string>("gptel-tools") || "(none)"}`)
   }, "Set active gptel tools by name.")
+
+  editor.command("gptel-openai-oauth-login", async ({ editor, args }) => {
+    const token = args.join(" ") || await editor.prompt("OpenAI OAuth token: ", "", "gptel-openai-oauth-token")
+    if (!token) return
+    await writeTokenFile(emacsCachePath("gptel-openai", "openai-oauth-token"), token.trim())
+    editor.message("gptel: saved OpenAI OAuth token")
+  }, "Save an OpenAI OAuth token for gptel OpenAI OAuth backends.")
+
+  editor.command("gptel-gh-login", async ({ editor, args }) => {
+    const token = args.join(" ") || await editor.prompt("GitHub Copilot chat token: ", "", "gptel-gh-token")
+    if (!token) return
+    await writeTokenFile(emacsCachePath("copilot-chat", "token"), token.trim())
+    editor.message("gptel: saved GitHub Copilot token")
+  }, "Save a GitHub Copilot chat token for gptel Copilot backends.")
 
   editor.command("gptel-version", ({ editor }) => {
     editor.message("gptel.ts 0.9.9.5-compatible")

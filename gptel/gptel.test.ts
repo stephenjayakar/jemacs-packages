@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
@@ -463,5 +463,23 @@ test("gptel inspect reports last and session token usage", async () => {
   } finally {
     globalThis.fetch = originalFetch
     setCustom("gptel-stream", true)
+  }
+})
+
+test("oauth login commands save upstream-compatible token files", async () => {
+  const home = mkdtempSync(join(tmpdir(), "gptel-home-"))
+  const oldHome = process.env.HOME
+  process.env.HOME = home
+  try {
+    const editor = new Editor()
+    await install(editor)
+    await editor.run("gptel-openai-oauth-login", ["openai-token"])
+    await editor.run("gptel-gh-login", ["copilot-token"])
+    expect(JSON.parse(readFileSync(join(home, ".emacs.d/.cache/gptel-openai/openai-oauth-token"), "utf8")).token).toBe("openai-token")
+    expect(JSON.parse(readFileSync(join(home, ".emacs.d/.cache/copilot-chat/token"), "utf8")).token).toBe("copilot-token")
+  } finally {
+    if (oldHome == null) delete process.env.HOME
+    else process.env.HOME = oldHome
+    rmSync(home, { recursive: true, force: true })
   }
 })
