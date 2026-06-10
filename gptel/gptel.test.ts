@@ -7,12 +7,15 @@ import {
   defaultBackends,
   extractPrompt,
   formatToolResultBlock,
+  gptelParseSchema,
   gptelAddPostResponseFunction,
   gptelAddPromptTransform,
   gptelAddResponseFilter,
+  gptelMakeAnthropic,
   gptelMakeAzure,
   gptelMakeBedrock,
   gptelMakeDeepSeek,
+  gptelMakeGemini,
   gptelMakeKagi,
   gptelMakeGithubCopilot,
   gptelMakeOllama,
@@ -64,6 +67,47 @@ test("convertMarkdownToOrg translates common gptel response syntax", () => {
   expect(org).toContain("#+end_src")
   expect(org).toContain("=code=")
   expect(org).toContain("/em/")
+})
+
+test("gptelParseSchema supports JSON and upstream shorthand forms", () => {
+  expect(gptelParseSchema("name, age int")).toEqual({
+    type: "object",
+    properties: {
+      name: { type: "string" },
+      age: { type: "integer" },
+    },
+    additionalProperties: false,
+    required: ["name", "age"],
+    propertyOrdering: ["name", "age"],
+  })
+  expect(gptelParseSchema("[title: short title\nscore number: confidence]")).toEqual({
+    type: "object",
+    properties: {
+      items: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "short title" },
+            score: { type: "number", description: "confidence" },
+          },
+          additionalProperties: false,
+          required: ["title", "score"],
+          propertyOrdering: ["title", "score"],
+        },
+      },
+    },
+    additionalProperties: false,
+    required: ["items"],
+    propertyOrdering: ["items"],
+  })
+  expect(gptelParseSchema("{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}}")).toEqual({
+    type: "object",
+    properties: { ok: { type: "boolean" } },
+    additionalProperties: false,
+    required: ["ok"],
+    propertyOrdering: ["ok"],
+  })
 })
 
 test("backend factories cover upstream provider families", () => {
@@ -479,6 +523,62 @@ test("gptel-send sends tools and inserts included tool results", async () => {
     setCustom("gptel-use-tools", true)
     setCustom("gptel-include-tool-results", "auto")
     setCustom("gptel-confirm-tool-calls", true)
+    setCustom("gptel-stream", true)
+  }
+})
+
+test("gptel-send injects structured output schemas for provider families", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "SchemaOpenAI", { endpoint: "http://schema.test/openai", models: ["m"], defaultModel: "m", stream: false })
+  gptelMakeOpenAIResponses(editor, "SchemaResponses", { endpoint: "http://schema.test/responses", models: ["m"], defaultModel: "m", stream: false })
+  gptelMakeAnthropic(editor, "SchemaAnthropic", { endpoint: "http://schema.test/anthropic", models: ["m"], defaultModel: "m", stream: false, key: "anthropic-key" })
+  gptelMakeGemini(editor, "SchemaGemini", { endpoint: "http://schema.test/gemini", models: ["m"], defaultModel: "m", stream: false, key: "gemini-key" })
+  gptelMakeOllama(editor, "SchemaOllama", { endpoint: "http://schema.test/ollama", models: ["m"], defaultModel: "m", stream: false })
+  setCustom("gptel-model", "m")
+  setCustom("gptel-stream", false)
+  setCustom("gptel-schema", "answer string, score number")
+  const bodies: Record<string, any> = {}
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    const key = url.includes("responses") ? "responses"
+      : url.includes("anthropic") ? "anthropic"
+        : url.includes("gemini") ? "gemini"
+          : url.includes("ollama") ? "ollama"
+            : "openai"
+    bodies[key] = JSON.parse(String(init?.body ?? "{}"))
+    if (key === "anthropic") {
+      return new Response(JSON.stringify({ content: [{ type: "tool_use", name: "response_json", input: { answer: "ok", score: 1 } }] }), { status: 200, headers: { "content-type": "application/json" } })
+    }
+    if (key === "gemini") return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "done" }] } }] }), { status: 200, headers: { "content-type": "application/json" } })
+    if (key === "ollama") return new Response(JSON.stringify({ message: { content: "done" } }), { status: 200, headers: { "content-type": "application/json" } })
+    if (key === "responses") return new Response(JSON.stringify({ output_text: "done" }), { status: 200, headers: { "content-type": "application/json" } })
+    return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200, headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  try {
+    const sentBuffers: BufferModel[] = []
+    for (const backend of ["SchemaOpenAI", "SchemaResponses", "SchemaAnthropic", "SchemaGemini", "SchemaOllama"]) {
+      setCustom("gptel-backend", backend)
+      const buffer = editor.scratch(`*${backend}*`, "User:\nhello", "gptel-chat")
+      sentBuffers.push(buffer)
+      buffer.point = buffer.text.length
+      editor.switchToBuffer(buffer.id)
+      await editor.run("gptel-send")
+    }
+    expect(bodies.openai.response_format.type).toBe("json_schema")
+    expect(bodies.openai.response_format.json_schema.schema.required).toEqual(["answer", "score"])
+    expect(bodies.responses.text.format.schema.required).toEqual(["answer", "score"])
+    expect(bodies.anthropic.tools[0].name).toBe("response_json")
+    expect(bodies.anthropic.tool_choice).toEqual({ type: "tool", name: "response_json" })
+    expect(bodies.gemini.generationConfig.responseMimeType).toBe("application/json")
+    expect(bodies.gemini.generationConfig.responseSchema.required).toEqual(["answer", "score"])
+    expect(bodies.ollama.format.required).toEqual(["answer", "score"])
+    expect(sentBuffers[2]!.text).toContain("\"answer\": \"ok\"")
+    expect(sentBuffers.at(-1)!.text).toContain("done")
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-schema", "")
     setCustom("gptel-stream", true)
   }
 })

@@ -23,6 +23,7 @@ export {
   gptelMakePrivateGPT,
   gptelMakeTool,
   gptelMakeXAI,
+  gptelParseSchema,
   gptelToolCallSummary,
   mediaPartsFromContext,
   mimeTypeForPath,

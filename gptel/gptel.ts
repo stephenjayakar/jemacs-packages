@@ -95,6 +95,7 @@ export type GptelPreset = {
   model?: string
   system?: string
   temperature?: number
+  schema?: unknown
   tools?: string[]
 }
 
@@ -874,6 +875,93 @@ function requestParams(backend: GptelBackend): Record<string, unknown> {
   return backend.requestParams ?? {}
 }
 
+function schemaType(type: string): string {
+  const allowed = ["number", "string", "integer", "boolean", "null"]
+  return allowed.find(candidate => candidate.startsWith(type)) ?? type
+}
+
+function shorthandSchema(value: string): Record<string, unknown> {
+  let source = value.trim()
+  let wrapArray = false
+  if (source.startsWith("[") && source.endsWith("]")) {
+    wrapArray = true
+    source = source.slice(1, -1).trim()
+  }
+  const properties: Record<string, unknown> = {}
+  if (!source.includes("\n")) {
+    for (const part of source.split(",")) {
+      const [name, type = "string"] = part.trim().split(/\s+/)
+      if (name) properties[name] = { type: schemaType(type) }
+    }
+  } else {
+    for (const line of source.split(/\n+/)) {
+      const match = line.trim().match(/^([^ :]+)(?:\s+([^ :]+))?:?\s*(.*)$/)
+      if (!match) continue
+      const [, name, type = "string", description = ""] = match
+      properties[name] = { type: schemaType(type), ...(description ? { description: description.trim() } : {}) }
+    }
+  }
+  const object = { type: "object", properties }
+  return wrapArray ? { type: "array", items: object } : object
+}
+
+function preprocessSchema(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(preprocessSchema)
+  if (!schema || typeof schema !== "object") return schema
+  const record = schema as Record<string, unknown>
+  for (const [key, value] of Object.entries(record)) record[key] = preprocessSchema(value)
+  if (record.type === "object" && record.properties && typeof record.properties === "object" && !Array.isArray(record.properties)) {
+    const propertyNames = Object.keys(record.properties as Record<string, unknown>)
+    record.additionalProperties = false
+    record.required = propertyNames
+    record.propertyOrdering = propertyNames
+  }
+  return record
+}
+
+export function gptelParseSchema(schema: unknown): Record<string, unknown> | undefined {
+  if (schema == null || schema === "") return undefined
+  let parsed = schema
+  if (typeof schema === "string") {
+    const trimmed = schema.trim()
+    if (!trimmed) return undefined
+    parsed = trimmed.startsWith("{") ? JSON.parse(trimmed) : shorthandSchema(trimmed)
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined
+  const prepared = preprocessSchema(structuredClone(parsed)) as Record<string, unknown>
+  if (prepared.type === "array") {
+    return preprocessSchema({
+      type: "object",
+      properties: { items: prepared },
+    }) as Record<string, unknown>
+  }
+  return prepared
+}
+
+function currentSchema(deps: GptelDeps): Record<string, unknown> | undefined {
+  return gptelParseSchema(deps.getCustom<unknown>("gptel-schema"))
+}
+
+function schemaName(): string {
+  return "gptel_schema"
+}
+
+function openAiSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  return { type: "json_schema", json_schema: { name: schemaName(), schema, strict: true } }
+}
+
+function openAiResponsesSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  return { type: "json_schema", name: schemaName(), schema, strict: true }
+}
+
+function anthropicSchemaTool(schema: Record<string, unknown>): unknown {
+  return {
+    name: "response_json",
+    description: "Record JSON output according to user prompt",
+    input_schema: schema,
+  }
+}
+
 function requestBody(
   backend: GptelBackend,
   model: string,
@@ -885,8 +973,10 @@ function requestBody(
   const temperature = deps.getCustom<number>("gptel-temperature")
   const maxTokens = deps.getCustom<number>("gptel-max-tokens")
   const extra = requestParams(backend)
+  const schema = currentSchema(deps)
   if (backend.kind === "anthropic") {
     const system = messages.find(m => m.role === "system")?.content
+    const backendTools = tools.map(anthropicTool)
     return {
       model,
       max_tokens: maxTokens || 4096,
@@ -894,7 +984,8 @@ function requestBody(
       stream,
       system,
       messages: anthropicMessages(messages),
-      tools: tools.length ? tools.map(anthropicTool) : undefined,
+      tools: schema || backendTools.length ? [...(schema ? [anthropicSchemaTool(schema)] : []), ...backendTools] : undefined,
+      tool_choice: schema ? { type: "tool", name: "response_json" } : undefined,
       ...extra,
     }
   }
@@ -905,12 +996,13 @@ function requestBody(
       generationConfig: {
         temperature: temperature || undefined,
         maxOutputTokens: maxTokens || undefined,
+        ...(schema ? { responseMimeType: "application/json", responseSchema: schema } : {}),
       },
       ...extra,
     }
   }
   if (backend.kind === "ollama") {
-    return { model, stream, messages: providerMessagesForBackend(backend, messages), ...extra }
+    return { model, stream, messages: providerMessagesForBackend(backend, messages), format: schema, ...extra }
   }
   if (backend.kind === "kagi") {
     const prompt = messages.filter(message => message.role === "user").at(-1)?.content ?? ""
@@ -937,6 +1029,7 @@ function requestBody(
       stream,
       input: (providerMessagesForBackend(backend, messages) as any[]).map((m: any) => ({ ...m, role: m.role === "system" ? "developer" : m.role })),
       tools: tools.length ? tools.map(openAiTool) : undefined,
+      text: schema ? { format: openAiResponsesSchema(schema) } : undefined,
       temperature: temperature || undefined,
       max_output_tokens: maxTokens || undefined,
       ...extra,
@@ -948,6 +1041,7 @@ function requestBody(
     messages: providerMessagesForBackend(backend, messages),
     tools: tools.length ? tools.map(openAiTool) : undefined,
     tool_choice: tools.length ? "auto" : undefined,
+    response_format: schema ? openAiSchema(schema) : undefined,
     temperature: temperature || undefined,
     max_tokens: maxTokens || undefined,
     ...extra,
@@ -1085,7 +1179,10 @@ function formatUsage(usage: GptelTokenUsage | undefined): string {
 function textFromJson(backend: GptelBackend, json: unknown): string {
   const data = json as Record<string, any>
   if (backend.kind === "anthropic") {
-    return data.content?.filter((part: any) => part.type !== "tool_use").map((part: any) => part.text ?? "").join("") ?? ""
+    const text = data.content?.filter((part: any) => part.type !== "tool_use").map((part: any) => part.text ?? "").join("") ?? ""
+    if (text) return text
+    const structured = data.content?.find((part: any) => part.type === "tool_use" && part.name === "response_json")?.input
+    return structured == null ? "" : JSON.stringify(structured, null, 2)
   }
   if (backend.kind === "gemini") {
     return data.candidates?.flatMap((c: any) => c.content?.parts ?? []).map((p: any) => p.text ?? "").join("") ?? ""
@@ -1367,6 +1464,9 @@ function applyTransientArgs(editor: Editor, deps: GptelDeps, args: string[]): vo
     } else if (arg === "--tools") {
       const value = args[++i]
       if (value != null) deps.setCustom("gptel-tools", value)
+    } else if (arg === "--schema") {
+      const value = args[++i]
+      if (value != null) deps.setCustom("gptel-schema", value)
     } else if (arg === "--no-stream") {
       deps.setCustom("gptel-stream", false)
     } else if (arg === "--stream") {
@@ -1730,6 +1830,7 @@ function describeState(editor: Editor, deps: GptelDeps): string {
     `Context items: ${st.context.length}`,
     `Presets: ${[...st.presets.keys()].join(", ") || "(none)"}`,
     `Tools: ${[...st.tools.keys()].join(", ") || "(none)"}`,
+    `Schema: ${deps.getCustom<string>("gptel-schema") ? "yes" : "no"}`,
     "",
     "Commands:",
     "  gptel                  open a chat buffer",
@@ -1762,6 +1863,7 @@ const gptelMenuDefinition: TransientDefinition = {
         { key: "-t", label: "Temperature", argument: "--temperature", kind: "value" },
         { key: "-n", label: "Max tokens", argument: "--max-tokens", kind: "value" },
         { key: "-T", label: "Tools", argument: "--tools", kind: "value" },
+        { key: "-S", label: "Schema", argument: "--schema", kind: "value" },
         { key: "-S", label: "No stream", argument: "--no-stream", kind: "toggle" },
       ],
     },
@@ -1995,6 +2097,7 @@ async function applyPreset(editor: Editor, deps: GptelDeps, name: string): Promi
   if (preset.model) deps.setCustom("gptel-model", preset.model)
   if (preset.system) deps.setCustom("gptel-system-message", preset.system)
   if (typeof preset.temperature === "number") deps.setCustom("gptel-temperature", preset.temperature)
+  if (preset.schema != null) deps.setCustom("gptel-schema", typeof preset.schema === "string" ? preset.schema : JSON.stringify(preset.schema))
   if (preset.tools) deps.setCustom("gptel-tools", preset.tools.join(","))
   editor.message(`gptel: applied preset ${name}`)
 }
@@ -2016,6 +2119,7 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-include-tool-results", "string", "auto", "Whether tool results are inserted in gptel buffers: auto, true, or false.", "gptel")
   deps.defcustom("gptel-max-tool-rounds", "number", 3, "Maximum number of tool-call continuation rounds.", "gptel")
   deps.defcustom("gptel-confirm-tool-calls", "boolean", true, "Ask before running gptel tool calls.", "gptel")
+  deps.defcustom("gptel-schema", "string", "", "Structured JSON output schema as JSON or gptel shorthand.", "gptel")
   deps.defcustom("gptel-prompt-prefix", "string", "User:\n", "String inserted before user prompts in gptel chat buffers.", "gptel")
   deps.defcustom("gptel-response-prefix", "string", "Assistant:\n", "String inserted before assistant responses in gptel chat buffers.", "gptel")
   deps.defcustom("gptel-response-separator", "string", "\n\n", "String inserted between gptel prompt and response sections.", "gptel")
