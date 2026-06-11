@@ -198,6 +198,7 @@ const CONTEXT_FLAGGED = "gptel-context-flagged"
 const STATE_BLOCK_START = "<!-- gptel-state:"
 const STATE_BLOCK_END = "-->"
 const STATE_RESTORED = "gptel-state-restored"
+const DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
 type GptelContextSection = {
   index: number
   start: number
@@ -403,10 +404,31 @@ function currentModel(editor: Editor, deps: GptelDeps, backend?: GptelBackend): 
   return active.defaultModel ?? active.models[0] ?? "model"
 }
 
-function backendKey(backend: GptelBackend): string {
+function customString(deps: Pick<GptelDeps, "getCustom">, ...names: string[]): string {
+  for (const name of names) {
+    const value = deps.getCustom<string>(name)
+    if (value) return value
+  }
+  return ""
+}
+
+function systemMessage(deps: Pick<GptelDeps, "getCustom">): string {
+  const prompt = deps.getCustom<string>("gptel-system-prompt")
+  const message = deps.getCustom<string>("gptel-system-message")
+  if (prompt && prompt !== DEFAULT_SYSTEM_MESSAGE && (!message || message === DEFAULT_SYSTEM_MESSAGE)) return prompt
+  return message || prompt || DEFAULT_SYSTEM_MESSAGE
+}
+
+function setSystemMessage(deps: Pick<GptelDeps, "setCustom">, value: string): void {
+  deps.setCustom("gptel-system-prompt", value)
+  deps.setCustom("gptel-system-message", value)
+}
+
+function backendKey(backend: GptelBackend, deps?: Pick<GptelDeps, "getCustom">): string {
   if (typeof backend.key === "function") return backend.key()
   if (backend.key) return backend.key
   if (backend.keyEnv) return process.env[backend.keyEnv] ?? ""
+  if (deps) return customString(deps, "gptel-api-key")
   return ""
 }
 
@@ -644,7 +666,7 @@ function savedStatePayload(editor: Editor, deps: GptelDeps, buffer: BufferModel)
   return {
     backend: deps.getCustom<string>("gptel-backend"),
     model: deps.getCustom<string>("gptel-model"),
-    system: deps.getCustom<string>("gptel-system-message"),
+    system: systemMessage(deps),
     tools: deps.getCustom<string>("gptel-tools"),
     temperature: deps.getCustom<number>("gptel-temperature"),
     maxTokens: deps.getCustom<number>("gptel-max-tokens"),
@@ -674,7 +696,7 @@ function restoreGptelState(editor: Editor, deps: GptelDeps, buffer: BufferModel)
   if (!saved) return false
   if (saved.backend) deps.setCustom("gptel-backend", saved.backend)
   if (saved.model) deps.setCustom("gptel-model", saved.model)
-  if (saved.system) deps.setCustom("gptel-system-message", saved.system)
+  if (saved.system) setSystemMessage(deps, saved.system)
   if (saved.tools != null) deps.setCustom("gptel-tools", saved.tools)
   if (typeof saved.temperature === "number") deps.setCustom("gptel-temperature", saved.temperature)
   if (typeof saved.maxTokens === "number") deps.setCustom("gptel-max-tokens", saved.maxTokens)
@@ -847,7 +869,7 @@ function saveOrgGptelProperties(deps: GptelDeps, buffer: BufferModel): boolean {
   const existingTopic = existing.GPTEL_TOPIC ?? buffer.text.slice(heading.start, heading.end).match(/^:GPTEL_TOPIC:\s*(.*)$/m)?.[1]
   setOrgProperties(buffer, heading, {
     GPTEL_TOPIC: existingTopic,
-    GPTEL_SYSTEM: (deps.getCustom<string>("gptel-system-message") ?? "").replace(/\n/g, "\\n"),
+    GPTEL_SYSTEM: systemMessage(deps).replace(/\n/g, "\\n"),
     GPTEL_BACKEND: deps.getCustom<string>("gptel-backend"),
     GPTEL_MODEL: deps.getCustom<string>("gptel-model"),
     GPTEL_TEMPERATURE: String(deps.getCustom<number>("gptel-temperature") ?? ""),
@@ -865,7 +887,7 @@ function restoreOrgGptelProperties(_editor: Editor, deps: GptelDeps, buffer: Buf
   if (!Object.keys(props).some(key => key.startsWith("GPTEL_"))) return false
   if (props.GPTEL_BACKEND) deps.setCustom("gptel-backend", props.GPTEL_BACKEND)
   if (props.GPTEL_MODEL) deps.setCustom("gptel-model", props.GPTEL_MODEL)
-  if (props.GPTEL_SYSTEM) deps.setCustom("gptel-system-message", props.GPTEL_SYSTEM.replace(/\\n/g, "\n"))
+  if (props.GPTEL_SYSTEM) setSystemMessage(deps, props.GPTEL_SYSTEM.replace(/\\n/g, "\n"))
   if (props.GPTEL_TOOLS != null) deps.setCustom("gptel-tools", props.GPTEL_TOOLS)
   if (props.GPTEL_TEMPERATURE && Number.isFinite(Number(props.GPTEL_TEMPERATURE))) deps.setCustom("gptel-temperature", Number(props.GPTEL_TEMPERATURE))
   if (props.GPTEL_MAX_TOKENS && Number.isFinite(Number(props.GPTEL_MAX_TOKENS))) deps.setCustom("gptel-max-tokens", Number(props.GPTEL_MAX_TOKENS))
@@ -959,7 +981,7 @@ async function runPostResponseFunctions(editor: Editor, buffer: BufferModel, bac
 
 async function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferModel, prompt: string, backend: GptelBackend, model: string, markers: GptelChatMarkers): Promise<GptelMessage[]> {
   const messages: GptelMessage[] = []
-  const system = deps.getCustom<string>("gptel-system-message") || "You are a helpful assistant."
+  const system = systemMessage(deps)
   if (system) messages.push({ role: "system", content: system })
   const st = state(editor)
   const contextMode = deps.getCustom<boolean | string>("gptel-use-context") ?? "system"
@@ -1457,8 +1479,8 @@ function requestBody(
   }
 }
 
-function requestHeaders(backend: GptelBackend): Record<string, string> {
-  const key = backendKey(backend)
+function requestHeaders(backend: GptelBackend, deps: Pick<GptelDeps, "getCustom">): Record<string, string> {
+  const key = backendKey(backend, deps)
   const headers: Record<string, string> = { "content-type": "application/json", ...(backend.headers ?? {}) }
   if (backend.kind === "anthropic") {
     if (key) headers["x-api-key"] = key
@@ -1482,7 +1504,7 @@ function requestPayload(backend: GptelBackend, model: string, messages: GptelMes
   const stream = backend.stream !== false && deps.getCustom<boolean>("gptel-stream") !== false && !tools.length
   return {
     url: backendUrl(backend, model),
-    headers: requestHeaders(backend),
+    headers: requestHeaders(backend, deps),
     body: requestBody(backend, model, messages, deps, stream, tools),
     stream,
   }
@@ -1976,7 +1998,7 @@ function applyTransientArgs(editor: Editor, deps: GptelDeps, args: string[]): vo
       if (value) deps.setCustom("gptel-model", value)
     } else if (arg === "--system") {
       const value = args[++i]
-      if (value) deps.setCustom("gptel-system-message", value)
+      if (value) setSystemMessage(deps, value)
     } else if (arg === "--temperature") {
       const value = Number(args[++i])
       if (Number.isFinite(value)) deps.setCustom("gptel-temperature", value)
@@ -2613,6 +2635,16 @@ export function gptelMakeOpenAI(editor: Editor, name: string, options: Partial<G
   }))
 }
 
+export function gptelMakeGPT4All(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
+  return gptelMakeOpenAI(editor, name, {
+    protocol: "http",
+    host: "localhost:4891",
+    endpoint: "/api/v1/completions",
+    stream: false,
+    ...options,
+  })
+}
+
 export function gptelMakeOpenAIResponses(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
   return registerBackend(editor, makeBackend("openai-responses", name, {
     host: "api.openai.com",
@@ -2747,6 +2779,8 @@ export function gptelMakeGithubCopilot(editor: Editor, name: string, options: Pa
   }))
 }
 
+export const gptelMakeGhCopilot = gptelMakeGithubCopilot
+
 export function gptelMakeOpenAIOAuth(editor: Editor, name: string, options: Partial<GptelBackend> = {}): GptelBackend {
   return registerBackend(editor, makeBackend("openai-responses", name, {
     host: "chatgpt.com",
@@ -2762,6 +2796,14 @@ export function gptelMakeOpenAIOAuth(editor: Editor, name: string, options: Part
 export function gptelMakeTool(editor: Editor, tool: GptelTool): GptelTool {
   state(editor).tools.set(tool.name, tool)
   return tool
+}
+
+export function gptelGetBackend(editor: Editor, name: string): GptelBackend | undefined {
+  return state(editor).backends.get(name)
+}
+
+export function gptelGetTool(editor: Editor, name: string): GptelTool | undefined {
+  return state(editor).tools.get(name)
 }
 
 function mcpCategory(serverName: string): string {
@@ -2897,7 +2939,7 @@ async function applyPreset(editor: Editor, deps: GptelDeps, name: string): Promi
   }
   if (preset.backend) deps.setCustom("gptel-backend", preset.backend)
   if (preset.model) deps.setCustom("gptel-model", preset.model)
-  if (preset.system) deps.setCustom("gptel-system-message", preset.system)
+  if (preset.system) setSystemMessage(deps, preset.system)
   if (typeof preset.temperature === "number") deps.setCustom("gptel-temperature", preset.temperature)
   if (preset.schema != null) deps.setCustom("gptel-schema", typeof preset.schema === "string" ? preset.schema : JSON.stringify(preset.schema))
   if (preset.tools) deps.setCustom("gptel-tools", preset.tools.join(","))
@@ -2912,12 +2954,18 @@ export async function install(editor: Editor): Promise<void> {
 
   deps.defcustom("gptel-backend", "string", "Claude", "Active gptel backend.", "gptel")
   deps.defcustom("gptel-model", "string", "claude-sonnet-4-5-20250929", "Active gptel model.", "gptel")
-  deps.defcustom("gptel-system-message", "string", "You are a helpful assistant.", "System message used for gptel requests.", "gptel")
+  deps.defcustom("gptel-api-key", "string", "", "Default API key used by gptel backends without an explicit key.", "gptel")
+  deps.defcustom("gptel-proxy", "string", "", "HTTP proxy for upstream gptel compatibility; fetch-based Jemacs requests do not use it directly.", "gptel")
+  deps.defcustom("gptel-use-curl", "boolean", false, "Curl transport toggle for upstream gptel compatibility; Jemacs uses fetch.", "gptel")
+  deps.defcustom("gptel-system-message", "string", DEFAULT_SYSTEM_MESSAGE, "System message used for gptel requests.", "gptel")
+  deps.defcustom("gptel-system-prompt", "string", DEFAULT_SYSTEM_MESSAGE, "Upstream-compatible alias for gptel-system-message.", "gptel")
   deps.defcustom("gptel-directives", "string", "", "JSON object of named gptel system directives.", "gptel")
   deps.defcustom("gptel-temperature", "number", 0.7, "Sampling temperature for gptel requests.", "gptel")
   deps.defcustom("gptel-max-tokens", "number", 4096, "Maximum output tokens for gptel requests.", "gptel")
   deps.defcustom("gptel-stream", "boolean", true, "Stream gptel responses into the current buffer.", "gptel")
   deps.defcustom("gptel-log-level", "string", "", "Logging level for gptel requests: off, info, or debug.", "gptel")
+  deps.defcustom("gptel-track-response", "boolean", true, "Track response metadata for upstream gptel compatibility.", "gptel")
+  deps.defcustom("gptel-track-media", "boolean", false, "Track media context for upstream gptel compatibility.", "gptel")
   deps.defcustom("gptel-cache", "string", "", "Prompt caching controls: true/t for all, or space/comma separated system, tool, message.", "gptel")
   deps.defcustom("gptel-use-tools", "boolean", true, "Whether selected gptel tools are made available to models.", "gptel")
   deps.defcustom("gptel-tools", "string", "", "Comma or space separated gptel tool names to include with requests.", "gptel")
@@ -2944,6 +2992,21 @@ export async function install(editor: Editor): Promise<void> {
     const name = args.join(" ") || GPTEL_BUFFER_PREFIX
     ensureChatBuffer(editor, name, chatMarkers(deps))
   }, "Start or switch to a gptel chat buffer.")
+
+  editor.command("gptel-add-and-open-buffer", async ({ editor, buffer }) => {
+    state(editor).context.length = 0
+    const source = buffer
+    const region = activeRegionText(source)
+    if (region) {
+      const [start, end] = regionBounds(source)!
+      state(editor).context.push({ type: "region", name: editor.bufferDisplayName(source), bufferId: source.id, start, end, text: region })
+    } else {
+      state(editor).context.push({ type: "buffer", name: editor.bufferDisplayName(source), bufferId: source.id, text: source.text })
+    }
+    const chat = ensureChatBuffer(editor, `${GPTEL_BUFFER_PREFIX}<${Date.now()}>`, chatMarkers(deps))
+    editor.displayBufferInOtherWindow(chat.id, { select: true })
+    editor.message("gptel: added current buffer context")
+  }, "Add current buffer or region to gptel context and open a chat buffer in another window.")
 
   editor.command("gptel-send", async ({ editor, buffer, args }) => {
     if (buffer.mode !== GPTEL_CHAT_MODE && !buffer.minorModes.has(GPTEL_MODE)) editor.enableMinorMode(GPTEL_MODE, { buffer })
@@ -3170,8 +3233,8 @@ export async function install(editor: Editor): Promise<void> {
     const promptFromArgs = transientValue(args, "--system")
     const prompt = directive
       ? directives[directive]
-      : promptFromArgs ?? await editor.prompt("System prompt: ", deps.getCustom<string>("gptel-system-message") ?? "", "gptel-system")
-    if (prompt != null) deps.setCustom("gptel-system-message", prompt)
+      : promptFromArgs ?? await editor.prompt("System prompt: ", systemMessage(deps), "gptel-system")
+    if (prompt != null) setSystemMessage(deps, prompt)
     editor.message("gptel: system prompt set")
   }, "Set the gptel system prompt.")
 
@@ -3240,6 +3303,10 @@ export async function install(editor: Editor): Promise<void> {
     editor.message("gptel.ts 0.9.9.5-compatible")
   }, "Show the gptel.ts compatibility version.")
 
+  editor.command("gptel-markdown-cycle-block", ({ editor }) => {
+    editor.message("gptel: markdown block cycling is not needed in Jemacs yet")
+  }, "Upstream-compatible placeholder for cycling Markdown block visibility.")
+
   editor.command("gptel-inspect", ({ editor }) => {
     editor.scratch("*gptel*", describeState(editor, deps), "text")
   }, "Inspect gptel state.")
@@ -3275,4 +3342,5 @@ export async function install(editor: Editor): Promise<void> {
 
   editor.defineKey("global", "s-m", "gptel-menu")
   editor.defineKey("global", "s-g", "gptel")
+  editor.defineKey("global", "s-l", "gptel-add-and-open-buffer")
 }

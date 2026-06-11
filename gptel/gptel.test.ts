@@ -18,6 +18,8 @@ import {
   gptelMakeBedrock,
   gptelMakeDeepSeek,
   gptelMakeGemini,
+  gptelMakeGhCopilot,
+  gptelMakeGPT4All,
   gptelMakeKagi,
   gptelMakeGithubCopilot,
   gptelMakeDirective,
@@ -29,6 +31,8 @@ import {
   gptelMakePrivateGPT,
   gptelMakeTool,
   gptelMakeXAI,
+  gptelGetBackend,
+  gptelGetTool,
   gptelMcpRegisterServer,
   gptelToolCallSummary,
   mediaPartsFromContext,
@@ -152,6 +156,24 @@ test("backend factories cover upstream provider families", () => {
   expect(state.backends.get("ChatGPT OAuth")?.host).toBe("chatgpt.com")
 })
 
+test("upstream factory aliases and lookup helpers are available", () => {
+  const editor = new Editor()
+  const gpt4all = gptelMakeGPT4All(editor, "GPT4All", { models: ["local"] })
+  const copilot = gptelMakeGhCopilot(editor, "GH", { key: "token" })
+  const tool = gptelMakeTool(editor, {
+    name: "lookup",
+    description: "search docs",
+    function: () => "ok",
+  })
+
+  expect(gpt4all.kind).toBe("openai")
+  expect(gpt4all.protocol).toBe("http")
+  expect(gpt4all.host).toBe("localhost:4891")
+  expect(copilot.host).toBe("api.githubcopilot.com")
+  expect(gptelGetBackend(editor, "GPT4All")).toBe(gpt4all)
+  expect(gptelGetTool(editor, "lookup")).toBe(tool)
+})
+
 test("extractPrompt prefers active region", () => {
   const buffer = new BufferModel({ name: "x", text: "hello world" })
   buffer.point = 11
@@ -193,6 +215,20 @@ test("renderContextBuffer creates navigable sections and deletion markers", () =
   expect(rendered.sections).toHaveLength(2)
   expect(rendered.sections[0]!.start).toBeLessThan(rendered.sections[0]!.end)
   expect(rendered.sections[1]!.start).toBeGreaterThan(rendered.sections[0]!.end)
+})
+
+test("gptel-add-and-open-buffer mirrors Stephen's Emacs helper", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const source = editor.scratch("source.ts", "const answer = 42", "typescript")
+  editor.switchToBuffer(source.id)
+  await editor.run("gptel-add-and-open-buffer")
+
+  const state = editor.locals.get("gptel-state") as { context: Array<{ type: string; text: string }> }
+  expect(state.context).toHaveLength(1)
+  expect(state.context[0]).toMatchObject({ type: "buffer", text: "const answer = 42" })
+  expect(editor.activeBuffer.name).toStartWith("*ChatGPT*<")
+  expect(editor.activeBuffer.mode).toBe("gptel-chat")
 })
 
 test("mimeTypeForPath identifies common gptel media types", () => {
@@ -979,6 +1015,32 @@ test("gptel inspect-query builds request payload without sending it", async () =
     globalThis.fetch = originalFetch
     setCustom("gptel-stream", true)
   }
+})
+
+test("upstream gptel-api-key and gptel-system-prompt aliases affect request payloads", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "CompatBackend", { endpoint: "http://compat.test/v1/chat/completions", models: ["compat-model"], defaultModel: "compat-model", stream: false })
+  setCustom("gptel-backend", "CompatBackend")
+  setCustom("gptel-model", "compat-model")
+  setCustom("gptel-stream", false)
+  setCustom("gptel-api-key", "compat-key")
+  setCustom("gptel-system-message", "You are a helpful assistant.")
+  setCustom("gptel-system-prompt", "Upstream system prompt")
+  const buffer = editor.scratch("*ChatGPT-compat*", "User:\nhello", "gptel-chat")
+  buffer.point = buffer.text.length
+  editor.switchToBuffer(buffer.id)
+
+  await editor.run("gptel-inspect-query")
+
+  const payload = JSON.parse(editor.activeBuffer.text)
+  expect(payload.headers.authorization).toBe("Bearer compat-key")
+  expect(payload.body.messages[0]).toEqual({ role: "system", content: "Upstream system prompt" })
+
+  setCustom("gptel-api-key", "")
+  setCustom("gptel-system-message", "You are a helpful assistant.")
+  setCustom("gptel-system-prompt", "You are a helpful assistant.")
+  setCustom("gptel-stream", true)
 })
 
 test("gptel-cache marks Anthropic system, tool, and message payload sections", async () => {
