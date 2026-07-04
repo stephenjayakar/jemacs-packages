@@ -197,6 +197,25 @@ export async function projectileAddKnownProject(root: string): Promise<void> {
   await saveKnownProjects()
 }
 
+export async function projectileRemoveKnownProject(root: string): Promise<void> {
+  const dir = resolve(root)
+  knownProjects = (await projectileKnownProjects()).filter(p => p !== dir)
+  await saveKnownProjects()
+}
+
+export async function projectileCleanupKnownProjects(): Promise<string[]> {
+  const projects = await projectileKnownProjects()
+  const kept: string[] = []
+  const removed: string[] = []
+  for (const project of projects) {
+    if (await pathExists(project)) kept.push(project)
+    else removed.push(project)
+  }
+  knownProjects = kept
+  await saveKnownProjects()
+  return removed
+}
+
 function projectileDefaultProjectName(root: string): string {
   return basename(resolve(root)) || root
 }
@@ -501,6 +520,26 @@ const PROJECTILE_COMMAND_MAP: Array<[string, string]> = [
   ["c r", "projectile-run-project"],
 ]
 
+export const PROJECTILE_COMMANDER_COMMANDS: Record<string, { command: string; label: string }> = {
+  f: { command: "projectile-find-file", label: "find-file" },
+  b: { command: "projectile-switch-to-buffer", label: "switch-to-buffer" },
+  d: { command: "projectile-find-dir", label: "find-dir" },
+  s: { command: "projectile-grep", label: "grep/search" },
+  r: { command: "projectile-replace", label: "replace" },
+  T: { command: "projectile-test-project", label: "test-project" },
+  c: { command: "projectile-compile-project", label: "compile-project" },
+}
+
+function projectileCommanderHelp(): string {
+  return Object.entries(PROJECTILE_COMMANDER_COMMANDS)
+    .map(([key, { label }]) => `${key}: ${label}`)
+    .join(", ")
+}
+
+function bytesContainNul(bytes: Uint8Array): boolean {
+  return bytes.includes(0)
+}
+
 export async function install(editor: Editor, deps?: ProjectileDeps): Promise<void> {
   defcustom("projectile-enable-caching", "boolean", true,
     "When t enables project files caching for the session.")
@@ -605,9 +644,10 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
   editor.command("projectile-compile-project", async ({ editor, args, prefixArgument }) => {
     const compile = requireCompile(editor)
     if (!compile) return
-    const root = await acquireRoot(editor)
+    const firstArgIsRoot = args[0] != null && await projectileProjectRoot(args[0]) === resolve(args[0])
+    const root = await acquireRoot(editor, firstArgIsRoot ? args[0] : undefined)
     if (!root) return
-    const cmd = args[0]
+    const cmd = (firstArgIsRoot ? args[1] : args[0])
       ?? (prefixArgument != null
         ? await editor.prompt("Compile command: ", compile.lastCompileCommand(editor), "compile-command")
         : compile.lastCompileCommand(editor))
@@ -616,9 +656,10 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
   }, "Compile the current project.")
 
   editor.command("projectile-grep", async ({ editor, args }) => {
-    const root = await acquireRoot(editor)
+    const firstArgIsRoot = args[0] != null && await projectileProjectRoot(args[0]) === resolve(args[0])
+    const root = await acquireRoot(editor, firstArgIsRoot ? args[0] : undefined)
     if (!root) return
-    const pattern = args[0] ?? await editor.prompt(prependProjectName("Grep for: ", root), "", "search")
+    const pattern = (firstArgIsRoot ? args[1] : args[0]) ?? await editor.prompt(prependProjectName("Grep for: ", root), "", "search")
     if (!pattern) return
     await editor.run("counsel-ag", [pattern])
   }, "Grep the project.")
@@ -661,8 +702,25 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
     editor.message(`Added ${resolve(root)} to known projects`)
   }, "Add a directory to known projects.")
 
-  editor.command("projectile-switch-to-buffer", async ({ editor }) => {
-    const root = await acquireRoot(editor)
+  editor.command("projectile-remove-known-project", async ({ editor, args }) => {
+    const projects = await projectileKnownProjects()
+    if (!projects.length) {
+      editor.message("There are no known projects")
+      return
+    }
+    const root = args[0] ?? await projectileCompletingRead(editor, "Remove known project: ", projects, null, "projectile-project")
+    if (!root) return
+    await projectileRemoveKnownProject(root)
+    editor.message(`Removed ${resolve(root)} from known projects`)
+  }, "Remove a project from Projectile's known projects.")
+
+  editor.command("projectile-cleanup-known-projects", async ({ editor }) => {
+    const removed = await projectileCleanupKnownProjects()
+    editor.message(`Removed ${removed.length} missing project${removed.length === 1 ? "" : "s"}`)
+  }, "Remove missing directories from Projectile's known projects.")
+
+  editor.command("projectile-switch-to-buffer", async ({ editor, args }) => {
+    const root = await acquireRoot(editor, args[0])
     if (!root) return
     const names = projectBufferFiles(editor, root).map(b => b.name)
     const choice = await projectileCompletingRead(editor, "Switch to buffer: ", names, root, "projectile-buffer")
@@ -701,8 +759,8 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
     editor.message(`Killed ${buffers.length} project buffers`)
   }, "Kill project file buffers.")
 
-  editor.command("projectile-find-dir", async ({ editor, prefixArgument }) => {
-    const root = await acquireRoot(editor)
+  editor.command("projectile-find-dir", async ({ editor, args, prefixArgument }) => {
+    const root = await acquireRoot(editor, args[0])
     if (!root) return
     maybeInvalidateCache(prefixArgument, root)
     const files = await projectileProjectFiles(root)
@@ -845,10 +903,26 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
     }
   }, "Add the current file to the project cache.")
 
-  editor.command("projectile-replace", async ({ editor }) => {
-    editor.message("projectile-replace: project-wide replacement is not available; running query-replace in current buffer")
-    await editor.run("query-replace")
-  }, "Replace in the current buffer.")
+  editor.command("projectile-replace", async ({ editor, args }) => {
+    const firstArgIsRoot = args[0] != null && await projectileProjectRoot(args[0]) === resolve(args[0])
+    const root = await acquireRoot(editor, firstArgIsRoot ? args[0] : undefined)
+    if (!root) return
+    const from = (firstArgIsRoot ? args[1] : args[0]) ?? await editor.prompt(prependProjectName("Query replace: ", root), "", "query-replace")
+    if (!from) return
+    const to = (firstArgIsRoot ? args[2] : args[1]) ?? await editor.prompt(`Replace ${from} with: `, "", "query-replace")
+    if (to == null) return
+    let visited = 0
+    for (const file of await projectileProjectFiles(root)) {
+      const path = join(root, file)
+      const bytes = await readFile(path).catch(() => null)
+      if (!bytes || bytesContainNul(bytes) || !bytes.toString("utf8").includes(from)) continue
+      const buffer = await editor.openFile(path)
+      buffer.point = 0
+      visited++
+      await editor.run("query-replace", [from, to])
+    }
+    editor.message(`Query replace visited ${visited} file${visited === 1 ? "" : "s"}`)
+  }, "Replace in project files.")
 
   editor.command("projectile-find-references", async ({ editor }) => {
     await editor.run("xref-find-references")
@@ -874,9 +948,10 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
   editor.command("projectile-test-project", async ({ editor, args, prefixArgument }) => {
     const compile = requireCompile(editor)
     if (!compile) return
-    const root = await acquireRoot(editor)
+    const firstArgIsRoot = args[0] != null && await projectileProjectRoot(args[0]) === resolve(args[0])
+    const root = await acquireRoot(editor, firstArgIsRoot ? args[0] : undefined)
     if (!root) return
-    const cmd = args[0] ?? (prefixArgument != null ? await editor.prompt("Test command: ", "bun test", "compile-command") : "bun test")
+    const cmd = (firstArgIsRoot ? args[1] : args[0]) ?? (prefixArgument != null ? await editor.prompt("Test command: ", "bun test", "compile-command") : "bun test")
     await compile.compilationStart(editor, cmd, root)
   }, "Run the project test command.")
 
@@ -890,10 +965,24 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
     await compile.compilationStart(editor, cmd, root)
   }, "Run the project.")
 
-  editor.command("projectile-commander", async ({ editor }) => {
-    editor.message("projectile-commander: command menu is not implemented; using execute-extended-command")
-    await editor.run("execute-extended-command")
-  }, "Projectile commander (M-x fallback).")
+  editor.command("projectile-commander", async ({ editor, args }) => {
+    const first = args[0]
+    const firstIsKey = first != null && (first === "?" || Object.prototype.hasOwnProperty.call(PROJECTILE_COMMANDER_COMMANDS, first))
+    const root = firstIsKey ? undefined : first
+    const input = firstIsKey ? first : (args[1] ?? await editor.prompt("Projectile command (? for help): ", "", "projectile-commander"))
+    const key = input?.slice(0, 1)
+    if (!key) return
+    if (key === "?") {
+      editor.message(projectileCommanderHelp())
+      return
+    }
+    const command = PROJECTILE_COMMANDER_COMMANDS[key]?.command
+    if (!command) {
+      editor.message(`Unknown Projectile command ${key}; ?: help`)
+      return
+    }
+    await editor.run(command, root ? [root] : [])
+  }, "Read one key and run a Projectile command.")
 
   const prefix = keymapPrefix()
   for (const [suffix, command] of PROJECTILE_COMMAND_MAP) {
