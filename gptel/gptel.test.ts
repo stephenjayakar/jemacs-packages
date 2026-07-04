@@ -13,6 +13,8 @@ import {
   gptelAddPromptTransform,
   gptelAddPreToolCallFunction,
   gptelAddResponseFilter,
+  gptelAddRewriteDirectivesHook,
+  gptelHighlightSpans,
   gptelMakeAnthropic,
   gptelMakeAzure,
   gptelMakeBedrock,
@@ -35,6 +37,8 @@ import {
   gptelMakeXAI,
   gptelGetBackend,
   gptelGetTool,
+  gptelContextString,
+  gptelContextWrapDefault,
   gptelMcpRegisterServer,
   gptelToolCallSummary,
   mediaPartsFromContext,
@@ -50,7 +54,7 @@ import {
   type GptelBackend,
   type GptelMessage,
 } from "./gptel"
-import { addHook, BufferModel, Editor, getCustom, removeHook, setCustom } from "@jemacs/core"
+import { addHook, BufferModel, currentKill, Editor, getCustom, killNew, removeHook, setCustom } from "@jemacs/core"
 
 test("default backends include Stephen's configured Claude backend", () => {
   const claude = defaultBackends().find(backend => backend.name === "Claude")
@@ -203,8 +207,16 @@ test("renderContext includes buffers and files", () => {
     { type: "buffer", name: "a.ts", bufferId: "1", text: "const a = 1" },
     { type: "file", path: "/tmp/b.ts", text: "const b = 2" },
   ])
-  expect(text).toContain("Buffer: a.ts")
-  expect(text).toContain("File: /tmp/b.ts")
+  expect(text).toContain("Request context:")
+  expect(text).toContain("In buffer `a.ts`")
+  expect(text).toContain("In file `/tmp/b.ts`")
+})
+
+test("Batch 8: default context string and wrap mirror upstream wording", () => {
+  const context = gptelContextString([{ type: "text", name: "*current-kill*", text: "copied text" }])
+  expect(context).toStartWith("Request context:")
+  expect(context).toContain("```")
+  expect(gptelContextWrapDefault(context, "answer me", "user")).toContain("In addition to the request context above")
 })
 
 test("renderContextBuffer creates navigable sections and deletion markers", () => {
@@ -232,6 +244,142 @@ test("gptel-add-and-open-buffer mirrors Stephen's Emacs helper", async () => {
   expect(editor.activeBuffer.name).toStartWith("*ChatGPT*<")
   expect(editor.activeBuffer.mode).toBe("gptel-chat")
   expect(editor.activeBuffer.minorModes.has("gptel-mode")).toBe(true)
+})
+
+test("Batch 8: gptel-add prefix semantics add whole buffer and remove context at point", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const source = editor.scratch("prefix.ts", "alpha\nbeta\ngamma", "typescript")
+  source.mark = 0
+  source.point = 5
+  source.markActive = true
+  editor.switchToBuffer(source.id)
+  editor.prefixArg.universalArgument()
+  await editor.run("gptel-add")
+
+  let st = editor.locals.get("gptel-state") as { context: Array<{ type: string; text: string; start?: number; end?: number }> }
+  expect(st.context).toHaveLength(1)
+  expect(st.context[0]).toMatchObject({ type: "buffer", text: "alpha\nbeta\ngamma" })
+
+  st.context.length = 0
+  source.mark = 0
+  source.point = 5
+  source.markActive = true
+  await editor.run("gptel-add")
+  source.markActive = false
+  source.point = 2
+  editor.prefixArg.toggleNegative()
+  await editor.run("gptel-add")
+  expect(st.context).toHaveLength(0)
+})
+
+test("Batch 8: gptel-add-kill adds and accumulates current kill context", async () => {
+  const editor = new Editor()
+  await install(editor)
+  killNew(editor, "first")
+  await editor.run("gptel-add-kill")
+  killNew(editor, "second")
+  editor.prefixArg.universalArgument()
+  await editor.run("gptel-add-kill")
+  const st = editor.locals.get("gptel-state") as { context: Array<{ type: string; name?: string; text: string }> }
+  expect(st.context.find(item => item.name === "*current-kill*")?.text).toBe("first\n----\nsecond")
+  expect(currentKill(editor)).toBe("second")
+})
+
+test("Batch 8: region context re-reads live buffer text and line numbers", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const source = editor.scratch("live.ts", "one\ntwo\nthree", "typescript")
+  source.mark = 4
+  source.point = 7
+  source.markActive = true
+  editor.switchToBuffer(source.id)
+  await editor.run("gptel-add")
+  source.point = 4
+  source.insert("changed-")
+  const st = editor.locals.get("gptel-state") as { context: any[] }
+  const rendered = gptelContextString(st.context, editor)
+  expect(rendered).toContain("changed-two")
+  expect(rendered).toContain("(lines 2-2)")
+})
+
+test("Batch 8: request context includes buffer-local context sources", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "LocalContextBackend", { endpoint: "http://context-local.test/v1/chat/completions", models: ["m"], defaultModel: "m", stream: false })
+  setCustom("gptel-backend", "LocalContextBackend")
+  setCustom("gptel-model", "m")
+  setCustom("gptel-stream", false)
+  setCustom("gptel-use-context", "system")
+  const source = editor.scratch("local.txt", "local context", "text")
+  editor.switchToBuffer(source.id)
+  await editor.run("gptel-add")
+  const chat = editor.scratch("*context-local*", "User:\nhello", "gptel-chat")
+  chat.point = chat.text.length
+  editor.switchToBuffer(chat.id)
+  const bodies: any[] = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body ?? "{}")))
+    return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200, headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  try {
+    await editor.run("gptel-send")
+    expect(JSON.stringify(bodies[0].messages)).toContain("local context")
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-stream", true)
+  }
+})
+
+test("Batch 8: gptel-context-string-function customizes request payload", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "CustomContextBackend", { endpoint: "http://context-custom.test/v1/chat/completions", models: ["m"], defaultModel: "m", stream: false })
+  setCustom("gptel-backend", "CustomContextBackend")
+  setCustom("gptel-model", "m")
+  setCustom("gptel-stream", false)
+  setCustom("gptel-use-context", "user")
+  setCustom("gptel-context-string-function", () => "CUSTOM CONTEXT")
+  const source = editor.scratch("custom.txt", "ignored", "text")
+  editor.switchToBuffer(source.id)
+  await editor.run("gptel-add")
+  const chat = editor.scratch("*context-custom*", "User:\nhello", "gptel-chat")
+  chat.point = chat.text.length
+  editor.switchToBuffer(chat.id)
+  const bodies: any[] = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body ?? "{}")))
+    return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200, headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  try {
+    await editor.run("gptel-send")
+    expect(bodies[0].messages.find((message: any) => message.role === "user")?.content).toContain("CUSTOM CONTEXT")
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-context-string-function", gptelContextString)
+    setCustom("gptel-use-context", "system")
+    setCustom("gptel-stream", true)
+  }
+})
+
+test("Batch 8: gptel-add-file directory skips binary files", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-context-restrict-to-project-files", false)
+  const dir = mkdtempSync(join(tmpdir(), "gptel-context-dir-"))
+  try {
+    writeFileSync(join(dir, "a.txt"), "plain")
+    writeFileSync(join(dir, "image.png"), Buffer.from([0, 1, 2, 3]))
+    await editor.run("gptel-add-file", [dir])
+    const st = editor.locals.get("gptel-state") as { context: Array<{ type: string; files?: Array<{ path: string }> }> }
+    const entry = st.context.find(item => item.type === "directory")
+    expect(entry?.files?.map(file => file.path)).toEqual([join(dir, "a.txt")])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    setCustom("gptel-context-restrict-to-project-files", true)
+  }
 })
 
 test("mimeTypeForPath identifies common gptel media types", () => {
@@ -440,6 +588,72 @@ test("gptel prompt transforms, response filters, and post-response functions run
   expect(seen).toHaveLength(2)
 })
 
+test("Batch 7: gptel status follows request FSM transitions and shows usage", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "UsageBackend", { endpoint: "http://usage.test/v1/chat/completions", models: ["m"], defaultModel: "m", stream: false })
+  setCustom("gptel-backend", "UsageBackend")
+  setCustom("gptel-model", "m")
+  setCustom("gptel-stream", false)
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    choices: [{ message: { content: "done" } }],
+    usage: { prompt_tokens: 7, completion_tokens: 3 },
+  }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch
+  try {
+    const buffer = editor.scratch("*ChatGPT-status*", "User:\nhello", "gptel-chat")
+    editor.enableMinorMode("gptel-mode", { buffer })
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    await editor.run("gptel-send")
+
+    expect(buffer.locals.get("gptel-status")).toBe("Ready")
+    const misc = getCustom<Array<(buffer: BufferModel) => string>>("mode-line-misc-info") ?? []
+    expect(misc.map(fn => fn(buffer)).join("")).toContain("Ready UsageBackend/m [7 up 3 down]")
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-stream", true)
+  }
+})
+
+test("Batch 7: gptel-highlight-mode highlights response ranges with response face", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const buffer = editor.scratch("*ChatGPT-highlight*", "User:\none\n\nAssistant:\ntwo\n\nUser:\nthree", "gptel-chat")
+  editor.enableMinorMode("gptel-highlight-mode", { buffer })
+  const ranges = responseRanges(buffer)
+  const spans = gptelHighlightSpans({
+    getCustom,
+  } as any, buffer)
+
+  expect(spans).toEqual(ranges.map(range => ({ ...range, face: "gptel-response-highlight" as any })))
+})
+
+test("Batch 7: crowdsourced prompts load from CSV cache into system prompt menu", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const dir = mkdtempSync(join(tmpdir(), "gptel-prompts-"))
+  const file = join(dir, "prompts.csv")
+  writeFileSync(file, "act,prompt\n\"Socratic tutor\",\"Ask questions before explaining.\"\nReviewer,\"Review carefully, then summarize.\"\n")
+  const savedMessage = getCustom("gptel-system-message")
+  const savedPrompt = getCustom("gptel-system-prompt")
+  const savedFile = getCustom("gptel-crowdsourced-prompts-file")
+  try {
+    setCustom("gptel-crowdsourced-prompts-file", file)
+    await editor.run("gptel-system-prompt")
+
+    const labels = editor.transient?.definition.groups.flatMap(group => group.suffixes?.map(suffix => suffix.label) ?? []) ?? []
+    expect(labels).toContain("Socratic tutor")
+    await editor.run("gptel-system-prompt-set", ["Socratic tutor"])
+    expect(getCustom<string>("gptel-system-message")).toBe("Ask questions before explaining.")
+  } finally {
+    setCustom("gptel-system-message", savedMessage)
+    setCustom("gptel-system-prompt", savedPrompt)
+    setCustom("gptel-crowdsourced-prompts-file", savedFile)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test("Batch 4: post-response functions run on failed requests with an empty failure region", async () => {
   const editor = new Editor()
   await install(editor)
@@ -550,7 +764,7 @@ test("Batch 1: null generation defaults, flexible option functions, and message 
     headers.push(init?.headers)
     bodies.push(JSON.parse(String(init?.body ?? "{}")))
     return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200, headers: { "content-type": "application/json" } })
-  }) as typeof fetch
+  }) as unknown as typeof fetch
   try {
     const buffer = editor.scratch("*BatchPayload*", [
       "User:",
@@ -857,12 +1071,14 @@ test("gptel rewrite accept and reject manage pending rewrite state", async () =>
   editor.switchToBuffer(buffer.id)
   await editor.run("gptel-rewrite", ["shorten"])
 
-  expect(buffer.text).not.toBe("alpha beta gamma")
-  const state = editor.locals.get("gptel-state") as { lastRewrite?: { original: string } }
+  expect(buffer.text).toBe("alpha beta gamma")
+  const state = editor.locals.get("gptel-state") as { lastRewrite?: { original: string }, rewriteOverlays: Array<{ original: string }> }
   expect(state.lastRewrite?.original).toBe("beta")
+  expect(state.rewriteOverlays).toHaveLength(1)
   await editor.run("gptel-rewrite-reject")
   expect(buffer.text).toBe("alpha beta gamma")
   expect(state.lastRewrite).toBeUndefined()
+  expect(state.rewriteOverlays).toHaveLength(0)
 
   buffer.mark = 6
   buffer.point = 10
@@ -870,7 +1086,155 @@ test("gptel rewrite accept and reject manage pending rewrite state", async () =>
   await editor.run("gptel-rewrite", ["shorten"])
   expect(state.lastRewrite?.original).toBe("beta")
   await editor.run("gptel-rewrite-accept")
+  expect(buffer.text).not.toBe("alpha beta gamma")
   expect(state.lastRewrite).toBeUndefined()
+  expect(state.rewriteOverlays).toHaveLength(0)
+})
+
+test("Batch 5: gptel rewrite supports multiple pending rewrites in one buffer", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  const buffer = editor.scratch("multi-rewrite.txt", "one two three four", "text")
+  editor.switchToBuffer(buffer.id)
+
+  buffer.mark = 4
+  buffer.point = 7
+  buffer.markActive = true
+  await editor.run("gptel-rewrite", ["first"])
+  buffer.mark = 14
+  buffer.point = 18
+  buffer.markActive = true
+  await editor.run("gptel-rewrite", ["second"])
+
+  const state = editor.locals.get("gptel-state") as { rewriteOverlays: Array<{ original: string }> }
+  expect(buffer.text).toBe("one two three four")
+  expect(state.rewriteOverlays.map(rewrite => rewrite.original)).toEqual(["two", "four"])
+
+  buffer.point = 5
+  await editor.run("gptel-rewrite-accept")
+  expect(buffer.text).toContain("one Mock response")
+  expect(state.rewriteOverlays.map(rewrite => rewrite.original)).toEqual(["four"])
+
+  buffer.point = buffer.text.length
+  await editor.run("gptel-rewrite-accept")
+  expect(buffer.text).toContain("second")
+  expect(state.rewriteOverlays).toHaveLength(0)
+})
+
+test("Batch 5: gptel rewrite diff and merge act on pending rewrite at point", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  const buffer = editor.scratch("rewrite-diff.txt", "alpha beta gamma", "text")
+  buffer.mark = 6
+  buffer.point = 10
+  buffer.markActive = true
+  editor.switchToBuffer(buffer.id)
+  await editor.run("gptel-rewrite", ["shorten"])
+
+  buffer.point = 7
+  await editor.run("gptel-rewrite-diff")
+  expect(editor.currentBuffer.name).toBe("*gptel-rewrite-diff*")
+  // Bare test Editors lack the kernel's diff-mode registration and fall back to text.
+  expect(["diff-mode", "text"]).toContain(editor.currentBuffer.mode)
+  expect(editor.currentBuffer.text).toContain("--- rewrite-diff.txt")
+  expect(editor.currentBuffer.text).toContain("-beta")
+  expect(editor.currentBuffer.text).toContain("+Mock response")
+
+  editor.switchToBuffer(buffer.id)
+  buffer.point = 7
+  await editor.run("gptel-rewrite-merge")
+  expect(buffer.text).toContain("<<<<<<< original")
+  expect(buffer.text).toContain("=======")
+  expect(buffer.text).toContain(">>>>>>> replacement")
+})
+
+test("Batch 5: gptel rewrite default action can accept on arrival", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  setCustom("gptel-rewrite-default-action", "accept")
+  const buffer = editor.scratch("rewrite-default.txt", "alpha beta gamma", "text")
+  buffer.mark = 6
+  buffer.point = 10
+  buffer.markActive = true
+  editor.switchToBuffer(buffer.id)
+  await editor.run("gptel-rewrite", ["shorten"])
+
+  const state = editor.locals.get("gptel-state") as { rewriteOverlays: unknown[] }
+  expect(buffer.text).toContain("Mock response")
+  expect(state.rewriteOverlays).toHaveLength(0)
+  setCustom("gptel-rewrite-default-action", null)
+})
+
+test("Batch 5: gptel rewrite dry-run shows directive and context payload", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  setCustom("gptel-use-context", "system")
+  gptelAddRewriteDirectivesHook(editor, () => "Custom rewrite directive.")
+  const source = editor.scratch("context.txt", "side note", "text")
+  editor.switchToBuffer(source.id)
+  await editor.run("gptel-add")
+  const buffer = editor.scratch("rewrite.ts", "const value = 1", "typescript")
+  buffer.mark = 0
+  buffer.point = buffer.text.length
+  buffer.markActive = true
+  editor.switchToBuffer(buffer.id)
+
+  await editor.run("gptel-rewrite", ["--dry-run", "make const uppercase"])
+  expect(editor.currentBuffer.name).toBe("*gptel-query*")
+  expect(editor.currentBuffer.text).toContain("Custom rewrite directive.")
+  expect(editor.currentBuffer.text).toContain("side note")
+  expect(editor.currentBuffer.text).toContain("make const uppercase")
+  expect(buffer.text).toBe("const value = 1")
+})
+
+test("Batch 5: gptel rewrite default directive derives buffer language", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  setCustom("gptel-rewrite-directive", "")
+  const buffer = editor.scratch("rewrite-language.ts", "const value = 1", "typescript")
+  buffer.mark = 0
+  buffer.point = buffer.text.length
+  buffer.markActive = true
+  editor.switchToBuffer(buffer.id)
+
+  await editor.run("gptel-rewrite", ["--dry-run", "rename value"])
+  expect(editor.currentBuffer.text).toContain("typescript programmer")
+  expect(editor.currentBuffer.text).toContain("Generate ONLY typescript code")
+})
+
+test("Batch 5: gptel rewrite iterate updates pending replacement without touching original", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  const buffer = editor.scratch("rewrite-iterate.txt", "alpha beta gamma", "text")
+  buffer.mark = 6
+  buffer.point = 10
+  buffer.markActive = true
+  editor.switchToBuffer(buffer.id)
+  await editor.run("gptel-rewrite", ["shorten"])
+  const state = editor.locals.get("gptel-state") as { rewriteOverlays: Array<{ replacement: string }> }
+  const first = state.rewriteOverlays[0]!.replacement
+
+  buffer.point = 7
+  await editor.run("gptel-rewrite-iterate", ["make louder"])
+  expect(buffer.text).toBe("alpha beta gamma")
+  expect(state.rewriteOverlays).toHaveLength(1)
+  expect(state.rewriteOverlays[0]!.replacement).not.toBe(first)
+
+  await editor.run("gptel-rewrite-accept")
+  expect(buffer.text).toContain("make louder")
+  expect(state.rewriteOverlays).toHaveLength(0)
 })
 
 test("gptel-send sends tools and inserts included tool results", async () => {
@@ -1208,10 +1572,10 @@ test("gptel-use-context controls request context placement", async () => {
       editor.switchToBuffer(buffer.id)
       await editor.run("gptel-send")
     }
-    expect(bodies[0].messages.find((message: any) => message.role === "system")?.content).toContain("Additional context:")
-    expect(bodies[0].messages.find((message: any) => message.role === "user")?.content).not.toContain("Additional context:")
-    expect(bodies[1].messages.find((message: any) => message.role === "system")?.content).not.toContain("Additional context:")
-    expect(bodies[1].messages.find((message: any) => message.role === "user")?.content).toContain("Additional context:")
+    expect(bodies[0].messages.find((message: any) => message.role === "system")?.content).toContain("Request context:")
+    expect(bodies[0].messages.find((message: any) => message.role === "user")?.content).not.toContain("Request context:")
+    expect(bodies[1].messages.find((message: any) => message.role === "system")?.content).not.toContain("Request context:")
+    expect(bodies[1].messages.find((message: any) => message.role === "user")?.content).toContain("Request context:")
     expect(JSON.stringify(bodies[2].messages)).not.toContain("context text")
   } finally {
     globalThis.fetch = originalFetch
@@ -1477,6 +1841,110 @@ test("gptel inspect-query builds request payload without sending it", async () =
     expect(editor.activeBuffer.name).toBe("*gptel-query*")
     expect(body.model).toBe("inspect-model")
     expect(body.messages.at(-1).content).toBe("hello")
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-stream", true)
+  }
+})
+
+test("Batch 6: edited inspect-query payload continues into the originating chat buffer", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "ContinueBackend", { endpoint: "http://continue.test/v1/chat/completions", models: ["continue-model"], defaultModel: "continue-model", stream: false })
+  setCustom("gptel-backend", "ContinueBackend")
+  setCustom("gptel-model", "continue-model")
+  setCustom("gptel-stream", false)
+  const originalFetch = globalThis.fetch
+  let sentBody: any
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    sentBody = JSON.parse(String(init?.body ?? "{}"))
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: `continued ${sentBody.messages.at(-1).content}` } }],
+    }), { status: 200, headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  try {
+    const chat = editor.scratch("*ChatGPT-continue-query*", "User:\noriginal", "gptel-chat")
+    chat.point = chat.text.length
+    editor.switchToBuffer(chat.id)
+    await editor.run("gptel-inspect-query-json")
+    const edited = JSON.parse(editor.activeBuffer.text)
+    edited.messages[edited.messages.length - 1].content = "edited payload"
+    editor.activeBuffer.setText(JSON.stringify(edited, null, 2))
+
+    await editor.run("gptel-continue-query")
+
+    expect(sentBody.messages.at(-1).content).toBe("edited payload")
+    expect(chat.text).toContain("Assistant:\ncontinued edited payload")
+    expect(chat.text.endsWith("\n\nUser:\n")).toBe(true)
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-stream", true)
+  }
+})
+
+test("Batch 6: gptel-copy-curl includes auth header and shell-escapes JSON body", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "CurlBackend", {
+    endpoint: "http://curl.test/v1/chat/completions",
+    models: ["curl-model"],
+    defaultModel: "curl-model",
+    stream: false,
+    key: "sek'ret",
+    headers: { "x-extra": "has space" },
+  })
+  setCustom("gptel-backend", "CurlBackend")
+  setCustom("gptel-model", "curl-model")
+  setCustom("gptel-stream", false)
+  const buffer = editor.scratch("*ChatGPT-curl*", "User:\nquote ' body", "gptel-chat")
+  buffer.point = buffer.text.length
+  editor.switchToBuffer(buffer.id)
+
+  await editor.run("gptel-inspect-query-json")
+  await editor.run("gptel-copy-curl")
+
+  const curl = currentKill(editor)
+  expect(curl).toContain("'curl' '-X' 'POST' 'http://curl.test/v1/chat/completions'")
+  expect(curl).toContain("'-H' 'authorization: Bearer sek'\\''ret'")
+  expect(curl).toContain("'-H' 'x-extra: has space'")
+  expect(curl).toContain("'--data-raw'")
+  expect(curl).toContain("\\''")
+  setCustom("gptel-stream", true)
+})
+
+test("Batch 6: inspect-fsm shows success and error request transitions", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "FsmBackend", { endpoint: "http://fsm.test/v1/chat/completions", models: ["fsm-model"], defaultModel: "fsm-model", stream: false })
+  setCustom("gptel-backend", "FsmBackend")
+  setCustom("gptel-model", "fsm-model")
+  setCustom("gptel-stream", false)
+  const originalFetch = globalThis.fetch
+  let fail = false
+  globalThis.fetch = (async () => {
+    if (fail) return new Response("broken", { status: 500, statusText: "Broken" })
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200, headers: { "content-type": "application/json" } })
+  }) as unknown as typeof fetch
+  try {
+    const okBuffer = editor.scratch("*ChatGPT-fsm-ok*", "User:\nok", "gptel-chat")
+    okBuffer.point = okBuffer.text.length
+    editor.switchToBuffer(okBuffer.id)
+    await editor.run("gptel-send")
+
+    fail = true
+    const errorBuffer = editor.scratch("*ChatGPT-fsm-error*", "User:\nerror", "gptel-chat")
+    errorBuffer.point = errorBuffer.text.length
+    editor.switchToBuffer(errorBuffer.id)
+    await editor.run("gptel-send")
+
+    await editor.run("gptel-inspect-fsm")
+    expect(editor.activeBuffer.text).toContain("*ChatGPT-fsm-ok*")
+    expect(editor.activeBuffer.text).toContain("INIT@")
+    expect(editor.activeBuffer.text).toContain("WAIT@")
+    expect(editor.activeBuffer.text).toContain("TYPE@")
+    expect(editor.activeBuffer.text).toContain("DONE")
+    expect(editor.activeBuffer.text).toContain("*ChatGPT-fsm-error*")
+    expect(editor.activeBuffer.text).toContain("ERRS")
   } finally {
     globalThis.fetch = originalFetch
     setCustom("gptel-stream", true)

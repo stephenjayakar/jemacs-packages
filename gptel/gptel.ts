@@ -1,9 +1,11 @@
-import { readFileSync, statSync } from "node:fs"
+import { execFileSync } from "node:child_process"
+import { existsSync, readFileSync, statSync } from "node:fs"
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises"
-import { dirname, join, resolve } from "node:path"
+import { dirname, join, relative, resolve } from "node:path"
 import { homedir } from "node:os"
 import type { BufferModel } from "../../jemacs-opentui/src/kernel/buffer"
 import type { Editor, TransientDefinition } from "../../jemacs-opentui/src/kernel/editor"
+import type { TextSpan } from "../../jemacs-opentui/src/kernel/extension-points"
 
 type GptelDeps = {
   Keymap: typeof import("../../jemacs-opentui/src/kernel/keymap").Keymap
@@ -15,6 +17,7 @@ type GptelDeps = {
   getCustomVariable: typeof import("../../jemacs-opentui/src/runtime/custom").getCustomVariable
   defface: typeof import("../../jemacs-opentui/src/runtime/faces").defface
   killNew: typeof import("../../jemacs-opentui/src/runtime/kill-ring").killNew
+  currentKill: typeof import("../../jemacs-opentui/src/runtime/kill-ring").currentKill
 }
 
 export type GptelMessage = {
@@ -56,10 +59,18 @@ export type GptelBackend = {
 
 export type GptelContextItem =
   | { type: "buffer"; name: string; bufferId: string; text: string }
-  | { type: "region"; name: string; bufferId: string; start: number; end: number; text: string }
+  | { type: "region"; name: string; bufferId: string; start: number; end: number; text: string; lineStart?: number; lineEnd?: number }
   | { type: "file"; path: string; text: string; binary?: boolean; mime?: string }
   | { type: "directory"; path: string; files: Array<{ path: string; text: string }> }
   | { type: "text"; name: string; text: string }
+
+export type GptelContextAlistEntry =
+  | { source: "buffer"; bufferId: string; name: string; regions?: Array<{ start: number; end: number; snapshot: string; lineStart?: number; lineEnd?: number }>; full?: boolean }
+  | { source: "file"; path: string; mime?: string }
+  | { source: "text"; name: string; text: string }
+
+export type GptelContextStringFunction = (items: readonly GptelContextItem[], editor?: Editor, buffer?: BufferModel) => string
+export type GptelContextWrapFunction = (context: string, prompt: string, method?: string | boolean) => string
 
 export type GptelTool = {
   name: string
@@ -183,6 +194,7 @@ export type GptelPostToolCallResult = GptelMessage | void | {
 }
 export type GptelPreToolCallFunction = (call: GptelToolCall, tool: GptelTool | undefined, ctx: GptelRequestContext) => GptelPreToolCallResult | Promise<GptelPreToolCallResult>
 export type GptelPostToolCallFunction = (call: GptelToolCall, result: GptelMessage, tool: GptelTool | undefined, ctx: GptelRequestContext) => GptelPostToolCallResult | Promise<GptelPostToolCallResult>
+export type GptelRewriteDirectivesHook = (ctx: { editor: Editor; buffer: BufferModel }) => string | null | undefined
 
 type PendingToolCallState = {
   bufferId: string
@@ -198,6 +210,16 @@ type GptelResponseHistory = {
   variantIndex: number
 }
 
+type GptelPendingRewrite = {
+  id: string
+  bufferId: string
+  start: number
+  end: number
+  original: string
+  replacement: string
+  instruction: string
+}
+
 type GptelState = {
   backends: Map<string, GptelBackend>
   tools: Map<string, GptelTool>
@@ -209,8 +231,13 @@ type GptelState = {
   postResponseFunctions: GptelPostResponseFunction[]
   preToolCallFunctions: GptelPreToolCallFunction[]
   postToolCallFunctions: GptelPostToolCallFunction[]
+  rewriteDirectivesHooks: GptelRewriteDirectivesHook[]
   context: GptelContextItem[]
+  gptelContextAlist: GptelContextAlistEntry[]
   activeRequests: Map<string, AbortController>
+  requestFsms: GptelRequestFsm[]
+  crowdsourcedPrompts: Map<string, string>
+  crowdsourcedPromptsFile?: string
   pendingToolCalls?: PendingToolCallState
   tokenUsage: GptelTokenUsage
   responseHistories: GptelResponseHistory[]
@@ -228,14 +255,39 @@ type GptelState = {
     variants: string[]
     variantIndex: number
   }
-  lastRewrite?: {
-    bufferId: string
-    start: number
-    end: number
-    original: string
-    replacement: string
-    instruction: string
-  }
+  rewriteOverlays: GptelPendingRewrite[]
+  lastRewrite?: GptelPendingRewrite
+}
+
+type GptelRequestFsmState = "INIT" | "WAIT" | "TYPE" | "TOOL" | "DONE" | "ERRS"
+
+type GptelRequestFsmTransition = {
+  state: GptelRequestFsmState
+  at: string
+  note?: string
+}
+
+type GptelRequestFsm = {
+  id: string
+  bufferId: string
+  backend: string
+  model: string
+  state: GptelRequestFsmState
+  active: boolean
+  editor: Editor
+  deps: GptelDeps
+  toolResults?: boolean
+  payload?: GptelRequestPayload
+  history: GptelRequestFsmTransition[]
+}
+
+type GptelInspectQueryMeta = {
+  originBufferId: string
+  insertionPosition: number
+  backend: string
+  model: string
+  payload: GptelRequestPayload
+  format: "json" | "object"
 }
 
 type RequestResult = {
@@ -256,13 +308,22 @@ const STATE_KEY = "gptel-state"
 const GPTEL_MODE = "gptel-mode"
 const GPTEL_CHAT_MODE = "gptel-chat"
 const GPTEL_CONTEXT_MODE = "gptel-context"
+const GPTEL_QUERY_MODE = "gptel-query"
+const GPTEL_QUERY_MINOR_MODE = "gptel-query-mode"
 const GPTEL_BUFFER_PREFIX = "*ChatGPT*"
 const CONTEXT_SECTIONS = "gptel-context-sections"
 const CONTEXT_FLAGGED = "gptel-context-flagged"
+const CONTEXT_LOCAL = "gptel-context"
+const CONTEXT_TRACKERS = "gptel-context-trackers"
+const CONTEXT_TRACKING_PREVIOUS = "gptel-context-on-splice-previous"
 const STATE_BLOCK_START = "<!-- gptel-state:"
 const STATE_BLOCK_END = "-->"
 const STATE_RESTORED = "gptel-state-restored"
+const INSPECT_QUERY_META = "gptel-inspect-query-meta"
+const STATUS_LOCAL = "gptel-status"
+const HIGHLIGHT_COMMENT_LOCAL = "gptel-highlight-comment-shown"
 const DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
+const CROWDSOURCED_PROMPTS_URL = "https://raw.githubusercontent.com/f/prompts.chat/main/prompts.csv"
 type GptelContextSection = {
   index: number
   start: number
@@ -335,6 +396,7 @@ async function loadDeps(): Promise<GptelDeps> {
     getCustomVariable: custom.getCustomVariable,
     defface: faces.defface,
     killNew: killRing.killNew,
+    currentKill: killRing.currentKill,
   }
 }
 
@@ -454,10 +516,15 @@ function state(editor: Editor): GptelState {
     postResponseFunctions: [],
     preToolCallFunctions: [],
     postToolCallFunctions: [],
+    rewriteDirectivesHooks: [],
     context: [],
+    gptelContextAlist: [],
     activeRequests: new Map(),
+    requestFsms: [],
+    crowdsourcedPrompts: new Map(),
     tokenUsage: {},
     responseHistories: [],
+    rewriteOverlays: [],
   }
   editor.locals.set(STATE_KEY, next)
   return next
@@ -563,13 +630,30 @@ function isImageMime(mime: string): boolean {
   return mime.startsWith("image/")
 }
 
+function isLikelyBinaryFile(path: string, size = statSync(path).size): boolean {
+  if (size > 200_000) return true
+  const mime = mimeTypeForPath(path)
+  if (mime && !isTextMime(mime)) return true
+  try {
+    const sample = readFileSync(path).subarray(0, Math.min(size, 4096))
+    if (sample.includes(0)) return true
+    let suspicious = 0
+    for (const byte of sample) {
+      if (byte < 7 || (byte > 13 && byte < 32)) suspicious++
+    }
+    return sample.length > 0 && suspicious / sample.length > 0.3
+  } catch {
+    return true
+  }
+}
+
 function base64File(path: string): string | null {
   try { return readFileSync(path).toString("base64") } catch { return null }
 }
 
 export function mediaPartsFromContext(items: readonly GptelContextItem[]): GptelMediaPart[] {
   const media: GptelMediaPart[] = []
-  for (const item of items) {
+  for (const item of flattenContextItems(items)) {
     if (item.type !== "file" || !item.mime || isTextMime(item.mime)) continue
     const base64 = base64File(item.path)
     if (base64) media.push({ path: item.path, mime: item.mime, base64 })
@@ -586,6 +670,39 @@ function activeRegionText(buffer: BufferModel): string | null {
   const bounds = regionBounds(buffer)
   if (!bounds) return null
   return buffer.text.slice(bounds[0], bounds[1])
+}
+
+function lineNumberAt(buffer: BufferModel, offset: number): number {
+  return buffer.lineAt(Math.max(0, Math.min(offset, buffer.text.length))) + 1
+}
+
+function modeFence(buffer: BufferModel): string {
+  return buffer.mode.replace(/-mode$/, "")
+}
+
+function contextItemText(item: GptelContextItem, editor?: Editor): string {
+  if (item.type === "buffer") return editor?.buffers.get(item.bufferId)?.text ?? item.text
+  if (item.type === "region") {
+    const source = editor?.buffers.get(item.bufferId)
+    if (source) return source.text.slice(item.start, item.end)
+    return item.text
+  }
+  if (item.type === "file") {
+    if (item.binary) return ""
+    try { return readFileSync(item.path, "utf8") } catch { return item.text }
+  }
+  if (item.type === "directory") return item.files.map(file => file.text).join("\n\n")
+  return item.text
+}
+
+function flattenContextItems(items: readonly GptelContextItem[]): GptelContextItem[] {
+  const flat: GptelContextItem[] = []
+  for (const item of items) {
+    if (item.type === "directory") {
+      for (const file of item.files) flat.push({ type: "file", path: file.path, text: file.text })
+    } else flat.push(item)
+  }
+  return flat
 }
 
 function defaultChatMarkers(): GptelChatMarkers {
@@ -672,19 +789,36 @@ export function extractPrompt(buffer: BufferModel, markers: GptelChatMarkers = d
   return { prompt: stripStateBlocks(buffer.text.slice(0, buffer.point)), start: 0, end: buffer.point }
 }
 
-export function renderContext(items: readonly GptelContextItem[]): string {
-  if (items.length === 0) return ""
-  const parts = ["Additional context:"]
-  for (const item of items) {
-    if (item.type === "buffer") parts.push(`\n--- Buffer: ${item.name} ---\n${item.text}`)
-    else if (item.type === "region") parts.push(`\n--- Region: ${item.name}:${item.start}-${item.end} ---\n${item.text}`)
-    else if (item.type === "file") parts.push(`\n--- File: ${item.path} ---\n${item.binary ? "[binary file omitted]" : item.text}`)
-    else if (item.type === "directory") {
-      parts.push(`\n--- Directory: ${item.path} ---`)
-      for (const file of item.files) parts.push(`\n--- File: ${file.path} ---\n${file.text}`)
-    } else parts.push(`\n--- ${item.name} ---\n${item.text}`)
+export function gptelContextString(items: readonly GptelContextItem[], editor?: Editor): string {
+  const parts: string[] = []
+  for (const item of flattenContextItems(items)) {
+    if (item.type === "buffer") {
+      const source = editor?.buffers.get(item.bufferId)
+      parts.push(`In buffer \`${item.name}\`:\n\n\`\`\`${source ? modeFence(source) : ""}\n${contextItemText(item, editor)}\n\`\`\``)
+    } else if (item.type === "region") {
+      const source = editor?.buffers.get(item.bufferId)
+      const lineStart = source ? lineNumberAt(source, item.start) : item.lineStart
+      const lineEnd = source ? lineNumberAt(source, item.end) : item.lineEnd
+      const lineSuffix = lineStart != null && lineEnd != null ? ` (lines ${lineStart}-${lineEnd})` : ""
+      parts.push(`In buffer \`${item.name}\`${lineSuffix}:\n\n\`\`\`${source ? modeFence(source) : ""}\n${contextItemText(item, editor)}\n\`\`\``)
+    } else if (item.type === "file") {
+      if (item.mime && !isTextMime(item.mime)) continue
+      parts.push(`In file \`${item.path}\`:\n\n\`\`\`\n${contextItemText(item, editor)}\n\`\`\``)
+    } else if (item.type === "text") {
+      parts.push(`In ${item.name}:\n\n\`\`\`\n${item.text}\n\`\`\``)
+    }
   }
-  return parts.join("\n")
+  return parts.length ? `Request context:\n\n${parts.join("\n\n")}` : ""
+}
+
+export function gptelContextWrapDefault(context: string, prompt: string, method: string | boolean = "user"): string {
+  if (!context.trim()) return prompt
+  if (method === "system") return `${context}\n\n${prompt}`
+  return `${context}\n\nIn addition to the request context above, respond to the following user request:\n\n${prompt}`
+}
+
+export function renderContext(items: readonly GptelContextItem[]): string {
+  return gptelContextString(items)
 }
 
 function contextItemTitle(item: GptelContextItem, index: number): string {
@@ -704,6 +838,136 @@ function contextItemPreview(item: GptelContextItem): string {
   const lines = text.split("\n").slice(0, 12)
   const preview = lines.join("\n")
   return text.split("\n").length > lines.length ? `${preview}\n...` : preview
+}
+
+function bufferLocalContext(buffer: BufferModel): GptelContextItem[] {
+  const existing = buffer.locals.get(CONTEXT_LOCAL) as GptelContextItem[] | undefined
+  if (existing) return existing
+  const next: GptelContextItem[] = []
+  buffer.locals.set(CONTEXT_LOCAL, next)
+  return next
+}
+
+function adjustTrackedPosition(pos: number, from: number, to: number, insertedLength: number, stickToEnd = false): number {
+  const removedLength = to - from
+  if (pos < from || (pos === from && !stickToEnd)) return pos
+  if (pos > to || (pos === to && stickToEnd)) return pos + insertedLength - removedLength
+  return stickToEnd ? from + insertedLength : from
+}
+
+function ensureContextTracking(buffer: BufferModel): void {
+  if (buffer.locals.has(CONTEXT_TRACKERS)) return
+  buffer.locals.set(CONTEXT_TRACKERS, true)
+  const previous = buffer.onSplice
+  buffer.locals.set(CONTEXT_TRACKING_PREVIOUS, previous)
+  buffer.onSplice = (splice, opts) => {
+    previous?.(splice, opts)
+    const items = bufferLocalContext(buffer)
+    for (const item of items) {
+      if (item.type !== "region") continue
+      item.start = adjustTrackedPosition(item.start, splice.from, splice.to, splice.text.length, false)
+      item.end = adjustTrackedPosition(item.end, splice.from, splice.to, splice.text.length, true)
+      item.lineStart = lineNumberAt(buffer, item.start)
+      item.lineEnd = lineNumberAt(buffer, item.end)
+    }
+  }
+}
+
+function addBufferContextItem(editor: Editor, buffer: BufferModel, full = true): GptelContextItem {
+  const item: GptelContextItem = { type: "buffer", name: editor.bufferDisplayName(buffer), bufferId: buffer.id, text: buffer.text }
+  state(editor).context.push(item)
+  bufferLocalContext(buffer).push(item)
+  state(editor).gptelContextAlist.push({ source: "buffer", bufferId: buffer.id, name: item.name, full: true })
+  return item
+}
+
+function addRegionContextItem(editor: Editor, buffer: BufferModel, start: number, end: number): GptelContextItem {
+  ensureContextTracking(buffer)
+  removeBufferContextInRange(editor, buffer, start, end, false)
+  const item: GptelContextItem = {
+    type: "region",
+    name: editor.bufferDisplayName(buffer),
+    bufferId: buffer.id,
+    start,
+    end,
+    text: buffer.text.slice(start, end),
+    lineStart: lineNumberAt(buffer, start),
+    lineEnd: lineNumberAt(buffer, end),
+  }
+  state(editor).context.push(item)
+  bufferLocalContext(buffer).push(item)
+  state(editor).gptelContextAlist.push({
+    source: "buffer",
+    bufferId: buffer.id,
+    name: item.name,
+    regions: [{ start, end, snapshot: item.text, lineStart: item.lineStart, lineEnd: item.lineEnd }],
+  })
+  return item
+}
+
+function removeBufferContextInRange(editor: Editor, buffer: BufferModel, start = 0, end = buffer.text.length, message = true): number {
+  const overlaps = (item: GptelContextItem) =>
+    ("bufferId" in item) && item.bufferId === buffer.id &&
+    (item.type === "buffer" || (item.type === "region" && item.start < end && item.end > start))
+  const st = state(editor)
+  const before = st.context.length
+  st.context = st.context.filter(item => !overlaps(item))
+  const local = bufferLocalContext(buffer)
+  const kept = local.filter(item => !overlaps(item))
+  local.splice(0, local.length, ...kept)
+  st.gptelContextAlist = st.gptelContextAlist.filter(entry => !(entry.source === "buffer" && entry.bufferId === buffer.id))
+  const removed = before - st.context.length
+  if (message) editor.message(`${removed} context${removed === 1 ? "" : "s"} removed from current buffer.`)
+  return removed
+}
+
+function removeContextItem(editor: Editor, item: GptelContextItem): void {
+  const st = state(editor)
+  st.context = st.context.filter(existing => existing !== item)
+  if ("bufferId" in item) {
+    const buffer = editor.buffers.get(item.bufferId)
+    if (buffer) {
+      const local = bufferLocalContext(buffer)
+      const index = local.indexOf(item)
+      if (index >= 0) local.splice(index, 1)
+    }
+    st.gptelContextAlist = st.gptelContextAlist.filter(entry => !(entry.source === "buffer" && entry.bufferId === item.bufferId))
+  } else if (item.type === "file") {
+    st.gptelContextAlist = st.gptelContextAlist.filter(entry => !(entry.source === "file" && entry.path === item.path))
+  }
+}
+
+function contextItemsForRequest(editor: Editor, _buffer?: BufferModel): GptelContextItem[] {
+  const seen = new Set<GptelContextItem>()
+  const items: GptelContextItem[] = []
+  for (const item of state(editor).context) {
+    if (!seen.has(item)) {
+      seen.add(item)
+      items.push(item)
+    }
+  }
+  for (const buffer of editor.buffers.values()) {
+    for (const item of bufferLocalContext(buffer)) {
+      if (!seen.has(item)) {
+        seen.add(item)
+        items.push(item)
+      }
+    }
+  }
+  return items
+}
+
+function addCurrentKillContext(editor: Editor, deps: GptelDeps, accumulate: boolean): void {
+  const kill = deps.currentKill(editor, 0)
+  if (!kill) {
+    editor.message("gptel: kill ring is empty")
+    return
+  }
+  const existing = state(editor).context.find(item => item.type === "text" && item.name === "*current-kill*") as Extract<GptelContextItem, { type: "text" }> | undefined
+  if (accumulate && existing) existing.text = `${existing.text}\n----\n${kill}`
+  else if (existing) existing.text = kill
+  else state(editor).context.push({ type: "text", name: "*current-kill*", text: kill })
+  editor.message("*current-kill* has been added as context.")
 }
 
 export function renderContextBuffer(items: readonly GptelContextItem[], flagged: ReadonlySet<number> = new Set()): {
@@ -1241,11 +1505,13 @@ async function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferMode
   const messages: GptelMessage[] = []
   const system = systemMessage(deps)
   if (system) messages.push({ role: "system", content: system })
-  const st = state(editor)
   const contextMode = deps.getCustom<boolean | string>("gptel-use-context") ?? "system"
   const useContext = contextMode !== false && contextMode !== "false" && contextMode !== "nil" && contextMode !== "no"
-  const context = useContext ? renderContext(st.context) : ""
-  const media = useContext ? mediaPartsFromContext(st.context) : []
+  const contextItems = useContext ? contextItemsForRequest(editor, buffer) : []
+  const contextStringFunction = deps.getCustom<GptelContextStringFunction>("gptel-context-string-function") ?? gptelContextString
+  const wrapFunction = deps.getCustom<GptelContextWrapFunction>("gptel-context-wrap-function") ?? gptelContextWrapDefault
+  const context = useContext ? contextStringFunction(contextItems, editor, buffer) : ""
+  const media = useContext ? mediaPartsFromContext(contextItems) : []
   if (context && contextMode === "system") {
     const systemIndex = messages.findIndex(message => message.role === "system")
     if (systemIndex >= 0) messages[systemIndex] = { ...messages[systemIndex]!, content: `${messages[systemIndex]!.content}\n\n${context}` }
@@ -1260,7 +1526,7 @@ async function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferMode
       ? { ...message, content: stripReasoningBlocks(message.content) }
       : message
   ))
-  const promptWithContext = context && contextMode !== "system" ? `${context}\n\nUser request:\n${prompt}` : prompt
+  const promptWithContext = context && contextMode !== "system" ? wrapFunction(context, prompt, contextMode) : prompt
   messages.push({ role: "user", content: await applyPromptTransforms(editor, buffer, backend, model, promptWithContext), media })
   return messages
 }
@@ -1270,6 +1536,16 @@ function appendWritable(buffer: BufferModel, text: string): void {
   buffer.readOnly = false
   buffer.point = buffer.text.length
   buffer.insert(text)
+  buffer.readOnly = wasReadOnly
+}
+
+function insertWritable(buffer: BufferModel, position: number, text: string): void {
+  const oldPoint = buffer.point
+  const wasReadOnly = buffer.readOnly
+  buffer.readOnly = false
+  buffer.point = Math.max(0, Math.min(position, buffer.text.length))
+  buffer.insert(text)
+  buffer.point = oldPoint <= position ? oldPoint : oldPoint + text.length
   buffer.readOnly = wasReadOnly
 }
 
@@ -1782,6 +2058,154 @@ function requestPayload(backend: GptelBackend, model: string, messages: GptelMes
   }
 }
 
+function gptelFsmStart(editor: Editor, deps: GptelDeps, buffer: BufferModel, backend: GptelBackend, model: string, payload?: GptelRequestPayload): GptelRequestFsm {
+  const fsm: GptelRequestFsm = {
+    id: `gptel-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    bufferId: buffer.id,
+    backend: backend.name,
+    model,
+    state: "INIT",
+    active: true,
+    editor,
+    deps,
+    payload,
+    history: [{ state: "INIT", at: new Date().toISOString() }],
+  }
+  const fsms = state(editor).requestFsms
+  fsms.push(fsm)
+  if (fsms.length > 50) fsms.splice(0, fsms.length - 50)
+  gptelUpdateStatus(editor, deps, buffer, "Ready")
+  return fsm
+}
+
+function gptelFsmTransition(fsm: GptelRequestFsm | undefined, next: GptelRequestFsmState, note?: string): void {
+  if (!fsm) return
+  if (fsm.state === next && next !== "TOOL") return
+  fsm.state = next
+  fsm.active = next !== "DONE" && next !== "ERRS"
+  fsm.history.push({ state: next, at: new Date().toISOString(), note })
+  const buffer = fsm.editor.buffers.get(fsm.bufferId)
+  if (!buffer) return
+  const status = next === "WAIT"
+    ? "Waiting..."
+    : next === "TYPE"
+      ? "Typing..."
+      : next === "TOOL"
+        ? "Waiting..."
+        : next === "DONE"
+          ? fsm.toolResults ? "Ready with tool results" : "Ready"
+          : `Error: ${note ?? "request failed"}`
+  gptelUpdateStatus(fsm.editor, fsm.deps, buffer, status, { message: next !== "TYPE" })
+}
+
+function gptelFsmInspectText(editor: Editor): string {
+  const fsms = [...state(editor).requestFsms].reverse()
+  if (!fsms.length) return "No gptel request log yet.\n"
+  const lines = [
+    "Buffer\tBackend/Model\tState\tHistory",
+    ...fsms.map(fsm => {
+      const buffer = editor.buffers.get(fsm.bufferId)
+      const history = fsm.history
+        .map(item => `${item.state}@${item.at}${item.note ? `(${item.note})` : ""}`)
+        .join(" -> ")
+      return [
+        buffer ? editor.bufferDisplayName(buffer) : `<dead ${fsm.bufferId}>`,
+        `${fsm.backend}/${fsm.model}`,
+        fsm.state,
+        history,
+      ].join("\t")
+    }),
+  ]
+  return `${lines.join("\n")}\n`
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+function gptelCurlCommand(payload: GptelRequestPayload): string {
+  const args = [
+    "curl",
+    "-X", "POST",
+    payload.url,
+    ...Object.entries(payload.headers).flatMap(([key, value]) => ["-H", `${key}: ${value}`]),
+    "--data-raw", JSON.stringify(payload.body),
+  ]
+  return args.map(shellSingleQuote).join(" ")
+}
+
+function parseInspectQueryPayload(buffer: BufferModel): GptelRequestPayload | null {
+  const meta = buffer.locals.get(INSPECT_QUERY_META) as GptelInspectQueryMeta | undefined
+  if (!meta) return null
+  const parsed = JSON.parse(buffer.text)
+  if (meta.format === "json") return { ...meta.payload, body: parsed }
+  const payload = parsed as Partial<GptelRequestPayload>
+  return {
+    url: typeof payload.url === "string" ? payload.url : meta.payload.url,
+    headers: isPlainObject(payload.headers) ? Object.fromEntries(Object.entries(payload.headers).map(([k, v]) => [k, String(v)])) : meta.payload.headers,
+    body: hasOwn(payload as Record<string, unknown>, "body") ? payload.body : parsed,
+    stream: typeof payload.stream === "boolean" ? payload.stream : meta.payload.stream,
+  }
+}
+
+function providerMessagesFromBody(backend: GptelBackend, body: unknown): GptelMessage[] {
+  if (!isPlainObject(body)) return []
+  if (backend.kind === "anthropic") {
+    const messages: GptelMessage[] = []
+    const system = typeof body.system === "string" ? body.system : Array.isArray(body.system)
+      ? body.system.map((part: any) => part?.text ?? "").join("")
+      : ""
+    if (system) messages.push({ role: "system", content: system })
+    if (Array.isArray(body.messages)) {
+      messages.push(...body.messages.map((message: any) => ({
+        role: message.role === "assistant" ? "assistant" : message.role === "tool" ? "tool" : "user",
+        content: Array.isArray(message.content)
+          ? message.content.map((part: any) => part?.text ?? "").join("")
+          : String(message.content ?? ""),
+      } satisfies GptelMessage)))
+    }
+    return messages
+  }
+  if (backend.kind === "openai-responses" && Array.isArray(body.input)) {
+    return body.input.map((message: any) => ({
+      role: message.role === "developer" ? "system" : message.role === "assistant" ? "assistant" : message.role === "tool" ? "tool" : "user",
+      content: Array.isArray(message.content)
+        ? message.content.map((part: any) => part?.text ?? part?.content ?? "").join("")
+        : String(message.content ?? ""),
+    } satisfies GptelMessage))
+  }
+  if (Array.isArray(body.messages)) {
+    return body.messages.map((message: any) => ({
+      role: message.role === "system" || message.role === "assistant" || message.role === "tool" ? message.role : "user",
+      content: Array.isArray(message.content)
+        ? message.content.map((part: any) => typeof part === "string" ? part : part?.text ?? "").join("")
+        : String(message.content ?? ""),
+      name: typeof message.name === "string" ? message.name : undefined,
+      toolCallId: typeof message.tool_call_id === "string" ? message.tool_call_id : undefined,
+    } satisfies GptelMessage))
+  }
+  return []
+}
+
+function payloadToolNames(body: unknown): string[] {
+  if (!isPlainObject(body)) return []
+  const names: string[] = []
+  const tools = Array.isArray(body.tools) ? body.tools : Array.isArray((body.toolConfig as any)?.tools) ? (body.toolConfig as any).tools : []
+  for (const tool of tools) {
+    const record = tool as any
+    const name = record?.function?.name ?? record?.name ?? record?.toolSpec?.name
+    if (typeof name === "string") names.push(name)
+  }
+  return [...new Set(names)]
+}
+
+function toolsForPayload(editor: Editor, deps: GptelDeps, payload: GptelRequestPayload): GptelTool[] {
+  const names = payloadToolNames(payload.body)
+  if (!names.length) return selectedTools(editor, deps)
+  const st = state(editor)
+  return names.map(name => st.tools.get(name)).filter((tool): tool is GptelTool => Boolean(tool))
+}
+
 function logLevel(deps: GptelDeps): string | false {
   const value = deps.getCustom<boolean | string>("gptel-log-level")
   if (!value || value === "off" || value === "nil" || value === "false") return false
@@ -1804,11 +2228,15 @@ function logJson(editor: Editor, deps: GptelDeps, type: string, data: unknown, n
   logBuffer(editor, `${existing?.text ? "\n" : ""}{"gptel":"${type}","timestamp":"${new Date().toISOString()}"}\n${body}\n`)
 }
 
-function inspectPayloadBuffer(editor: Editor, payload: GptelRequestPayload, format: "json" | "object" = "object"): BufferModel {
+function inspectPayloadBuffer(editor: Editor, payload: GptelRequestPayload, format: "json" | "object" = "object", meta?: Omit<GptelInspectQueryMeta, "payload" | "format">): BufferModel {
   const body = format === "json"
     ? JSON.stringify(payload.body, null, 2)
     : JSON.stringify(payload, null, 2)
-  const buffer = editor.scratch("*gptel-query*", body, format === "json" ? "json" : "text")
+  const buffer = editor.scratch("*gptel-query*", body, format === "json" ? "json" : GPTEL_QUERY_MODE)
+  editor.enterMode(buffer, format === "json" ? "json" : GPTEL_QUERY_MODE)
+  editor.enableMinorMode(GPTEL_QUERY_MINOR_MODE, { buffer })
+  buffer.readOnly = false
+  if (meta) buffer.locals.set(INSPECT_QUERY_META, { ...meta, payload, format } satisfies GptelInspectQueryMeta)
   buffer.point = 0
   editor.switchToBuffer(buffer.id)
   return buffer
@@ -1921,6 +2349,56 @@ function formatUsage(usage: GptelTokenUsage | undefined): string {
   return parts.join(", ") || "(none)"
 }
 
+function formatHeaderUsage(usage: GptelTokenUsage | undefined): string {
+  if (!usage) return ""
+  const parts: string[] = []
+  if (usage.input != null) parts.push(`${usage.input}${usage.cached ? `, C${usage.cached}` : ""} up`)
+  if (usage.output != null) parts.push(`${usage.output} down`)
+  return parts.length ? ` [${parts.join(" ")}]` : ""
+}
+
+function gptelStatusText(editor: Editor, deps: GptelDeps, buffer: BufferModel): string {
+  const backend = backendByName(editor, deps)
+  const model = currentModel(editor, deps, backend)
+  const status = buffer.locals.get(STATUS_LOCAL) as string | undefined
+  const usage = state(editor).lastRequest?.bufferId === buffer.id ? formatHeaderUsage(state(editor).lastRequest?.usage) : ""
+  return `${status ?? "Ready"} ${backend.name}/${model}${usage}`
+}
+
+export function gptelUpdateStatus(editor: Editor, deps: GptelDeps, buffer: BufferModel, msg: string, options: { message?: boolean } = {}): void {
+  if (!buffer.minorModes.has(GPTEL_MODE)) return
+  buffer.locals.set(STATUS_LOCAL, msg.trim())
+  // Jemacs does not expose an Emacs-style buffer header-line-format yet.  The
+  // installer registers a mode-line-misc-info segment as the closest always
+  // visible buffer-local surface, and transition messages keep echo-area parity.
+  if (options.message) editor.message(`gptel: ${gptelStatusText(editor, deps, buffer)}`)
+  void editor.changed("gptel-status")
+}
+
+function gptelHighlightMethods(deps: GptelDeps): Set<string> {
+  const raw = deps.getCustom<string | string[]>("gptel-highlight-methods")
+  if (Array.isArray(raw)) return new Set(raw)
+  return new Set(String(raw ?? "face").split(/[, ]+/).filter(Boolean))
+}
+
+export function gptelHighlightSpans(deps: GptelDeps, buffer: BufferModel): TextSpan[] {
+  if (!buffer.minorModes.has("gptel-highlight-mode")) return []
+  const methods = gptelHighlightMethods(deps)
+  if (!methods.has("face")) {
+    if (!buffer.locals.get(HIGHLIGHT_COMMENT_LOCAL)) {
+      buffer.locals.set(HIGHLIGHT_COMMENT_LOCAL, true)
+      // Jemacs has no fringe or margin overlay API at present; response
+      // highlighting therefore uses font-lock faces only.
+    }
+    return []
+  }
+  return responseRanges(buffer, chatMarkers(deps, buffer)).map(range => ({
+    start: range.start,
+    end: range.end,
+    face: "gptel-response-highlight" as any,
+  }))
+}
+
 function reasoningFromJson(backend: GptelBackend, json: unknown): string {
   const data = json as Record<string, any>
   if (backend.kind === "anthropic") return data.content?.filter((part: any) => part.type === "thinking").map((part: any) => part.thinking ?? "").join("") ?? ""
@@ -2020,21 +2498,25 @@ async function requestLlm(
   backend: GptelBackend,
   model: string,
   messages: GptelMessage[],
-  options: { onDelta?: (delta: string) => void; onReasoning?: (reasoning: string) => void; signal?: AbortSignal; tools?: GptelTool[] } = {},
+  options: { onDelta?: (delta: string) => void; onReasoning?: (reasoning: string) => void; signal?: AbortSignal; tools?: GptelTool[]; payload?: GptelRequestPayload; fsm?: GptelRequestFsm } = {},
 ): Promise<RequestResult> {
   if (backend.kind === "mock") {
     const response = `Mock response to: ${messages.at(-1)?.content ?? ""}`
+    gptelFsmTransition(options.fsm, "WAIT")
     for (const token of response.match(/.{1,16}/g) ?? []) {
+      gptelFsmTransition(options.fsm, "TYPE")
       options.onDelta?.(token)
       await new Promise(resolve => setTimeout(resolve, 1))
     }
     return { text: response }
   }
 
-  const payload = requestPayload(backend, model, messages, deps, options.tools)
+  const payload = options.payload ?? requestPayload(backend, model, messages, deps, options.tools)
+  if (options.fsm) options.fsm.payload = payload
   const level = logLevel(deps)
   if (level === "debug") logJson(editor, deps, "request headers", payload.headers)
   logJson(editor, deps, "request body", payload.body)
+  gptelFsmTransition(options.fsm, "WAIT")
   const response = await fetch(payload.url, {
     method: "POST",
     headers: payload.headers,
@@ -2048,6 +2530,7 @@ async function requestLlm(
   const includeReasoning = includeReasoningSetting(deps)
   if (!payload.stream || !response.body) {
     const json = await response.json()
+    gptelFsmTransition(options.fsm, "TYPE")
     if (level === "debug") logJson(editor, deps, "response body", json)
     if (reasoningBufferName(includeReasoning)) {
       const reasoning = reasoningFromJson(backend, json)
@@ -2078,6 +2561,7 @@ async function requestLlm(
       const delta = textFromStreamEvent(backend, event, includeReasoning)
       if (!delta) continue
       text += delta
+      gptelFsmTransition(options.fsm, "TYPE")
       options.onDelta?.(delta)
       void editor.changed("gptel-stream")
     }
@@ -2092,6 +2576,7 @@ async function requestLlm(
     }
     const delta = textFromStreamEvent(backend, event, includeReasoning)
     text += delta
+    if (delta) gptelFsmTransition(options.fsm, "TYPE")
     options.onDelta?.(delta)
   }
   return { text, usage }
@@ -2368,9 +2853,9 @@ async function requestWithTools(
   model: string,
   messages: GptelMessage[],
   buffer: BufferModel,
-  options: { onDelta?: (delta: string) => void; onReasoning?: (reasoning: string) => void; onToolResults?: (calls: GptelToolCall[], results: GptelMessage[], tools: ReadonlyMap<string, GptelTool>) => void; signal?: AbortSignal } = {},
+  options: { onDelta?: (delta: string) => void; onReasoning?: (reasoning: string) => void; onToolResults?: (calls: GptelToolCall[], results: GptelMessage[], tools: ReadonlyMap<string, GptelTool>) => void; signal?: AbortSignal; tools?: GptelTool[]; firstPayload?: GptelRequestPayload; fsm?: GptelRequestFsm } = {},
 ): Promise<RequestResult> {
-  const tools = selectedTools(editor, deps)
+  const tools = options.tools ?? selectedTools(editor, deps)
   const maxRounds = Math.max(0, deps.getCustom<number>("gptel-max-tool-rounds") ?? 3)
   let conversation = [...messages]
   let finalText = ""
@@ -2378,6 +2863,8 @@ async function requestWithTools(
     const result = await requestLlm(editor, deps, backend, model, conversation, {
       ...options,
       tools,
+      payload: round === 0 ? options.firstPayload : undefined,
+      fsm: options.fsm,
       onDelta: round === 0 ? options.onDelta : undefined,
       onReasoning: options.onReasoning,
     })
@@ -2388,6 +2875,7 @@ async function requestWithTools(
       ...conversation,
       { role: "assistant", content: result.text, toolCalls: calls },
     ]
+    gptelFsmTransition(options.fsm, "TOOL", calls.map(call => call.name).join(", "))
     const toolExecution = await executeToolCalls(editor, deps, buffer, calls, backend, model)
     if (!toolExecution) return { ...result, text: finalText }
     options.onToolResults?.(toolExecution.calls, toolExecution.results, state(editor).tools)
@@ -2485,6 +2973,7 @@ function positionalArgs(args: string[]): string[] {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!
     if (arg.startsWith("--tool=")) continue
+    if (arg === "--dry-run" || arg === "-n") continue
     if (arg.startsWith("--")) {
       if (args[i + 1] && !args[i + 1]!.startsWith("--")) i++
       continue
@@ -2533,6 +3022,8 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
   const backend = backendByName(editor, deps)
   const model = currentModel(editor, deps, backend)
   const messages = await buildMessages(editor, deps, buffer, prompt, backend, model, markers)
+  const payload = requestPayload(backend, model, messages, deps, selectedTools(editor, deps))
+  const fsm = gptelFsmStart(editor, deps, buffer, backend, model, payload)
   const controller = new AbortController()
   state(editor).activeRequests.set(buffer.id, controller)
 
@@ -2547,8 +3038,10 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
     await editor.runHook("gptel-pre-response-hook", buffer)
     await editor.runHook("gptel-post-request-hook", buffer)
     const result = await requestWithTools(editor, deps, backend, model, messages, buffer, {
+      fsm,
       signal: controller.signal,
       onToolResults(calls, results, tools) {
+        fsm.toolResults = true
         insertIncludedToolResults(deps, buffer, calls, results, tools)
       },
       onReasoning(reasoning) {
@@ -2597,9 +3090,11 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
       variants: history.variants,
       variantIndex: history.variantIndex,
     }
+    gptelFsmTransition(fsm, "DONE")
     editor.message(`gptel: done (${backend.name}/${model})`)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    gptelFsmTransition(fsm, "ERRS", message)
     appendWritable(buffer, `${markers.separator}[gptel error] ${message}${markerText(markers, "user")}`)
     await runPostResponseFunctions(editor, buffer, backend, model, responseStart, responseStart)
     editor.message(`gptel failed: ${message}`)
@@ -2626,7 +3121,7 @@ async function inspectQueryFromBuffer(editor: Editor, deps: GptelDeps, buffer: B
       const model = currentModel(editor, deps, backend)
       const messages = await buildMessages(editor, deps, buffer, token.prompt, backend, model, markers)
       const payload = requestPayload(backend, model, messages, deps, selectedTools(editor, deps))
-      inspectPayloadBuffer(editor, payload, format)
+      inspectPayloadBuffer(editor, payload, format, { originBufferId: buffer.id, insertionPosition: buffer.text.length, backend: backend.name, model })
     })
     editor.message("gptel: query inspected")
     return
@@ -2635,8 +3130,126 @@ async function inspectQueryFromBuffer(editor: Editor, deps: GptelDeps, buffer: B
   const model = currentModel(editor, deps, backend)
   const messages = await buildMessages(editor, deps, buffer, prompt, backend, model, markers)
   const payload = requestPayload(backend, model, messages, deps, selectedTools(editor, deps))
-  inspectPayloadBuffer(editor, payload, format)
+  inspectPayloadBuffer(editor, payload, format, { originBufferId: buffer.id, insertionPosition: buffer.text.length, backend: backend.name, model })
   editor.message("gptel: query inspected")
+}
+
+async function continueQueryFromBuffer(editor: Editor, deps: GptelDeps, inspectBuffer: BufferModel): Promise<void> {
+  const meta = inspectBuffer.locals.get(INSPECT_QUERY_META) as GptelInspectQueryMeta | undefined
+  if (!meta) {
+    editor.message("gptel: this is not a gptel query buffer")
+    return
+  }
+  let payload: GptelRequestPayload
+  try {
+    const parsed = parseInspectQueryPayload(inspectBuffer)
+    if (!parsed) throw new Error("missing query metadata")
+    payload = parsed
+  } catch {
+    editor.message("Can not resume request: could not read data from buffer!")
+    return
+  }
+  const target = editor.buffers.get(meta.originBufferId)
+  if (!target) {
+    editor.message("gptel: original buffer is gone")
+    return
+  }
+  const backend = backendByName(editor, deps, meta.backend)
+  const model = meta.model
+  const markers = chatMarkers(deps, target)
+  const messages = providerMessagesFromBody(backend, payload.body)
+  const controller = new AbortController()
+  const fsm = gptelFsmStart(editor, deps, target, backend, model, payload)
+  state(editor).activeRequests.set(target.id, controller)
+
+  const insertionStart = Math.max(0, Math.min(meta.insertionPosition, target.text.length))
+  const originalPoint = target.point
+  const followOutput = deps.getCustom<boolean>("gptel-auto-scroll") || originalPoint === target.text.length
+  insertWritable(target, insertionStart, markerText(markers, "assistant"))
+  const responseStart = insertionStart + markerText(markers, "assistant").length
+  editor.switchToBuffer(target.id)
+  editor.message(`gptel: ${backend.name}/${model}`)
+  try {
+    await editor.runHook("gptel-pre-response-hook", target)
+    await editor.runHook("gptel-post-request-hook", target)
+    const result = await requestWithTools(editor, deps, backend, model, messages, target, {
+      fsm,
+      signal: controller.signal,
+      firstPayload: payload,
+      tools: toolsForPayload(editor, deps, payload),
+      onToolResults(calls, results, tools) {
+        fsm.toolResults = true
+        insertIncludedToolResults(deps, target, calls, results, tools)
+      },
+      onReasoning(reasoning) {
+        const reasoningTarget = reasoningBufferName(includeReasoningSetting(deps))
+        if (reasoningTarget) appendReasoningToTarget(editor, reasoningTarget, reasoning)
+      },
+      onDelta(delta) {
+        insertWritable(target, target.text.length, delta)
+        if (followOutput) target.point = target.text.length
+        void editor.runHook("gptel-post-stream-hook", target)
+      },
+    })
+    const insertedResponse = target.text.slice(responseStart)
+    if (result.text && !insertedResponse.includes(result.text)) appendWritable(target, result.text)
+    let finalResponse = await applyResponseFilters(editor, target, backend, model, target.text.slice(responseStart))
+    if (shouldConvertResponseToOrg(deps, target)) finalResponse = convertMarkdownToOrg(finalResponse)
+    if (finalResponse !== target.text.slice(responseStart)) replaceWritable(target, responseStart, target.text.length, finalResponse)
+    const responseEnd = target.text.length
+    const responseText = target.text.slice(responseStart, responseEnd)
+    const st = state(editor)
+    st.tokenUsage = addUsage(st.tokenUsage, result.usage)
+    await runPostResponseFunctions(editor, target, backend, model, responseStart, responseEnd)
+    const history = upsertResponseHistory(editor, target, {
+      bufferId: target.id,
+      start: responseStart,
+      end: responseEnd,
+      variants: [responseText],
+      variantIndex: 0,
+    })
+    appendWritable(target, markerText(markers, "user"))
+    target.point = followOutput ? target.text.length : originalPoint
+    st.lastRequest = {
+      bufferId: target.id,
+      prompt: messages.filter(message => message.role === "user").at(-1)?.content ?? "",
+      messages,
+      insertionStart,
+      responseStart,
+      responseEnd,
+      insertionEnd: target.text.length,
+      backend: backend.name,
+      model,
+      usage: result.usage,
+      variants: history.variants,
+      variantIndex: history.variantIndex,
+    }
+    gptelFsmTransition(fsm, "DONE")
+    editor.message(`gptel: done (${backend.name}/${model})`)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    gptelFsmTransition(fsm, "ERRS", message)
+    appendWritable(target, `${markers.separator}[gptel error] ${message}${markerText(markers, "user")}`)
+    await runPostResponseFunctions(editor, target, backend, model, responseStart, responseStart)
+    editor.message(`gptel failed: ${message}`)
+  } finally {
+    state(editor).activeRequests.delete(target.id)
+    void editor.changed("gptel-continue-query")
+  }
+}
+
+function copyCurlFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferModel): void {
+  try {
+    const payload = parseInspectQueryPayload(buffer)
+    if (!payload) {
+      editor.message("gptel: this is not a gptel query buffer")
+      return
+    }
+    deps.killNew(editor, gptelCurlCommand(payload))
+    editor.message("Curl command for request copied to kill-ring")
+  } catch {
+    editor.message("Can not copy request: could not read data from buffer!")
+  }
 }
 
 function historyForVariantCommand(editor: Editor, deps: GptelDeps, buffer: BufferModel): GptelResponseHistory | null {
@@ -2774,65 +3387,330 @@ function markdownCycleBlock(editor: Editor, buffer: BufferModel): void {
 }
 
 async function rewriteRegion(editor: Editor, deps: GptelDeps, buffer: BufferModel, instruction: string): Promise<void> {
-  const bounds = regionBounds(buffer)
-  if (!bounds) {
-    editor.message("gptel-rewrite: mark a region first")
-    return
-  }
-  const original = buffer.text.slice(bounds[0], bounds[1])
-  const backend = backendByName(editor, deps)
-  const model = currentModel(editor, deps, backend)
-  const messages: GptelMessage[] = [
-    { role: "system", content: "Rewrite the provided text according to the instruction. Return only the rewritten text." },
-    { role: "user", content: `Instruction:\n${instruction}\n\nText:\n${original}` },
-  ]
-  editor.message(`gptel-rewrite: ${backend.name}/${model}`)
-  const result = await requestWithTools(editor, deps, backend, model, messages, buffer)
-  const replacement = result.text.trim()
-  replaceWritable(buffer, bounds[0], bounds[1], replacement)
-  state(editor).lastRewrite = {
-    bufferId: buffer.id,
-    start: bounds[0],
-    end: bounds[0] + replacement.length,
-    original,
-    replacement,
-    instruction,
-  }
-  await editor.runHook("gptel-post-rewrite-functions", buffer)
-  editor.message("gptel-rewrite: replaced region; use gptel-rewrite-reject to restore")
-  void editor.changed("gptel-rewrite")
+  await gptelRewriteRequest(editor, deps, buffer, instruction)
 }
 
-function acceptRewrite(editor: Editor): void {
+function gptelRewriteOverlaySpans(editor: Editor, buffer: BufferModel): TextSpan[] {
   const st = state(editor)
-  if (!st.lastRewrite) {
-    editor.message("gptel-rewrite: no pending rewrite")
-    return
-  }
-  st.lastRewrite = undefined
-  editor.message("gptel-rewrite: accepted")
+  return st.rewriteOverlays
+    .filter(rewrite => rewrite.bufferId === buffer.id)
+    .map(rewrite => ({
+      start: Math.max(0, Math.min(rewrite.start, buffer.text.length)),
+      end: Math.max(0, Math.min(rewrite.end, buffer.text.length)),
+      face: "region" as const,
+      style: { bg: "#041714" },
+    }))
+    .filter(span => span.end > span.start)
 }
 
-function rejectRewrite(editor: Editor): void {
-  const st = state(editor)
-  const rewrite = st.lastRewrite
+function pendingRewritesForBuffer(editor: Editor, buffer: BufferModel): GptelPendingRewrite[] {
+  return state(editor).rewriteOverlays.filter(rewrite => rewrite.bufferId === buffer.id)
+}
+
+function gptelRewriteOverlayAt(editor: Editor, buffer: BufferModel, point = buffer.point): GptelPendingRewrite | null {
+  const rewrites = pendingRewritesForBuffer(editor, buffer)
+  return rewrites.find(rewrite => point >= rewrite.start && point <= rewrite.end)
+    ?? (state(editor).lastRewrite?.bufferId === buffer.id ? state(editor).lastRewrite! : null)
+    ?? rewrites.at(-1)
+    ?? null
+}
+
+function gptelRewriteReject(editor: Editor, buffer: BufferModel, rewrite = gptelRewriteOverlayAt(editor, buffer)): void {
   if (!rewrite) {
     editor.message("gptel-rewrite: no pending rewrite")
     return
   }
-  const buffer = editor.buffers.get(rewrite.bufferId)
-  if (!buffer) {
-    st.lastRewrite = undefined
-    return
-  }
-  replaceWritable(buffer, rewrite.start, rewrite.end, rewrite.original)
-  buffer.point = rewrite.start + rewrite.original.length
-  st.lastRewrite = undefined
-  editor.message("gptel-rewrite: restored original text")
-  void editor.changed("gptel-rewrite-reject")
+  const st = state(editor)
+  st.rewriteOverlays = st.rewriteOverlays.filter(candidate => candidate.id !== rewrite.id)
+  if (st.lastRewrite?.id === rewrite.id) st.lastRewrite = st.rewriteOverlays.at(-1)
+  editor.message("Cleared pending LLM response(s).")
+  void editor.changed("gptel--rewrite-reject")
 }
 
-async function collectDirectory(path: string, limit = 24): Promise<Array<{ path: string; text: string }>> {
+function adjustPendingRewriteRanges(editor: Editor, applied: GptelPendingRewrite, delta: number): void {
+  if (!delta) return
+  for (const rewrite of state(editor).rewriteOverlays) {
+    if (rewrite.id === applied.id || rewrite.bufferId !== applied.bufferId || rewrite.start < applied.end) continue
+    rewrite.start += delta
+    rewrite.end += delta
+  }
+}
+
+function gptelRewriteAccept(editor: Editor, buffer: BufferModel, rewrite = gptelRewriteOverlayAt(editor, buffer)): void {
+  if (!rewrite) {
+    editor.message("gptel-rewrite: no pending rewrite")
+    return
+  }
+  const target = editor.buffers.get(rewrite.bufferId)
+  if (!target) {
+    gptelRewriteReject(editor, buffer, rewrite)
+    return
+  }
+  replaceWritable(target, rewrite.start, rewrite.end, rewrite.replacement)
+  target.point = rewrite.start + rewrite.replacement.length
+  adjustPendingRewriteRanges(editor, rewrite, rewrite.replacement.length - (rewrite.end - rewrite.start))
+  gptelRewriteReject(editor, target, rewrite)
+  editor.message(`Replaced region(s) with LLM output in buffer: ${editor.bufferDisplayName(target)}.`)
+  void editor.changed("gptel--rewrite-accept")
+}
+
+function mergeConflictText(original: string, replacement: string): string {
+  const left = original.endsWith("\n") ? original : `${original}\n`
+  const right = replacement.endsWith("\n") ? replacement : `${replacement}\n`
+  return `<<<<<<< original\n${left}=======\n${right}>>>>>>> replacement`
+}
+
+function gptelRewriteMerge(editor: Editor, buffer: BufferModel, rewrite = gptelRewriteOverlayAt(editor, buffer)): void {
+  if (!rewrite) {
+    editor.message("gptel-rewrite: no pending rewrite")
+    return
+  }
+  const target = editor.buffers.get(rewrite.bufferId)
+  if (!target) {
+    gptelRewriteReject(editor, buffer, rewrite)
+    return
+  }
+  const merged = mergeConflictText(rewrite.original, rewrite.replacement)
+  replaceWritable(target, rewrite.start, rewrite.end, merged)
+  target.point = rewrite.start
+  adjustPendingRewriteRanges(editor, rewrite, merged.length - (rewrite.end - rewrite.start))
+  gptelRewriteReject(editor, target, rewrite)
+  editor.message("gptel-rewrite: inserted merge conflict")
+  void editor.changed("gptel--rewrite-merge")
+}
+
+function splitDiffLines(text: string): string[] {
+  if (!text) return []
+  const lines = text.split("\n")
+  if (lines.at(-1) === "") lines.pop()
+  return lines
+}
+
+function unifiedDiff(original: string, replacement: string, oldName = "original", newName = "replacement"): string {
+  const a = splitDiffLines(original)
+  const b = splitDiffLines(replacement)
+  const dp = Array.from({ length: a.length + 1 }, () => Array<number>(b.length + 1).fill(0))
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      dp[i]![j] = a[i] === b[j] ? dp[i + 1]![j + 1]! + 1 : Math.max(dp[i + 1]![j]!, dp[i]![j + 1]!)
+    }
+  }
+  const body: string[] = []
+  let i = 0
+  let j = 0
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) {
+      body.push(` ${a[i++]}`)
+    } else if (j < b.length && (i === a.length || dp[i]![j + 1]! >= dp[i + 1]![j]!)) {
+      body.push(`+${b[j++]}`)
+    } else if (i < a.length) {
+      body.push(`-${a[i++]}`)
+    }
+  }
+  return [
+    `--- ${oldName}`,
+    `+++ ${newName}`,
+    `@@ -1,${Math.max(1, a.length)} +1,${Math.max(1, b.length)} @@`,
+    ...body,
+    "",
+  ].join("\n")
+}
+
+function gptelRewriteDiff(editor: Editor, buffer: BufferModel, rewrite = gptelRewriteOverlayAt(editor, buffer)): void {
+  if (!rewrite) {
+    editor.message("gptel-rewrite: no pending rewrite")
+    return
+  }
+  const source = editor.buffers.get(rewrite.bufferId) ?? buffer
+  const diff = unifiedDiff(rewrite.original, rewrite.replacement, editor.bufferDisplayName(source), `${editor.bufferDisplayName(source)}<gptel>`)
+  const diffBuffer = editor.scratch("*gptel-rewrite-diff*", diff, "diff-mode")
+  diffBuffer.locals.set("gptel-rewrite-id", rewrite.id)
+  editor.switchToBuffer(diffBuffer.id)
+}
+
+function stripModeSuffix(mode: string): string {
+  return mode.replace(/-mode$/, "")
+}
+
+const EXTENSION_LANGUAGES: Record<string, string> = {
+  ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript", mjs: "javascript",
+  py: "python", rb: "ruby", rs: "rust", go: "go", java: "java", c: "c", h: "c",
+  cc: "c++", cpp: "c++", hpp: "c++", cs: "csharp", php: "php", swift: "swift",
+  kt: "kotlin", scala: "scala", el: "elisp", clj: "clojure", sh: "shell", bash: "shell",
+  zsh: "shell", sql: "sql", css: "css", html: "html", json: "json", yaml: "yaml",
+  yml: "yaml", toml: "toml",
+}
+
+/** Buffers whose mode fell back to a generic one still deserve a language-specific
+ *  rewrite directive; infer it from the visited name's extension. */
+function bufferLanguage(buffer: BufferModel): string {
+  const lang = stripModeSuffix(buffer.mode).toLowerCase()
+  if (lang && lang !== "text" && lang !== "fundamental") return lang
+  const ext = buffer.name.match(/\.([A-Za-z0-9]+)$/)?.[1]?.toLowerCase()
+  return (ext && EXTENSION_LANGUAGES[ext]) || lang
+}
+
+function isProgrammingMode(mode: string): boolean {
+  return /(?:typescript|javascript|python|ruby|rust|go|java|c\+\+|csharp|php|swift|kotlin|scala|elisp|lisp|scheme|clojure|shell|sh|bash|zsh|tsx|jsx|json|yaml|toml|css|html|sql)/i.test(mode)
+}
+
+function articleFor(word: string): "a" | "an" {
+  return /^[aeiou]/i.test(word) ? "an" : "a"
+}
+
+function gptelRewriteDirectiveDefault(editor: Editor, deps: GptelDeps, buffer: BufferModel): string {
+  for (const hook of state(editor).rewriteDirectivesHooks) {
+    const value = hook({ editor, buffer })
+    if (value) return value
+  }
+  const customHook = deps.getCustom<string>("gptel-rewrite-directives-hook")
+  if (customHook && customHook.trim()) return customHook
+  const configured = deps.getCustom<string>("gptel-rewrite-directive")
+  if (configured && configured.trim()) return configured
+  const lang = bufferLanguage(buffer)
+  const article = articleFor(lang)
+  if (isProgrammingMode(lang)) {
+    return `You are ${article} ${lang} programmer.  Follow my instructions and refactor ${lang} code I provide.\n- Generate ONLY ${lang} code as output, without any explanation or markdown code fences.\n- Generate code in full, do not abbreviate or omit code.\n- Do not produce intermediate text or report on your progress.\n- Do not ask for further clarification, and make any assumptions you need to follow instructions.`
+  }
+  return `${lang ? `You are ${article} ${lang} editor.` : "You are an editor."}  Follow my instructions and improve or rewrite the text I provide.  Do not produce intermediate text or report on your progress.  Generate ONLY the replacement text, without any explanation or markdown code fences.`
+}
+
+async function rewriteMessages(editor: Editor, deps: GptelDeps, buffer: BufferModel, instruction: string, text: string, backend: GptelBackend, model: string): Promise<GptelMessage[]> {
+  let system = gptelRewriteDirectiveDefault(editor, deps, buffer)
+  const contextMode = deps.getCustom<boolean | string>("gptel-use-context") ?? "system"
+  const useContext = contextMode !== false && contextMode !== "false" && contextMode !== "nil" && contextMode !== "no"
+  const contextItems = useContext ? contextItemsForRequest(editor, buffer) : []
+  const contextStringFunction = deps.getCustom<GptelContextStringFunction>("gptel-context-string-function") ?? gptelContextString
+  const wrapFunction = deps.getCustom<GptelContextWrapFunction>("gptel-context-wrap-function") ?? gptelContextWrapDefault
+  const context = useContext ? contextStringFunction(contextItems, editor, buffer) : ""
+  if (context && contextMode === "system") system = `${system}\n\n${context}`
+  let prompt = [
+    text,
+    "What is the required change?  I will generate only the final replacement.",
+    instruction,
+  ].filter(Boolean).join("\n\n")
+  if (context && contextMode !== "system") prompt = wrapFunction(context, prompt, contextMode)
+  prompt = await applyPromptTransforms(editor, buffer, backend, model, prompt)
+  return [
+    { role: "system", content: system },
+    { role: "user", content: prompt },
+  ]
+}
+
+function addPendingRewrite(editor: Editor, buffer: BufferModel, rewrite: Omit<GptelPendingRewrite, "id" | "bufferId">): GptelPendingRewrite {
+  const pending: GptelPendingRewrite = { ...rewrite, id: `rewrite-${Date.now()}-${Math.random().toString(36).slice(2)}`, bufferId: buffer.id }
+  const st = state(editor)
+  st.rewriteOverlays.push(pending)
+  st.lastRewrite = pending
+  return pending
+}
+
+async function applyRewriteDefaultAction(editor: Editor, deps: GptelDeps, buffer: BufferModel, rewrite: GptelPendingRewrite): Promise<void> {
+  const action = deps.getCustom<string | null>("gptel-rewrite-default-action")
+  if (!action || action === "nil") return
+  if (action === "accept") gptelRewriteAccept(editor, buffer, rewrite)
+  else if (action === "merge") gptelRewriteMerge(editor, buffer, rewrite)
+  else if (action === "diff" || action === "ediff") gptelRewriteDiff(editor, buffer, rewrite)
+  else if (action === "dispatch") editor.openTransient(gptelRewriteDefinition(editor, deps))
+}
+
+async function gptelRewriteRequest(editor: Editor, deps: GptelDeps, buffer: BufferModel, instruction: string, options: { rewrite?: GptelPendingRewrite; dryRun?: boolean } = {}): Promise<void> {
+  const bounds = regionBounds(buffer)
+  if (!bounds && !options.rewrite) {
+    editor.message("gptel-rewrite: mark a region first")
+    return
+  }
+  const original = options.rewrite?.original ?? buffer.text.slice(bounds![0], bounds![1])
+  const textToRewrite = options.rewrite?.replacement ?? original
+  const backend = backendByName(editor, deps)
+  const model = currentModel(editor, deps, backend)
+  const messages = await rewriteMessages(editor, deps, buffer, instruction, textToRewrite, backend, model)
+  if (options.dryRun) {
+    inspectPayloadBuffer(editor, requestPayload(backend, model, messages, deps, selectedTools(editor, deps)))
+    editor.message("gptel-rewrite: dry run request payload")
+    return
+  }
+  editor.message(`gptel-rewrite: ${backend.name}/${model}`)
+  const result = await requestWithTools(editor, deps, backend, model, messages, buffer)
+  const replacement = result.text.trim()
+  let pending: GptelPendingRewrite
+  if (options.rewrite) {
+    options.rewrite.replacement = replacement
+    options.rewrite.instruction = instruction
+    pending = options.rewrite
+    state(editor).lastRewrite = pending
+  } else {
+    pending = addPendingRewrite(editor, buffer, {
+      start: bounds![0],
+      end: bounds![1],
+      original,
+      replacement,
+      instruction,
+    })
+  }
+  await editor.runHook("gptel-post-rewrite-functions", buffer)
+  editor.message("LLM rewrite output ready: use gptel-rewrite-accept, gptel-rewrite-reject, gptel-rewrite-diff, gptel-rewrite-merge, or gptel-rewrite-iterate.")
+  void editor.changed("gptel-rewrite")
+  await applyRewriteDefaultAction(editor, deps, buffer, pending)
+}
+
+async function gptelRewriteIterate(editor: Editor, deps: GptelDeps, buffer: BufferModel, rewrite = gptelRewriteOverlayAt(editor, buffer), instruction?: string, dryRun = false): Promise<void> {
+  if (!rewrite) {
+    editor.message("gptel-rewrite: no pending rewrite")
+    return
+  }
+  const nextInstruction = instruction ?? await editor.prompt("Rewrite instruction: ", rewrite.instruction, "gptel-rewrite")
+  if (!nextInstruction) return
+  const target = editor.buffers.get(rewrite.bufferId) ?? buffer
+  await gptelRewriteRequest(editor, deps, target, nextInstruction, { rewrite, dryRun })
+}
+
+function acceptRewrite(editor: Editor, buffer = editor.activeBuffer): void {
+  gptelRewriteAccept(editor, buffer)
+}
+
+function rejectRewrite(editor: Editor, buffer = editor.activeBuffer): void {
+  gptelRewriteReject(editor, buffer)
+}
+
+function gitRootFor(path: string): string | null {
+  try {
+    const dir = statSync(path).isDirectory() ? path : dirname(path)
+    return execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null
+  } catch {
+    return null
+  }
+}
+
+function gitProjectFiles(root: string): Set<string> | null {
+  try {
+    const out = execFileSync("git", ["-C", root, "ls-files", "-co", "--exclude-standard"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+    return new Set(out.split(/\r?\n/).filter(Boolean).map(file => resolve(root, file)))
+  } catch {
+    return null
+  }
+}
+
+function shouldRestrictProjectFiles(deps: GptelDeps, path: string): { skip: boolean; root?: string; rel?: string } {
+  const restrict = deps.getCustom<boolean>("gptel-context-restrict-to-project-files") ?? true
+  if (!restrict) return { skip: false }
+  const root = gitRootFor(path)
+  if (!root) return { skip: false }
+  const files = gitProjectFiles(root)
+  if (!files) return { skip: false }
+  const full = resolve(path)
+  if (files.has(full)) return { skip: false, root, rel: relative(root, full) }
+  return { skip: true, root, rel: relative(root, full) }
+}
+
+function projectSkipMessage(path: string, root?: string, rel?: string): string {
+  const type = existsSync(path) && statSync(path).isDirectory() ? "directory" : "file"
+  const reminder = "To include it, unset `gptel-context-restrict-to-project-files'."
+  if (root && rel) return `Skipping ${type} "${rel}" in project "${root}".  ${reminder}`
+  return `Skipping ${type} "${path}". ${reminder}`
+}
+
+async function collectDirectory(editor: Editor, deps: GptelDeps, path: string, limit = 24): Promise<Array<{ path: string; text: string }>> {
   const files: Array<{ path: string; text: string }> = []
   async function walk(dir: string): Promise<void> {
     if (files.length >= limit) return
@@ -2841,8 +3719,17 @@ async function collectDirectory(path: string, limit = 24): Promise<Array<{ path:
       const full = join(dir, entry.name)
       if (entry.isDirectory()) await walk(full)
       else if (entry.isFile()) {
+        const project = shouldRestrictProjectFiles(deps, full)
+        if (project.skip) {
+          editor.message(projectSkipMessage(full, project.root, project.rel))
+          continue
+        }
         const size = statSync(full).size
-        if (size > 100_000) continue
+        const mime = mimeTypeForPath(full) ?? undefined
+        if (isLikelyBinaryFile(full, size)) {
+          editor.message(`Ignoring unsupported binary file "${full}".`)
+          continue
+        }
         const text = await readFile(full, "utf8").catch(() => "")
         files.push({ path: full, text })
       }
@@ -2852,17 +3739,24 @@ async function collectDirectory(path: string, limit = 24): Promise<Array<{ path:
   return files
 }
 
-async function addPathContext(editor: Editor, path: string): Promise<void> {
+async function addPathContext(editor: Editor, deps: GptelDeps, path: string): Promise<void> {
   const full = resolve(path)
   const st = await stat(full)
   if (st.isDirectory()) {
-    state(editor).context.push({ type: "directory", path: full, files: await collectDirectory(full) })
+    state(editor).context.push({ type: "directory", path: full, files: await collectDirectory(editor, deps, full) })
     editor.message(`gptel: added directory context ${full}`)
   } else {
+    const project = shouldRestrictProjectFiles(deps, full)
+    if (project.skip) {
+      editor.message(projectSkipMessage(full, project.root, project.rel))
+      return
+    }
     const mime = mimeTypeForPath(full) ?? undefined
-    const binary = st.size > 200_000 || (mime ? !isTextMime(mime) : false)
+    const binary = isLikelyBinaryFile(full, st.size)
     const text = binary ? "" : await readFile(full, "utf8").catch(() => "")
-    state(editor).context.push({ type: "file", path: full, text, binary, mime })
+    const item: GptelContextItem = { type: "file", path: full, text, binary, mime }
+    state(editor).context.push(item)
+    state(editor).gptelContextAlist.push({ source: "file", path: full, mime })
     editor.message(`gptel: added file context ${full}`)
   }
 }
@@ -2872,6 +3766,9 @@ function installFaces(deps: GptelDeps): void {
   deps.defface("gptel-assistant", { fg: "#b8bb26", bold: true }, "gptel assistant response face.")
   deps.defface("gptel-context", { fg: "#fabd2f" }, "gptel context face.")
   deps.defface("gptel-error", { fg: "#fb4934", bold: true }, "gptel error face.")
+  deps.defface("gptel-rewrite-highlight-face", { bg: "#041714" }, "Face for highlighting regions with pending rewrites.")
+  deps.defface("gptel-response-highlight", { bg: "#2a2a2a" }, "Face used to highlight gptel response regions.")
+  deps.defface("gptel-response-fringe-highlight", { inherit: ["modeLine"] as any }, "Compatibility face for response fringe/margin highlights.")
 }
 
 function gptelFontLock(buffer: BufferModel) {
@@ -2911,6 +3808,13 @@ function installModes(deps: GptelDeps): void {
   contextMap.bind("g", "gptel-context")
   deps.defineMode({ name: GPTEL_CONTEXT_MODE, parent: "text", keymap: contextMap })
 
+  deps.defineMode({ name: GPTEL_QUERY_MODE, parent: "text" })
+  const queryMap = new deps.Keymap("gptel-query-mode-map")
+  queryMap.bind("C-c C-c", "gptel-continue-query")
+  queryMap.bind("C-c C-w", "gptel-copy-curl")
+  queryMap.bind("C-c C-k", "quit-window")
+  deps.defineMinorMode({ name: GPTEL_QUERY_MINOR_MODE, lighter: " GPTelQuery", keymap: queryMap })
+
   const minorMap = new deps.Keymap("gptel-mode-map")
   minorMap.bind("C-c RET", "gptel-send")
   minorMap.bind("C-c C-c", "gptel-send")
@@ -2918,7 +3822,18 @@ function installModes(deps: GptelDeps): void {
   minorMap.bind("C-c C-a", "gptel-add")
   minorMap.bind("M-p", "gptel-beginning-of-response")
   minorMap.bind("M-n", "gptel-end-of-response")
-  deps.defineMinorMode({ name: GPTEL_MODE, lighter: " GPTel", keymap: minorMap })
+  deps.defineMinorMode({
+    name: GPTEL_MODE,
+    lighter: " GPTel",
+    keymap: minorMap,
+    onEnable(editor, buffer) {
+      if (buffer) gptelUpdateStatus(editor, deps, buffer, "Ready")
+    },
+    onDisable(_editor, buffer) {
+      buffer?.locals.delete(STATUS_LOCAL)
+    },
+  })
+  deps.defineMinorMode({ name: "gptel-highlight-mode", lighter: "", keymap: new deps.Keymap("gptel-highlight-mode-map") })
 }
 
 function contextBuffer(editor: Editor): BufferModel {
@@ -3008,6 +3923,7 @@ function describeState(editor: Editor, deps: GptelDeps): string {
     `Last usage: ${formatUsage(st.lastRequest?.usage)}`,
     `Session usage: ${formatUsage(st.tokenUsage)}`,
     `Context items: ${st.context.length}`,
+    `Latest request FSM: ${st.requestFsms.at(-1)?.state ?? "(none)"}`,
     `Presets: ${[...st.presets.keys()].join(", ") || "(none)"}`,
     `Tools: ${[...st.tools.keys()].join(", ") || "(none)"}`,
     `Schema: ${deps.getCustom<string>("gptel-schema") ? "yes" : "no"}`,
@@ -3028,6 +3944,7 @@ function describeState(editor: Editor, deps: GptelDeps): string {
     "  gptel-menu             inspect and change backend/model",
     "  gptel-mcp-connect      activate tools from registered MCP servers",
     "  gptel-mcp-disconnect   remove MCP tools and disconnect servers",
+    "  gptel-inspect-fsm      inspect recent request state machines",
     "  gptel-org-set-topic    set GPTEL_TOPIC on the current Org heading",
     "  gptel-org-set-properties save gptel options as Org properties",
     "  gptel-save-state       persist gptel metadata in this buffer",
@@ -3060,6 +3977,63 @@ function customDirectives(deps: GptelDeps): Record<string, string | (() => strin
   return Object.fromEntries(entries)
 }
 
+function parseCsv(text: string): string[][] {
+  const rows: string[][] = []
+  let row: string[] = []
+  let field = ""
+  let quoted = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!
+    if (quoted) {
+      if (ch === "\"" && text[i + 1] === "\"") {
+        field += "\""
+        i++
+      } else if (ch === "\"") {
+        quoted = false
+      } else {
+        field += ch
+      }
+      continue
+    }
+    if (ch === "\"") quoted = true
+    else if (ch === ",") {
+      row.push(field)
+      field = ""
+    } else if (ch === "\n") {
+      row.push(field)
+      rows.push(row)
+      row = []
+      field = ""
+    } else if (ch !== "\r") field += ch
+  }
+  if (field || row.length) {
+    row.push(field)
+    rows.push(row)
+  }
+  return rows
+}
+
+function parseCrowdsourcedPromptsCsv(text: string): Map<string, string> {
+  const prompts = new Map<string, string>()
+  const rows = parseCsv(text)
+  for (const row of rows.slice(1)) {
+    const act = row[0]?.trim()
+    const prompt = row[1]?.trim()
+    if (act && prompt) prompts.set(act, prompt)
+  }
+  return prompts
+}
+
+function gptelCrowdsourcedPrompts(editor: Editor, deps: GptelDeps): Map<string, string> {
+  const st = state(editor)
+  const file = deps.getCustom<string>("gptel-crowdsourced-prompts-file")
+  if (!file) return new Map()
+  if (st.crowdsourcedPromptsFile === file && st.crowdsourcedPrompts.size) return st.crowdsourcedPrompts
+  st.crowdsourcedPromptsFile = file
+  st.crowdsourcedPrompts = existsSync(file) ? parseCrowdsourcedPromptsCsv(readFileSync(file, "utf8")) : new Map()
+  return st.crowdsourcedPrompts
+}
+
 function resolveDirective(value: string | (() => string)): string {
   return typeof value === "function" ? value() : value
 }
@@ -3067,6 +4041,7 @@ function resolveDirective(value: string | (() => string)): string {
 function knownDirectives(editor: Editor, deps: GptelDeps): Record<string, string> {
   const directives = {
     ...defaultDirectives(),
+    ...Object.fromEntries(gptelCrowdsourcedPrompts(editor, deps)),
     ...Object.fromEntries(state(editor).directives),
     ...customDirectives(deps),
   }
@@ -3142,11 +4117,15 @@ function gptelRewriteDefinition(editor: Editor, deps: GptelDeps): TransientDefin
         title: "Rewrite",
         infixes: [
           { key: "-i", label: "Instruction", argument: "--instruction", kind: "value" },
+          { key: "-n", label: "Dry run", argument: "--dry-run", kind: "toggle" },
         ],
         suffixes: [
           { key: "r", label: "Rewrite", command: "gptel-rewrite-run" },
           { key: "a", label: "Accept", command: "gptel-rewrite-accept" },
           { key: "k", label: "Reject", command: "gptel-rewrite-reject" },
+          { key: "d", label: "Diff", command: "gptel-rewrite-diff" },
+          { key: "m", label: "Merge", command: "gptel-rewrite-merge" },
+          { key: "i", label: "Iterate", command: "gptel-rewrite-iterate" },
         ],
       },
       {
@@ -3526,6 +4505,11 @@ export function gptelAddPostToolCallFunction(editor: Editor, fn: GptelPostToolCa
   return fn
 }
 
+export function gptelAddRewriteDirectivesHook(editor: Editor, fn: GptelRewriteDirectivesHook): GptelRewriteDirectivesHook {
+  state(editor).rewriteDirectivesHooks.push(fn)
+  return fn
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
@@ -3747,15 +4731,39 @@ export async function install(editor: Editor): Promise<void> {
   state(editor)
   installFaces(deps)
   installModes(deps)
+  if (!editor.locals.get("gptel-rewrite-overlay-source-installed")) {
+    editor.addOverlaySource(buffer => gptelRewriteOverlaySpans(editor, buffer))
+    editor.locals.set("gptel-rewrite-overlay-source-installed", true)
+  }
+  if (!editor.locals.get("gptel-highlight-overlay-source-installed")) {
+    editor.addOverlaySource(buffer => gptelHighlightSpans(deps, buffer))
+    editor.locals.set("gptel-highlight-overlay-source-installed", true)
+  }
+  if (!editor.locals.get("gptel-mode-line-misc-installed")) {
+    deps.defcustom("mode-line-misc-info", "sexp", [] as Array<(buffer: BufferModel) => string>, "Functions appended to the mode line after minor-mode lighters.", "display")
+    const current = deps.getCustom<Array<(buffer: BufferModel) => string>>("mode-line-misc-info") ?? []
+    const segment = (buffer: BufferModel) => buffer.minorModes.has(GPTEL_MODE) && deps.getCustom<boolean>("gptel-use-header-line") !== false
+      ? ` [${gptelStatusText(editor, deps, buffer)}]`
+      : ""
+    ;(segment as any).gptelStatusSegment = true
+    deps.setCustom("mode-line-misc-info", [
+      ...current.filter(fn => !(fn as any).gptelStatusSegment),
+      segment,
+    ])
+    editor.locals.set("gptel-mode-line-misc-installed", true)
+  }
 
   deps.defcustom("gptel-backend", "string", "Claude", "Active gptel backend.", "gptel")
   deps.defcustom("gptel-model", "string", "claude-sonnet-4-5-20250929", "Active gptel model.", "gptel")
   deps.defcustom("gptel-api-key", "sexp", "", "Default API key used by gptel backends without an explicit key.", "gptel")
   deps.defcustom("gptel-proxy", "string", "", "HTTP proxy for upstream gptel compatibility; fetch-based Jemacs requests do not use it directly.", "gptel")
   deps.defcustom("gptel-use-curl", "boolean", false, "Curl transport toggle for upstream gptel compatibility; Jemacs uses fetch.", "gptel")
+  deps.defcustom("gptel-use-header-line", "boolean", true, "Whether gptel-mode should show status information in the header-line; Jemacs falls back to mode-line misc info.", "gptel")
   deps.defcustom("gptel-system-message", "string", DEFAULT_SYSTEM_MESSAGE, "System message used for gptel requests.", "gptel")
   deps.defcustom("gptel-system-prompt", "sexp", DEFAULT_SYSTEM_MESSAGE, "Upstream-compatible alias for gptel-system-message.", "gptel")
   deps.defcustom("gptel-directives", "sexp", "", "JSON object or object of named gptel system directives.", "gptel")
+  deps.defcustom("gptel-crowdsourced-prompts-file", "string", emacsCachePath("gptel-crowdsourced-prompts.csv"), "CSV cache file for crowdsourced gptel system prompts.", "gptel")
+  deps.defcustom("gptel-highlight-methods", "sexp", ["face"], "Highlight methods for gptel-highlight-mode; Jemacs supports face highlighting.", "gptel")
   deps.defcustom("gptel-temperature", "sexp", null, "Sampling temperature for gptel requests, or null for the API default.", "gptel")
   deps.defcustom("gptel-max-tokens", "sexp", null, "Maximum output tokens for gptel requests, or null for the API default.", "gptel")
   deps.defcustom("gptel-num-messages-to-send", "sexp", null, "Number of prior chat messages to send, or null for all.", "gptel")
@@ -3770,9 +4778,14 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-max-tool-rounds", "number", 3, "Maximum number of tool-call continuation rounds.", "gptel")
   deps.defcustom("gptel-confirm-tool-calls", "sexp", true, "Ask before running gptel tool calls: true, false, or auto.", "gptel")
   deps.defcustom("gptel-use-context", "string", "system", "How gptel sends context: system, user, or false.", "gptel")
+  deps.defcustom("gptel-context-string-function", "sexp", gptelContextString, "Function to prepare the context string sent with gptel requests.", "gptel")
+  deps.defcustom("gptel-context-wrap-function", "sexp", gptelContextWrapDefault, "Function to wrap request context around user prompts.", "gptel")
+  deps.defcustom("gptel-context-restrict-to-project-files", "boolean", true, "Restrict files eligible to be added to context to project files.", "gptel")
   deps.defcustom("gptel-schema", "string", "", "Structured JSON output schema as JSON or gptel shorthand.", "gptel")
   deps.defcustom("gptel-include-reasoning", "string", "ignore", "Reasoning handling: ignore, true, false, or a buffer name.", "gptel")
   deps.defcustom("gptel-rewrite-directive", "sexp", "", "Directive used by gptel rewrite commands and presets.", "gptel")
+  deps.defcustom("gptel-rewrite-directives-hook", "string", "", "Hook-like override used to generate default rewrite directives.", "gptel")
+  deps.defcustom("gptel-rewrite-default-action", "sexp", null, "Action for received rewrites: nil, accept, merge, diff, ediff, or dispatch.", "gptel")
   deps.defcustom("gptel-default-mode", "string", "markdown", "Major mode for new dedicated gptel chat buffers.", "gptel")
   deps.defcustom("gptel-display-buffer-action", "sexp", "same-window", "Display hint for gptel chat buffers; supports same-window or other-window in Jemacs.", "gptel")
   deps.defcustom("gptel-prompt-prefix-alist", "sexp", defaultPromptPrefixAlist(), "Mode-specific prompt prefixes for dedicated gptel chat buffers.", "gptel")
@@ -3809,13 +4822,15 @@ export async function install(editor: Editor): Promise<void> {
 
   editor.command("gptel-add-and-open-buffer", async ({ editor, buffer }) => {
     state(editor).context.length = 0
+    state(editor).gptelContextAlist.length = 0
+    for (const source of editor.buffers.values()) bufferLocalContext(source).length = 0
     const source = buffer
     const region = activeRegionText(source)
     if (region) {
       const [start, end] = regionBounds(source)!
-      state(editor).context.push({ type: "region", name: editor.bufferDisplayName(source), bufferId: source.id, start, end, text: region })
+      addRegionContextItem(editor, source, start, end)
     } else {
-      state(editor).context.push({ type: "buffer", name: editor.bufferDisplayName(source), bufferId: source.id, text: source.text })
+      addBufferContextItem(editor, source)
     }
     const chat = ensureChatBuffer(editor, deps, `${GPTEL_BUFFER_PREFIX}<${Date.now()}>`)
     editor.displayBufferInOtherWindow(chat.id, { select: true })
@@ -3844,26 +4859,59 @@ export async function install(editor: Editor): Promise<void> {
     decidePendingToolCalls(editor, "reject")
   }, "Reject pending gptel tool calls.")
 
-  editor.command("gptel-add", async ({ editor, buffer }) => {
+  editor.command("gptel-add", async ({ editor, buffer, prefixArgument }) => {
     const region = activeRegionText(buffer)
-    if (region) {
-      const [start, end] = regionBounds(buffer)!
-      state(editor).context.push({ type: "region", name: editor.bufferDisplayName(buffer), bufferId: buffer.id, start, end, text: region })
-      editor.message("gptel: added region context")
+    if (prefixArgument != null && prefixArgument < 0) {
+      const bounds = regionBounds(buffer)
+      if (bounds) removeBufferContextInRange(editor, buffer, bounds[0], bounds[1])
+      else {
+        const atPoint = state(editor).context.find(item => item.type === "region" && item.bufferId === buffer.id && buffer.point >= item.start && buffer.point <= item.end)
+        if (atPoint) {
+          removeContextItem(editor, atPoint)
+          editor.message("Context under point has been removed.")
+        } else editor.message("0 contexts removed from current buffer.")
+      }
       return
     }
-    state(editor).context.push({ type: "buffer", name: editor.bufferDisplayName(buffer), bufferId: buffer.id, text: buffer.text })
-    editor.message("gptel: added buffer context")
+    if (prefixArgument != null && prefixArgument > 0) {
+      addBufferContextItem(editor, buffer)
+      editor.message(`Buffer "${editor.bufferDisplayName(buffer)}" added to context.`)
+      return
+    }
+    if (region) {
+      const [start, end] = regionBounds(buffer)!
+      addRegionContextItem(editor, buffer, start, end)
+      buffer.markActive = false
+      editor.message("Current region added as context.")
+      return
+    }
+    const atPoint = state(editor).context.find(item => item.type === "region" && item.bufferId === buffer.id && buffer.point >= item.start && buffer.point <= item.end)
+    if (atPoint) {
+      removeContextItem(editor, atPoint)
+      editor.message("Context under point has been removed.")
+      return
+    }
+    addBufferContextItem(editor, buffer)
+    editor.message(`Buffer "${editor.bufferDisplayName(buffer)}" added to context.`)
   }, "Add active region or current buffer to gptel context.")
+
+  editor.command("gptel-context-add-current-kill", ({ editor, prefixArgument }) => {
+    addCurrentKillContext(editor, deps, prefixArgument != null)
+  }, "Add current kill to gptel context.")
+  editor.command("gptel-add-kill", ({ editor, prefixArgument }) => {
+    addCurrentKillContext(editor, deps, prefixArgument != null)
+  }, "Add current kill to gptel context.")
 
   editor.command("gptel-add-file", async ({ editor, args }) => {
     const picked = args[0] ?? await editor.completingRead("Add file or directory: ", { completion: "file", history: "file" })
     if (!picked) return
-    await addPathContext(editor, picked)
+    await addPathContext(editor, deps, picked)
   }, "Add a file or directory to gptel context.")
 
   editor.command("gptel-context-remove-all", ({ editor }) => {
     state(editor).context.length = 0
+    state(editor).gptelContextAlist.length = 0
+    for (const source of editor.buffers.values()) bufferLocalContext(source).length = 0
     editor.message("gptel: cleared context")
   }, "Remove all gptel context.")
 
@@ -3897,7 +4945,10 @@ export async function install(editor: Editor): Promise<void> {
     if (buffer.mode !== GPTEL_CONTEXT_MODE) return
     const flagged = [...contextFlagged(buffer)].sort((a, b) => b - a)
     const st = state(editor)
-    for (const index of flagged) st.context.splice(index, 1)
+    for (const index of flagged) {
+      const item = st.context[index]
+      if (item) removeContextItem(editor, item)
+    }
     buffer.locals.set(CONTEXT_FLAGGED, new Set<number>())
     contextBuffer(editor)
     editor.message(`gptel: removed ${flagged.length} context item${flagged.length === 1 ? "" : "s"}`)
@@ -3944,7 +4995,8 @@ export async function install(editor: Editor): Promise<void> {
     if (buffer.mode === GPTEL_CONTEXT_MODE) {
       const section = contextSectionAtPoint(buffer)
       if (section) {
-        state(editor).context.splice(section.index, 1)
+        const item = state(editor).context[section.index]
+        if (item) removeContextItem(editor, item)
         contextBuffer(editor)
         editor.message("gptel: removed context entry")
       }
@@ -3952,17 +5004,26 @@ export async function install(editor: Editor): Promise<void> {
     }
     const st = state(editor)
     const before = st.context.length
-    st.context = st.context.filter(item =>
-      !(("bufferId" in item) && item.bufferId === buffer.id))
+    for (const item of [...st.context]) if (("bufferId" in item) && item.bufferId === buffer.id) removeContextItem(editor, item)
     editor.message(`gptel: removed ${before - st.context.length} context item${before - st.context.length === 1 ? "" : "s"}`)
   }, "Remove gptel context for this buffer or current context entry.")
 
-  editor.command("gptel-rewrite", async ({ editor, buffer, args }) => {
+  editor.command("gptel-rewrite", async ({ editor, buffer, args, prefixArgument }) => {
     applyTransientArgs(editor, deps, args)
+    const dryRun = args.includes("--dry-run") || args.includes("-n")
+    if (prefixArgument != null) {
+      editor.openTransient(gptelRewriteDefinition(editor, deps))
+      return
+    }
+    const pending = gptelRewriteOverlayAt(editor, buffer)
+    if (!buffer.useRegion() && pending) {
+      editor.openTransient(gptelRewriteDefinition(editor, deps))
+      return
+    }
     if (buffer.useRegion()) {
       const instruction = positionalArgs(args).join(" ") || await editor.prompt("Rewrite instruction: ", "Improve clarity while preserving meaning.", "gptel-rewrite")
       if (!instruction) return
-      await rewriteRegion(editor, deps, buffer, instruction)
+      await gptelRewriteRequest(editor, deps, buffer, instruction, { dryRun })
       return
     }
     editor.openTransient(gptelRewriteDefinition(editor, deps))
@@ -3970,21 +5031,68 @@ export async function install(editor: Editor): Promise<void> {
 
   editor.command("gptel-rewrite-run", async ({ editor, buffer, args }) => {
     applyTransientArgs(editor, deps, args)
+    const dryRun = args.includes("--dry-run") || args.includes("-n")
     const directives = knownDirectives(editor, deps)
     const directive = positionalArgs(args).find(arg => directives[arg])
     const instruction = transientValue(args, "--instruction")
       ?? (directive ? directives[directive] : await editor.prompt("Rewrite instruction: ", "Improve clarity while preserving meaning.", "gptel-rewrite"))
     if (!instruction) return
-    await rewriteRegion(editor, deps, buffer, instruction)
+    const pending = gptelRewriteOverlayAt(editor, buffer)
+    if (pending && !buffer.useRegion()) await gptelRewriteIterate(editor, deps, buffer, pending, instruction, dryRun)
+    else await gptelRewriteRequest(editor, deps, buffer, instruction, { dryRun })
   }, "Run a gptel rewrite from the rewrite transient.")
 
-  editor.command("gptel-rewrite-accept", ({ editor }) => {
-    acceptRewrite(editor)
-  }, "Accept the last gptel rewrite.")
+  editor.command("gptel--rewrite-accept", ({ editor, buffer }) => {
+    gptelRewriteAccept(editor, buffer)
+  }, "Apply the pending gptel rewrite at point.")
 
-  editor.command("gptel-rewrite-reject", ({ editor }) => {
-    rejectRewrite(editor)
-  }, "Reject the last gptel rewrite and restore the original text.")
+  editor.command("gptel--rewrite-reject", ({ editor, buffer }) => {
+    gptelRewriteReject(editor, buffer)
+  }, "Clear the pending gptel rewrite at point.")
+
+  editor.command("gptel--rewrite-diff", ({ editor, buffer }) => {
+    gptelRewriteDiff(editor, buffer)
+  }, "Show a diff for the pending gptel rewrite at point.")
+
+  editor.command("gptel--rewrite-ediff", ({ editor, buffer }) => {
+    gptelRewriteDiff(editor, buffer)
+  }, "Show a diff fallback for the pending gptel rewrite at point.")
+
+  editor.command("gptel--rewrite-merge", ({ editor, buffer }) => {
+    gptelRewriteMerge(editor, buffer)
+  }, "Apply the pending gptel rewrite as a merge conflict.")
+
+  editor.command("gptel--rewrite-iterate", async ({ editor, buffer, args }) => {
+    const dryRun = args.includes("--dry-run") || args.includes("-n")
+    const instruction = positionalArgs(args).join(" ") || transientValue(args, "--instruction")
+    await gptelRewriteIterate(editor, deps, buffer, gptelRewriteOverlayAt(editor, buffer), instruction || undefined, dryRun)
+  }, "Iterate on the pending gptel rewrite at point.")
+
+  editor.command("gptel-rewrite-accept", ({ editor, buffer }) => {
+    acceptRewrite(editor, buffer)
+  }, "Accept the pending gptel rewrite at point or the last pending rewrite.")
+
+  editor.command("gptel-rewrite-reject", ({ editor, buffer }) => {
+    rejectRewrite(editor, buffer)
+  }, "Reject the pending gptel rewrite at point or the last pending rewrite.")
+
+  editor.command("gptel-rewrite-diff", ({ editor, buffer }) => {
+    gptelRewriteDiff(editor, buffer)
+  }, "Show a unified diff for the pending gptel rewrite.")
+
+  editor.command("gptel-rewrite-ediff", ({ editor, buffer }) => {
+    gptelRewriteDiff(editor, buffer)
+  }, "Show a diff fallback for the pending gptel rewrite.")
+
+  editor.command("gptel-rewrite-merge", ({ editor, buffer }) => {
+    gptelRewriteMerge(editor, buffer)
+  }, "Apply the pending gptel rewrite with conflict markers.")
+
+  editor.command("gptel-rewrite-iterate", async ({ editor, buffer, args }) => {
+    const dryRun = args.includes("--dry-run") || args.includes("-n")
+    const instruction = positionalArgs(args).join(" ") || transientValue(args, "--instruction")
+    await gptelRewriteIterate(editor, deps, buffer, gptelRewriteOverlayAt(editor, buffer), instruction || undefined, dryRun)
+  }, "Send a follow-up rewrite instruction for the pending rewrite.")
 
   editor.command("gptel-abort", ({ editor, buffer }) => {
     const controller = state(editor).activeRequests.get(buffer.id)
@@ -4090,6 +5198,27 @@ export async function install(editor: Editor): Promise<void> {
     editor.message("gptel: system prompt set")
   }, "Set the gptel system prompt.")
 
+  editor.command("gptel-refresh-crowdsourced-prompts", async ({ editor }) => {
+    const file = deps.getCustom<string>("gptel-crowdsourced-prompts-file")
+    if (!file) {
+      editor.message("gptel: no crowdsourced prompts file configured")
+      return
+    }
+    const response = await fetch(CROWDSOURCED_PROMPTS_URL)
+    if (!response.ok) throw new Error(`gptel crowdsourced prompts ${response.status}: ${response.statusText}`)
+    const text = await response.text()
+    await mkdir(dirname(file), { recursive: true })
+    await writeFile(file, text, "utf8")
+    const st = state(editor)
+    st.crowdsourcedPromptsFile = file
+    st.crowdsourcedPrompts = parseCrowdsourcedPromptsCsv(text)
+    editor.message(`gptel: loaded ${st.crowdsourcedPrompts.size} crowdsourced prompts`)
+  }, "Fetch and cache crowdsourced gptel system prompts.")
+
+  editor.command("gptel-status", ({ editor, buffer }) => {
+    editor.message(`gptel: ${gptelStatusText(editor, deps, buffer)}`)
+  }, "Show gptel status for the current buffer.")
+
   editor.command("gptel-tools", async ({ editor, args }) => {
     const st = state(editor)
     if (!st.tools.size) {
@@ -4170,6 +5299,19 @@ export async function install(editor: Editor): Promise<void> {
   editor.command("gptel-inspect-query-json", async ({ editor, buffer, args }) => {
     await inspectQueryFromBuffer(editor, deps, buffer, args, "json")
   }, "Dry-run the current gptel request and inspect the JSON body.")
+
+  editor.command("gptel-continue-query", async ({ editor, buffer }) => {
+    await continueQueryFromBuffer(editor, deps, buffer)
+  }, "Continue a gptel request from an editable inspect-query buffer.")
+
+  editor.command("gptel-copy-curl", ({ editor, buffer }) => {
+    copyCurlFromBuffer(editor, deps, buffer)
+  }, "Copy a Curl command for the gptel inspect-query buffer.")
+
+  editor.command("gptel-inspect-fsm", ({ editor }) => {
+    const buffer = editor.scratch("*gptel-diagnostic*", gptelFsmInspectText(editor), "text")
+    buffer.readOnly = true
+  }, "Inspect recent and active gptel request FSM states.")
 
   editor.command("gptel-log", ({ editor }) => {
     const buffer = logBuffer(editor, "")
