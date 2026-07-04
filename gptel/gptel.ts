@@ -199,7 +199,12 @@ export type GptelRewriteDirectivesHook = (ctx: { editor: Editor; buffer: BufferM
 type PendingToolCallState = {
   bufferId: string
   calls: GptelToolCall[]
-  resolve: (decision: "accept" | "reject") => void
+  resolve: (decision: PendingToolCallDecision) => void
+}
+
+type PendingToolCallDecision = "reject" | "cancel" | {
+  action: "accept"
+  calls: GptelToolCall[]
 }
 
 type GptelResponseHistory = {
@@ -295,6 +300,11 @@ type RequestResult = {
   raw?: unknown
   usage?: GptelTokenUsage
   toolCalls?: GptelToolCall[]
+  canceled?: boolean
+}
+
+type GptelInspectToolCallsMeta = {
+  pending: PendingToolCallState
 }
 
 type GptelRequestPayload = {
@@ -310,6 +320,7 @@ const GPTEL_CHAT_MODE = "gptel-chat"
 const GPTEL_CONTEXT_MODE = "gptel-context"
 const GPTEL_QUERY_MODE = "gptel-query"
 const GPTEL_QUERY_MINOR_MODE = "gptel-query-mode"
+const GPTEL_TOOL_CALL_INSPECT_MODE = "gptel-tool-call-inspect"
 const GPTEL_BUFFER_PREFIX = "*ChatGPT*"
 const CONTEXT_SECTIONS = "gptel-context-sections"
 const CONTEXT_FLAGGED = "gptel-context-flagged"
@@ -320,6 +331,7 @@ const STATE_BLOCK_START = "<!-- gptel-state:"
 const STATE_BLOCK_END = "-->"
 const STATE_RESTORED = "gptel-state-restored"
 const INSPECT_QUERY_META = "gptel-inspect-query-meta"
+const INSPECT_TOOL_CALLS_META = "gptel-inspect-tool-calls-meta"
 const STATUS_LOCAL = "gptel-status"
 const HIGHLIGHT_COMMENT_LOCAL = "gptel-highlight-comment-shown"
 const DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
@@ -2242,6 +2254,74 @@ function inspectPayloadBuffer(editor: Editor, payload: GptelRequestPayload, form
   return buffer
 }
 
+function toolCallInspectionJson(calls: readonly GptelToolCall[]): string {
+  return `${JSON.stringify(calls.map(call => ({
+    id: call.id,
+    name: call.name,
+    args: call.arguments ?? {},
+  })), null, 2)}\n`
+}
+
+function inspectToolCalls(editor: Editor): BufferModel | null {
+  const pending = state(editor).pendingToolCalls
+  if (!pending) {
+    editor.message("gptel: no pending tool calls")
+    return null
+  }
+  const buffer = editor.scratch("*gptel-tool-calls*", toolCallInspectionJson(pending.calls), "json")
+  editor.enterMode(buffer, "json")
+  editor.enableMinorMode(GPTEL_TOOL_CALL_INSPECT_MODE, { buffer })
+  buffer.readOnly = false
+  buffer.locals.set(INSPECT_TOOL_CALLS_META, { pending } satisfies GptelInspectToolCallsMeta)
+  buffer.point = 0
+  editor.switchToBuffer(buffer.id)
+  return buffer
+}
+
+function callFromInspectionEntry(entry: unknown, fallback: GptelToolCall | undefined): GptelToolCall | null {
+  if (!isPlainObject(entry)) return null
+  const record = entry as Record<string, unknown>
+  const id = typeof record.id === "string" ? record.id : fallback?.id
+  const name = typeof record.name === "string" ? record.name : fallback?.name
+  if (!id || !name) return null
+  const args = hasOwn(record, "args") ? record.args : hasOwn(record, "arguments") ? record.arguments : fallback?.arguments ?? {}
+  return { ...(fallback ?? { id, name, arguments: args }), id, name, arguments: args }
+}
+
+function parseInspectedToolCalls(buffer: BufferModel, pending: PendingToolCallState): GptelToolCall[] {
+  const parsed = JSON.parse(buffer.text)
+  if (!Array.isArray(parsed)) throw new Error("expected a JSON array of tool calls")
+  return parsed
+    .map((entry, index) => {
+      const byId = isPlainObject(entry) && typeof (entry as Record<string, unknown>).id === "string"
+        ? pending.calls.find(call => call.id === (entry as Record<string, unknown>).id)
+        : undefined
+      return callFromInspectionEntry(entry, byId ?? pending.calls[index])
+    })
+    .filter((call): call is GptelToolCall => Boolean(call))
+}
+
+function acceptInspectedToolCalls(editor: Editor, buffer: BufferModel): boolean {
+  const meta = buffer.locals.get(INSPECT_TOOL_CALLS_META) as GptelInspectToolCallsMeta | undefined
+  const currentPending = state(editor).pendingToolCalls
+  const pending = meta?.pending ?? currentPending
+  if (!pending) {
+    editor.message("gptel: no pending tool calls")
+    return false
+  }
+  let calls: GptelToolCall[]
+  try {
+    calls = parseInspectedToolCalls(buffer, pending)
+  } catch (error) {
+    editor.message(`gptel: cannot read modified tool calls: ${error instanceof Error ? error.message : String(error)}`)
+    return false
+  }
+  if (currentPending === pending) state(editor).pendingToolCalls = undefined
+  pending.resolve({ action: "accept", calls })
+  editor.message("gptel: accepted tool calls")
+  return true
+}
+
 export function parseSseEvents(chunk: string): string[] {
   const events: string[] = []
   for (const event of chunk.split(/\n\n+/)) {
@@ -2640,6 +2720,7 @@ type ToolExecutionResult = {
   calls: GptelToolCall[]
   results: GptelMessage[]
   stop?: boolean
+  canceled?: boolean
 }
 
 function hasOwn(value: Record<string, unknown>, key: string): boolean {
@@ -2651,26 +2732,25 @@ async function confirmToolCalls(
   deps: GptelDeps,
   toolCalls: readonly GptelToolCall[],
   tools: ReadonlyMap<string, GptelTool>,
-): Promise<"accept" | "reject"> {
+): Promise<PendingToolCallDecision> {
   const setting = deps.getCustom<boolean | string>("gptel-confirm-tool-calls")
-  if (setting === false || setting === "false" || setting === "nil" || setting === "no") return "accept"
+  if (setting === false || setting === "false" || setting === "nil" || setting === "no") return { action: "accept", calls: [...toolCalls] }
   const callsNeedingConfirmation = setting === "auto"
     ? toolCalls.filter(call => call.confirm === true || (call.confirm == null && tools.get(call.name)?.confirm === true))
     : toolCalls.filter(call => call.confirm === true || (call.confirm == null && tools.get(call.name)?.confirm !== false))
-  if (!callsNeedingConfirmation.length) return "accept"
+  if (!callsNeedingConfirmation.length) return { action: "accept", calls: [...toolCalls] }
   const names = callsNeedingConfirmation.map(call => call.name).join(", ")
   const st = state(editor)
-  const commandDecision = new Promise<"accept" | "reject">(resolve => {
+  const commandDecision = new Promise<PendingToolCallDecision>(resolve => {
     st.pendingToolCalls = { bufferId: editor.currentBuffer.id, calls: [...toolCalls], resolve }
   })
-  const promptDecision = (async (): Promise<"accept" | "reject"> => {
+  const promptDecision = (async (): Promise<PendingToolCallDecision> => {
     for (;;) {
-      const answer = (await editor.prompt(`Run gptel tool call${callsNeedingConfirmation.length > 1 ? "s" : ""} (${names})? y, n, or i: `, "n", "gptel-tool-confirm"))?.trim().toLowerCase()
-      if (answer === "y" || answer === "yes") return "accept"
+      const answer = (await editor.prompt(`Run gptel tool call${callsNeedingConfirmation.length > 1 ? "s" : ""} (${names})? y, n, k, or i: `, "n", "gptel-tool-confirm"))?.trim().toLowerCase()
+      if (answer === "y" || answer === "yes") return { action: "accept", calls: [...toolCalls] }
+      if (answer === "k" || answer === "cancel") return "cancel"
       if (answer === "i" || answer === "inspect") {
-        const buffer = editor.scratch("*gptel tool calls*", `${gptelToolCallSummary(toolCalls)}\n`, "gptel-inspect")
-        buffer.readOnly = true
-        editor.switchToBuffer(buffer.id)
+        inspectToolCalls(editor)
         continue
       }
       return "reject"
@@ -2681,15 +2761,15 @@ async function confirmToolCalls(
   return decision
 }
 
-function decidePendingToolCalls(editor: Editor, decision: "accept" | "reject"): boolean {
+function decidePendingToolCalls(editor: Editor, decision: "accept" | "reject" | "cancel"): boolean {
   const pending = state(editor).pendingToolCalls
   if (!pending) {
     editor.message("gptel: no pending tool calls")
     return false
   }
   state(editor).pendingToolCalls = undefined
-  pending.resolve(decision)
-  editor.message(decision === "accept" ? "gptel: accepted tool calls" : "gptel: rejected tool calls")
+  pending.resolve(decision === "accept" ? { action: "accept", calls: [...pending.calls] } : decision)
+  editor.message(decision === "accept" ? "gptel: accepted tool calls" : decision === "reject" ? "gptel: rejected tool calls" : "gptel: canceled tool calls")
   return true
 }
 
@@ -2798,6 +2878,7 @@ async function executeToolCalls(
     executable.push({ call, tool })
   }
   const confirmed = await confirmToolCalls(editor, deps, executable.map(item => item.call), st.tools)
+  if (confirmed === "cancel") return { calls: resultCalls, results, stop: true, canceled: true }
   if (confirmed === "reject") {
     for (const { call, tool } of executable) {
       const post = await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, makeToolResult(call, "Tool call declined by user"), tool)
@@ -2807,7 +2888,10 @@ async function executeToolCalls(
     }
     return { calls: resultCalls, results }
   }
-  for (const { call, tool } of executable) {
+  const acceptedCalls = confirmed.calls
+    .map(call => ({ call, tool: st.tools.get(call.name) }))
+    .filter((item): item is { call: GptelToolCall; tool: GptelTool } => Boolean(item.tool))
+  for (const { call, tool } of acceptedCalls) {
     try {
       editor.message(`gptel tool: ${call.name}`)
       const value = await callGptelTool(tool, call.arguments, { editor, buffer })
@@ -2871,15 +2955,16 @@ async function requestWithTools(
     if (result.text) finalText = result.text
     const calls = result.toolCalls ?? []
     if (!calls.length || !tools.length) return { ...result, text: finalText }
-    conversation = [
-      ...conversation,
-      { role: "assistant", content: result.text, toolCalls: calls },
-    ]
     gptelFsmTransition(options.fsm, "TOOL", calls.map(call => call.name).join(", "))
     const toolExecution = await executeToolCalls(editor, deps, buffer, calls, backend, model)
     if (!toolExecution) return { ...result, text: finalText }
+    conversation = [
+      ...conversation,
+      { role: "assistant", content: result.text, toolCalls: toolExecution.calls },
+    ]
     options.onToolResults?.(toolExecution.calls, toolExecution.results, state(editor).tools)
     conversation.push(...toolExecution.results)
+    if (toolExecution.canceled) return { ...result, text: finalText, canceled: true }
     if (toolExecution.stop) return { ...result, text: finalText }
     if (round === 0 && options.onDelta && result.text) options.onDelta("\n")
   }
@@ -3057,6 +3142,12 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
         void editor.runHook("gptel-post-stream-hook", buffer)
       },
     })
+    if (result.canceled) {
+      replaceWritable(buffer, insertionStart, buffer.text.length, "")
+      gptelFsmTransition(fsm, "ERRS", "tool calls canceled")
+      editor.message("gptel: canceled tool calls")
+      return
+    }
     const insertedResponse = buffer.text.slice(responseStart)
     if (result.text && !insertedResponse.includes(result.text)) appendWritable(buffer, result.text)
     let finalResponse = await applyResponseFilters(editor, buffer, backend, model, buffer.text.slice(responseStart))
@@ -3528,6 +3619,26 @@ function gptelRewriteDiff(editor: Editor, buffer: BufferModel, rewrite = gptelRe
   editor.switchToBuffer(diffBuffer.id)
 }
 
+function gptelEdiff(editor: Editor, deps: GptelDeps, buffer: BufferModel, arg?: string): void {
+  const history = historyForVariantCommand(editor, deps, buffer)
+  if (!history || history.variants.length < 2) {
+    editor.message("gptel response is additive: no changes to ediff")
+    return
+  }
+  const current = buffer.text.slice(history.start, history.end)
+  const prior = history.variants.filter((variant, index) => index !== history.variantIndex)
+  const requested = arg == null ? 1 : Math.max(1, Math.abs(Number(arg) || 1))
+  const previous = prior[requested - 1] ?? prior[0]
+  if (previous == null) {
+    editor.message("gptel response is additive: no changes to ediff")
+    return
+  }
+  const diff = unifiedDiff(previous, current, `${editor.bufferDisplayName(buffer)}<previous>`, `${editor.bufferDisplayName(buffer)}<current>`)
+  const diffBuffer = editor.scratch("*gptel-ediff*", diff, "diff-mode")
+  diffBuffer.locals.set("gptel-response-history", { bufferId: history.bufferId, start: history.start, end: history.end })
+  editor.switchToBuffer(diffBuffer.id)
+}
+
 function stripModeSuffix(mode: string): string {
   return mode.replace(/-mode$/, "")
 }
@@ -3814,6 +3925,11 @@ function installModes(deps: GptelDeps): void {
   queryMap.bind("C-c C-w", "gptel-copy-curl")
   queryMap.bind("C-c C-k", "quit-window")
   deps.defineMinorMode({ name: GPTEL_QUERY_MINOR_MODE, lighter: " GPTelQuery", keymap: queryMap })
+
+  const inspectToolMap = new deps.Keymap("gptel-tool-call-inspection-map")
+  inspectToolMap.bind("C-c C-c", "gptel--inspect-accept-tool-calls")
+  inspectToolMap.bind("C-c C-k", "gptel--inspect-reject-tool-calls")
+  deps.defineMinorMode({ name: GPTEL_TOOL_CALL_INSPECT_MODE, lighter: " GPTelToolInspect", keymap: inspectToolMap })
 
   const minorMap = new deps.Keymap("gptel-mode-map")
   minorMap.bind("C-c RET", "gptel-send")
@@ -4859,6 +4975,35 @@ export async function install(editor: Editor): Promise<void> {
     decidePendingToolCalls(editor, "reject")
   }, "Reject pending gptel tool calls.")
 
+  editor.command("gptel-cancel-tool-calls", ({ editor }) => {
+    decidePendingToolCalls(editor, "cancel")
+  }, "Cancel pending gptel tool calls without continuing the request.")
+
+  editor.command("gptel-inspect-tool-calls", ({ editor }) => {
+    inspectToolCalls(editor)
+  }, "Inspect or edit pending gptel tool calls.")
+
+  editor.command("gptel--inspect-tool-calls", ({ editor }) => {
+    inspectToolCalls(editor)
+  }, "Inspect or edit pending gptel tool calls.")
+
+  editor.command("gptel--dispatch-tool-calls", ({ editor, args }) => {
+    const choice = String(args[0] ?? "").trim().toLowerCase()
+    if (choice === "y" || choice === "yes") decidePendingToolCalls(editor, "accept")
+    else if (choice === "k" || choice === "cancel") decidePendingToolCalls(editor, "cancel")
+    else if (choice === "i" || choice === "inspect") inspectToolCalls(editor)
+    else if (choice === "n" || choice === "no" || choice === "reject" || choice === "decline") decidePendingToolCalls(editor, "reject")
+    else editor.message("gptel: choose y, n, k, or i")
+  }, "Dispatch pending gptel tool calls.")
+
+  editor.command("gptel--inspect-accept-tool-calls", ({ editor, buffer }) => {
+    acceptInspectedToolCalls(editor, buffer)
+  }, "Accept pending gptel tool calls from an inspection buffer.")
+
+  editor.command("gptel--inspect-reject-tool-calls", ({ editor }) => {
+    decidePendingToolCalls(editor, "reject")
+  }, "Reject pending gptel tool calls from an inspection buffer.")
+
   editor.command("gptel-add", async ({ editor, buffer, prefixArgument }) => {
     const region = activeRegionText(buffer)
     if (prefixArgument != null && prefixArgument < 0) {
@@ -5137,6 +5282,14 @@ export async function install(editor: Editor): Promise<void> {
     const count = Number(args[0] ?? 1) || 1
     switchResponseVariant(editor, deps, buffer, -count)
   }, "Switch the last gptel response to the next variant.")
+
+  editor.command("gptel-ediff", ({ editor, buffer, args, prefixArgument }) => {
+    gptelEdiff(editor, deps, buffer, args[0] ?? (prefixArgument != null ? String(prefixArgument) : undefined))
+  }, "Show a unified diff between the response at point and a previous variant.")
+
+  editor.command("gptel--ediff", ({ editor, buffer, args, prefixArgument }) => {
+    gptelEdiff(editor, deps, buffer, args[0] ?? (prefixArgument != null ? String(prefixArgument) : undefined))
+  }, "Show a unified diff between the response at point and a previous variant.")
 
   editor.command("gptel-beginning-of-response", ({ editor, buffer, args }) => {
     const count = Math.abs(Number(args[0] ?? 1) || 1)

@@ -568,6 +568,35 @@ test("Batch 4: variant commands use the response at point with numeric movement"
   expect(buffer.text.slice(nextRanges[1]!.start, nextRanges[1]!.end)).toBe("second")
 })
 
+test("Batch 9: gptel ediff renders unified diff for response variants", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const text = "User:\none\n\nAssistant:\ncurrent response"
+  const buffer = editor.scratch("*ChatGPT-ediff*", text, "gptel-chat")
+  editor.switchToBuffer(buffer.id)
+  const range = responseRanges(buffer)[0]!
+  const state = editor.locals.get("gptel-state") as {
+    responseHistories: Array<{ bufferId: string; start: number; end: number; variants: string[]; variantIndex: number }>
+  }
+  state.responseHistories.push({
+    bufferId: buffer.id,
+    start: range.start,
+    end: range.end,
+    variants: ["current response", "previous response"],
+    variantIndex: 0,
+  })
+  buffer.point = range.start + 1
+
+  await editor.run("gptel-ediff")
+
+  expect(editor.currentBuffer.name).toBe("*gptel-ediff*")
+  expect(["diff-mode", "text"]).toContain(editor.currentBuffer.mode)
+  expect(editor.currentBuffer.text).toContain("--- *ChatGPT-ediff*<previous>")
+  expect(editor.currentBuffer.text).toContain("+++ *ChatGPT-ediff*<current>")
+  expect(editor.currentBuffer.text).toContain("-previous response")
+  expect(editor.currentBuffer.text).toContain("+current response")
+})
+
 test("gptel prompt transforms, response filters, and post-response functions run", async () => {
   const editor = new Editor()
   await install(editor)
@@ -1383,6 +1412,129 @@ test("gptel accept and reject commands resolve parked tool calls", async () => {
     setCustom("gptel-include-tool-results", "auto")
     setCustom("gptel-confirm-tool-calls", true)
     setCustom("gptel-stream", true)
+  }
+})
+
+test("Batch 9: gptel inspect tool calls accepts edited arguments", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const saved = new Map(["gptel-backend", "gptel-model", "gptel-tools", "gptel-use-tools", "gptel-include-tool-results", "gptel-confirm-tool-calls", "gptel-stream"].map(name => [name, getCustom(name)]))
+  const originalFetch = globalThis.fetch
+  const executed: string[] = []
+  try {
+    gptelMakeOpenAI(editor, "InspectTools", { endpoint: "http://inspect-tools.test/v1/chat/completions", models: ["tool-model"], defaultModel: "tool-model", stream: false })
+    gptelMakeTool(editor, {
+      name: "lookup",
+      description: "Lookup a value.",
+      confirm: true,
+      include: true,
+      parameters: { type: "object", properties: { q: { type: "string" } } },
+      function: args => {
+        executed.push((args as { q?: string }).q ?? "")
+        return `result:${(args as { q?: string }).q ?? ""}`
+      },
+    })
+    setCustom("gptel-backend", "InspectTools")
+    setCustom("gptel-model", "tool-model")
+    setCustom("gptel-tools", "lookup")
+    setCustom("gptel-use-tools", true)
+    setCustom("gptel-include-tool-results", "auto")
+    setCustom("gptel-confirm-tool-calls", true)
+    setCustom("gptel-stream", false)
+    editor.prompt = (async (..._args: Parameters<typeof editor.prompt>) => await new Promise<string>(() => {})) as typeof editor.prompt
+    const bodies: any[] = []
+    let callCount = 0
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")))
+      callCount += 1
+      if (callCount === 1) {
+        return new Response(JSON.stringify({
+          choices: [{
+            message: {
+              content: "",
+              tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{\"q\":\"original\"}" } }],
+            },
+          }],
+        }), { status: 200, headers: { "content-type": "application/json" } })
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200, headers: { "content-type": "application/json" } })
+    }) as typeof fetch
+
+    const buffer = editor.scratch("*ChatGPT-inspect-tools*", "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    const send = editor.run("gptel-send")
+    for (let i = 0; i < 20; i += 1) {
+      if ((editor.locals.get("gptel-state") as { pendingToolCalls?: unknown }).pendingToolCalls) break
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    await editor.run("gptel-inspect-tool-calls")
+    const inspect = editor.currentBuffer
+    inspect.replaceRange(0, inspect.text.length, JSON.stringify([{ id: "call_1", name: "lookup", args: { q: "edited" } }], null, 2))
+    await editor.run("gptel--inspect-accept-tool-calls")
+    await send
+
+    expect(executed).toEqual(["edited"])
+    expect(JSON.stringify(bodies[1].messages)).toContain("edited")
+    expect(buffer.text).toContain("result:edited")
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const [name, value] of saved) setCustom(name, value)
+  }
+})
+
+test("Batch 9: cancel tool calls aborts without declined continuation", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const saved = new Map(["gptel-backend", "gptel-model", "gptel-tools", "gptel-use-tools", "gptel-include-tool-results", "gptel-confirm-tool-calls", "gptel-stream"].map(name => [name, getCustom(name)]))
+  const originalFetch = globalThis.fetch
+  try {
+    gptelMakeOpenAI(editor, "CancelTools", { endpoint: "http://cancel-tools.test/v1/chat/completions", models: ["tool-model"], defaultModel: "tool-model", stream: false })
+    gptelMakeTool(editor, {
+      name: "lookup",
+      description: "Lookup a value.",
+      confirm: true,
+      include: true,
+      parameters: { type: "object", properties: { q: { type: "string" } } },
+      function: () => "should-not-run",
+    })
+    setCustom("gptel-backend", "CancelTools")
+    setCustom("gptel-model", "tool-model")
+    setCustom("gptel-tools", "lookup")
+    setCustom("gptel-use-tools", true)
+    setCustom("gptel-include-tool-results", "auto")
+    setCustom("gptel-confirm-tool-calls", true)
+    setCustom("gptel-stream", false)
+    editor.prompt = (async (..._args: Parameters<typeof editor.prompt>) => await new Promise<string>(() => {})) as typeof editor.prompt
+    const bodies: any[] = []
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")))
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: "",
+            tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{\"q\":\"cancel\"}" } }],
+          },
+        }],
+      }), { status: 200, headers: { "content-type": "application/json" } })
+    }) as typeof fetch
+
+    const buffer = editor.scratch("*ChatGPT-cancel-tools*", "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    const send = editor.run("gptel-send")
+    for (let i = 0; i < 20; i += 1) {
+      if ((editor.locals.get("gptel-state") as { pendingToolCalls?: unknown }).pendingToolCalls) break
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    await editor.run("gptel-cancel-tool-calls")
+    await send
+
+    expect(bodies).toHaveLength(1)
+    expect(buffer.text).not.toContain("Tool call declined by user")
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const [name, value] of saved) setCustom(name, value)
   }
 })
 
