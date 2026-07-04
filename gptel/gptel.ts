@@ -12,6 +12,7 @@ type GptelDeps = {
   defcustom: typeof import("../../jemacs-opentui/src/runtime/custom").defcustom
   getCustom: typeof import("../../jemacs-opentui/src/runtime/custom").getCustom
   setCustom: typeof import("../../jemacs-opentui/src/runtime/custom").setCustom
+  getCustomVariable: typeof import("../../jemacs-opentui/src/runtime/custom").getCustomVariable
   defface: typeof import("../../jemacs-opentui/src/runtime/faces").defface
   killNew: typeof import("../../jemacs-opentui/src/runtime/kill-ring").killNew
 }
@@ -66,9 +67,10 @@ export type GptelTool = {
   parameters?: unknown
   confirm?: boolean
   include?: boolean
+  async?: boolean
   category?: string
   sourceName?: string
-  function: (args: unknown, ctx: { editor: Editor; buffer: BufferModel }) => unknown | Promise<unknown>
+  function: (...args: any[]) => unknown | Promise<unknown> | void
 }
 
 export type GptelMcpToolSpec = {
@@ -77,6 +79,7 @@ export type GptelMcpToolSpec = {
   parameters?: unknown
   confirm?: boolean
   include?: boolean
+  async?: boolean
   function?: (args: unknown, ctx: { editor: Editor; buffer: BufferModel }) => unknown | Promise<unknown>
 }
 
@@ -92,6 +95,7 @@ export type GptelToolCall = {
   id: string
   name: string
   arguments: unknown
+  confirm?: boolean
 }
 
 export type GptelTokenUsage = {
@@ -107,20 +111,50 @@ export type GptelMediaPart = {
   base64: string
 }
 
+export type GptelPresetValueSpec<T = unknown> = T | {
+  append?: unknown
+  prepend?: unknown
+  remove?: unknown
+  merge?: Record<string, unknown>
+  eval?: (() => unknown) | unknown
+  function?: (current: unknown) => unknown
+}
+
 export type GptelPreset = {
   name: string
   description?: string
-  backend?: string
-  model?: string
-  system?: string
-  temperature?: number
-  schema?: unknown
-  tools?: string[]
+  parents?: string | string[] | GptelPreset | GptelPreset[]
+  pre?: () => void | Promise<void>
+  post?: () => void | Promise<void>
+  backend?: GptelPresetValueSpec<string | GptelBackend>
+  model?: GptelPresetValueSpec<string>
+  system?: GptelPresetValueSpec<string>
+  "system-prompt"?: GptelPresetValueSpec<string>
+  "system-message"?: GptelPresetValueSpec<string>
+  stream?: GptelPresetValueSpec<boolean>
+  temperature?: GptelPresetValueSpec<number | null>
+  "max-tokens"?: GptelPresetValueSpec<number | null>
+  maxTokens?: GptelPresetValueSpec<number | null>
+  "use-context"?: GptelPresetValueSpec<string | boolean>
+  useContext?: GptelPresetValueSpec<string | boolean>
+  "track-media"?: GptelPresetValueSpec<boolean>
+  trackMedia?: GptelPresetValueSpec<boolean>
+  "include-reasoning"?: GptelPresetValueSpec<string | boolean>
+  includeReasoning?: GptelPresetValueSpec<string | boolean>
+  "use-tools"?: GptelPresetValueSpec<boolean>
+  useTools?: GptelPresetValueSpec<boolean>
+  tools?: GptelPresetValueSpec<string | string[] | GptelTool[]>
+  "confirm-tool-calls"?: GptelPresetValueSpec<boolean | string>
+  confirmToolCalls?: GptelPresetValueSpec<boolean | string>
+  schema?: GptelPresetValueSpec<unknown>
+  "rewrite-directive"?: GptelPresetValueSpec<string>
+  rewriteDirective?: GptelPresetValueSpec<string>
+  [key: string]: unknown
 }
 
 export type GptelDirective = {
   name: string
-  prompt: string
+  prompt: string | (() => string)
 }
 
 export type GptelRequestContext = {
@@ -133,15 +167,43 @@ export type GptelRequestContext = {
 export type GptelPromptTransform = (prompt: string, ctx: GptelRequestContext) => string | Promise<string>
 export type GptelResponseFilter = (response: string, ctx: GptelRequestContext) => string | Promise<string>
 export type GptelPostResponseFunction = (start: number, end: number, ctx: GptelRequestContext) => void | Promise<void>
-export type GptelPreToolCallFunction = (call: GptelToolCall, tool: GptelTool | undefined, ctx: GptelRequestContext) => GptelToolCall | false | void | Promise<GptelToolCall | false | void>
-export type GptelPostToolCallFunction = (call: GptelToolCall, result: GptelMessage, tool: GptelTool | undefined, ctx: GptelRequestContext) => GptelMessage | void | Promise<GptelMessage | void>
+export type GptelPreToolCallResult = GptelToolCall | false | true | void | {
+  name?: string
+  args?: unknown
+  arguments?: unknown
+  confirm?: boolean
+  block?: boolean | string
+  stop?: boolean
+  result?: unknown
+}
+export type GptelPostToolCallResult = GptelMessage | void | {
+  result?: unknown
+  block?: boolean | string
+  stop?: boolean
+}
+export type GptelPreToolCallFunction = (call: GptelToolCall, tool: GptelTool | undefined, ctx: GptelRequestContext) => GptelPreToolCallResult | Promise<GptelPreToolCallResult>
+export type GptelPostToolCallFunction = (call: GptelToolCall, result: GptelMessage, tool: GptelTool | undefined, ctx: GptelRequestContext) => GptelPostToolCallResult | Promise<GptelPostToolCallResult>
+
+type PendingToolCallState = {
+  bufferId: string
+  calls: GptelToolCall[]
+  resolve: (decision: "accept" | "reject") => void
+}
+
+type GptelResponseHistory = {
+  bufferId: string
+  start: number
+  end: number
+  variants: string[]
+  variantIndex: number
+}
 
 type GptelState = {
   backends: Map<string, GptelBackend>
   tools: Map<string, GptelTool>
   mcpServers: Map<string, GptelMcpServer>
   presets: Map<string, GptelPreset>
-  directives: Map<string, string>
+  directives: Map<string, string | (() => string)>
   promptTransforms: GptelPromptTransform[]
   responseFilters: GptelResponseFilter[]
   postResponseFunctions: GptelPostResponseFunction[]
@@ -149,7 +211,9 @@ type GptelState = {
   postToolCallFunctions: GptelPostToolCallFunction[]
   context: GptelContextItem[]
   activeRequests: Map<string, AbortController>
+  pendingToolCalls?: PendingToolCallState
   tokenUsage: GptelTokenUsage
+  responseHistories: GptelResponseHistory[]
   lastRequest?: {
     bufferId: string
     prompt: string
@@ -212,10 +276,17 @@ type GptelSavedState = {
   tools?: string
   temperature?: number
   maxTokens?: number
+  numMessagesToSend?: number | null
   useContext?: string | boolean
   includeReasoning?: string | boolean
   schema?: string
   responseRanges?: Array<{ start: number; end: number }>
+  responseHistories?: Array<{
+    start: number
+    end: number
+    variants: string[]
+    variantIndex: number
+  }>
   lastRequest?: {
     responseStart: number
     responseEnd: number
@@ -231,6 +302,8 @@ type OrgHeading = {
   title: string
   contentStart: number
 }
+
+type GptelPrefixAlist = Record<string, string> | Array<[string, string]> | string
 
 export type GptelChatMarkers = {
   promptPrefix: string
@@ -259,6 +332,7 @@ async function loadDeps(): Promise<GptelDeps> {
     defcustom: custom.defcustom,
     getCustom: custom.getCustom,
     setCustom: custom.setCustom,
+    getCustomVariable: custom.getCustomVariable,
     defface: faces.defface,
     killNew: killRing.killNew,
   }
@@ -383,6 +457,7 @@ function state(editor: Editor): GptelState {
     context: [],
     activeRequests: new Map(),
     tokenUsage: {},
+    responseHistories: [],
   }
   editor.locals.set(STATE_KEY, next)
   return next
@@ -406,15 +481,19 @@ function currentModel(editor: Editor, deps: GptelDeps, backend?: GptelBackend): 
 
 function customString(deps: Pick<GptelDeps, "getCustom">, ...names: string[]): string {
   for (const name of names) {
-    const value = deps.getCustom<string>(name)
-    if (value) return value
+    const value = deps.getCustom<string | (() => string)>(name)
+    const resolved = typeof value === "function" ? value() : value
+    if (resolved) return resolved
   }
   return ""
 }
 
 function systemMessage(deps: Pick<GptelDeps, "getCustom">): string {
-  const prompt = deps.getCustom<string>("gptel-system-prompt")
-  const message = deps.getCustom<string>("gptel-system-message")
+  const promptValue = deps.getCustom<string | null | (() => string | null)>("gptel-system-prompt")
+  if (promptValue === null) return ""
+  const prompt = typeof promptValue === "function" ? promptValue() ?? "" : promptValue
+  const messageValue = deps.getCustom<string | null | (() => string | null)>("gptel-system-message")
+  const message = typeof messageValue === "function" ? messageValue() ?? "" : messageValue
   if (prompt && prompt !== DEFAULT_SYSTEM_MESSAGE && (!message || message === DEFAULT_SYSTEM_MESSAGE)) return prompt
   return message || prompt || DEFAULT_SYSTEM_MESSAGE
 }
@@ -513,11 +592,45 @@ function defaultChatMarkers(): GptelChatMarkers {
   return { promptPrefix: "User:\n", responsePrefix: "Assistant:\n", separator: "\n\n" }
 }
 
-function chatMarkers(deps: GptelDeps): GptelChatMarkers {
+function defaultPromptPrefixAlist(): Record<string, string> {
+  return { "markdown-mode": "### ", markdown: "### ", "org-mode": "*** ", "text-mode": "### ", text: "### " }
+}
+
+function defaultResponsePrefixAlist(): Record<string, string> {
+  return { "markdown-mode": "", markdown: "", "org-mode": "", "text-mode": "", text: "" }
+}
+
+function normalizePrefixAlist(value: GptelPrefixAlist | undefined, fallback: Record<string, string>): Record<string, string> {
+  if (!value) return fallback
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown
+      return normalizePrefixAlist(parsed as GptelPrefixAlist, fallback)
+    } catch {
+      return fallback
+    }
+  }
+  if (Array.isArray(value)) return { ...fallback, ...Object.fromEntries(value.filter(entry => typeof entry[0] === "string" && typeof entry[1] === "string")) }
+  return { ...fallback, ...Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string")) }
+}
+
+function modePrefix(deps: Pick<GptelDeps, "getCustom">, name: "gptel-prompt-prefix-alist" | "gptel-response-prefix-alist", mode: string, fallback: Record<string, string>): string {
+  const alist = normalizePrefixAlist(deps.getCustom<GptelPrefixAlist>(name), fallback)
+  const key = mode === GPTEL_CHAT_MODE ? "markdown" : mode
+  return alist[key] ?? alist[key.replace(/-mode$/, "")] ?? ""
+}
+
+function chatMarkers(deps: GptelDeps, buffer?: BufferModel): GptelChatMarkers {
   const defaults = defaultChatMarkers()
+  const mode = buffer?.mode ?? String(deps.getCustom<string>("gptel-default-mode") ?? "markdown")
+  if (mode === GPTEL_CHAT_MODE
+    && deps.getCustom<string | null>("gptel-prompt-prefix") == null
+    && deps.getCustom<string | null>("gptel-response-prefix") == null) {
+    return { ...defaults, separator: deps.getCustom<string>("gptel-response-separator") ?? defaults.separator }
+  }
   return {
-    promptPrefix: deps.getCustom<string>("gptel-prompt-prefix") ?? defaults.promptPrefix,
-    responsePrefix: deps.getCustom<string>("gptel-response-prefix") ?? defaults.responsePrefix,
+    promptPrefix: deps.getCustom<string | null>("gptel-prompt-prefix") ?? modePrefix(deps, "gptel-prompt-prefix-alist", mode, defaultPromptPrefixAlist()),
+    responsePrefix: deps.getCustom<string | null>("gptel-response-prefix") ?? modePrefix(deps, "gptel-response-prefix-alist", mode, defaultResponsePrefixAlist()),
     separator: deps.getCustom<string>("gptel-response-separator") ?? defaults.separator,
   }
 }
@@ -630,17 +743,87 @@ export function responseRanges(buffer: BufferModel, markers: GptelChatMarkers = 
   if (!responseMarkers.length) return ranges
   const nextMarkers = markerAlternatives(markers).map(escapeRegExp).join("|")
   const regex = new RegExp(`(?:${responseMarkers.join("|")})([\\s\\S]*?)(?=${nextMarkers}|$)`, "g")
+  const stateBlock = buffer.text.match(stateBlockRegex())
+  // The persisted gptel-state comment block is metadata, never response text.
+  const limit = stateBlock?.index != null
+    ? buffer.text.slice(0, stateBlock.index).replace(/\s+$/, "").length
+    : buffer.text.length
   for (const match of buffer.text.matchAll(regex)) {
     const full = match[0] ?? ""
     const body = match[1] ?? ""
     const end = (match.index ?? 0) + full.length
-    ranges.push({ start: end - body.length, end })
+    const start = end - body.length
+    if (start >= limit) continue
+    ranges.push({ start, end: Math.min(end, limit) })
   }
   return ranges
 }
 
 function responseRangeAtPoint(buffer: BufferModel, markers: GptelChatMarkers): { start: number; end: number } | null {
   return responseRanges(buffer, markers).find(range => buffer.point >= range.start && buffer.point <= range.end) ?? null
+}
+
+function responseHistoryText(buffer: BufferModel, history: GptelResponseHistory): string {
+  return buffer.text.slice(history.start, history.end)
+}
+
+function normalizeResponseHistory(buffer: BufferModel, history: GptelResponseHistory): GptelResponseHistory {
+  const current = responseHistoryText(buffer, history)
+  const variants = [current, ...history.variants.filter(variant => variant !== current)]
+  const variantIndex = Math.max(0, variants.indexOf(history.variants[history.variantIndex] ?? current))
+  return { ...history, variants, variantIndex: variantIndex < 0 ? 0 : variantIndex }
+}
+
+function reconcileResponseHistories(editor: Editor, deps: GptelDeps, buffer: BufferModel): GptelResponseHistory[] {
+  const st = state(editor)
+  const ranges = responseRanges(buffer, chatMarkers(deps, buffer))
+  const existing = st.responseHistories.filter(history => history.bufferId === buffer.id)
+  const byExact = new Map(existing.map(history => [`${history.start}:${history.end}`, history]))
+  const used = new Set<GptelResponseHistory>()
+  const reconciled: GptelResponseHistory[] = []
+  for (const range of ranges) {
+    let history = byExact.get(`${range.start}:${range.end}`)
+    if (!history) {
+      history = existing.find(candidate =>
+        !used.has(candidate)
+        && candidate.start <= range.end
+        && candidate.end >= range.start
+        && buffer.text.slice(range.start, range.end) === candidate.variants[candidate.variantIndex])
+    }
+    if (history) {
+      used.add(history)
+      reconciled.push(normalizeResponseHistory(buffer, { ...history, start: range.start, end: range.end }))
+    }
+  }
+  st.responseHistories = [
+    ...st.responseHistories.filter(history => history.bufferId !== buffer.id),
+    ...reconciled,
+  ]
+  return reconciled
+}
+
+function upsertResponseHistory(editor: Editor, buffer: BufferModel, history: GptelResponseHistory): GptelResponseHistory {
+  const st = state(editor)
+  const normalized = normalizeResponseHistory(buffer, history)
+  const index = st.responseHistories.findIndex(item =>
+    item.bufferId === buffer.id && item.start === history.start && item.end === history.end)
+  if (index >= 0) st.responseHistories[index] = normalized
+  else st.responseHistories.push(normalized)
+  return normalized
+}
+
+function responseHistoryAtPoint(editor: Editor, deps: GptelDeps, buffer: BufferModel): GptelResponseHistory | null {
+  const range = responseRangeAtPoint(buffer, chatMarkers(deps, buffer))
+  if (!range) return null
+  const histories = reconcileResponseHistories(editor, deps, buffer)
+  return histories.find(history => history.start === range.start && history.end === range.end)
+    ?? upsertResponseHistory(editor, buffer, {
+      bufferId: buffer.id,
+      start: range.start,
+      end: range.end,
+      variants: [buffer.text.slice(range.start, range.end)],
+      variantIndex: 0,
+    })
 }
 
 function stateBlockRegex(): RegExp {
@@ -663,17 +846,34 @@ function parseSavedState(buffer: BufferModel): GptelSavedState | null {
 
 function savedStatePayload(editor: Editor, deps: GptelDeps, buffer: BufferModel): GptelSavedState {
   const last = state(editor).lastRequest
+  if (last?.bufferId === buffer.id) {
+    upsertResponseHistory(editor, buffer, {
+      bufferId: buffer.id,
+      start: last.responseStart,
+      end: last.responseEnd,
+      variants: last.variants,
+      variantIndex: last.variantIndex,
+    })
+  }
+  const histories = reconcileResponseHistories(editor, deps, buffer)
   return {
     backend: deps.getCustom<string>("gptel-backend"),
     model: deps.getCustom<string>("gptel-model"),
     system: systemMessage(deps),
     tools: deps.getCustom<string>("gptel-tools"),
-    temperature: deps.getCustom<number>("gptel-temperature"),
-    maxTokens: deps.getCustom<number>("gptel-max-tokens"),
+    temperature: deps.getCustom<number | null>("gptel-temperature") ?? undefined,
+    maxTokens: deps.getCustom<number | null>("gptel-max-tokens") ?? undefined,
+    numMessagesToSend: deps.getCustom<number | null>("gptel-num-messages-to-send") ?? null,
     useContext: deps.getCustom<string | boolean>("gptel-use-context"),
     includeReasoning: deps.getCustom<string | boolean>("gptel-include-reasoning"),
     schema: deps.getCustom<string>("gptel-schema"),
-    responseRanges: responseRanges(buffer, chatMarkers(deps)),
+    responseRanges: responseRanges(buffer, chatMarkers(deps, buffer)),
+    responseHistories: histories.map(history => ({
+      start: history.start,
+      end: history.end,
+      variants: history.variants,
+      variantIndex: history.variantIndex,
+    })),
     lastRequest: last?.bufferId === buffer.id ? {
       responseStart: last.responseStart,
       responseEnd: last.responseEnd,
@@ -683,7 +883,8 @@ function savedStatePayload(editor: Editor, deps: GptelDeps, buffer: BufferModel)
   }
 }
 
-function saveGptelState(editor: Editor, deps: GptelDeps, buffer: BufferModel): void {
+async function saveGptelState(editor: Editor, deps: GptelDeps, buffer: BufferModel): Promise<void> {
+  await editor.runHook("gptel-save-state-hook", buffer)
   const block = `${STATE_BLOCK_START}\n${JSON.stringify(savedStatePayload(editor, deps, buffer), null, 2)}\n${STATE_BLOCK_END}\n`
   const match = buffer.text.match(stateBlockRegex())
   if (match?.index != null) replaceWritable(buffer, match.index, match.index + match[0].length, block)
@@ -700,6 +901,7 @@ function restoreGptelState(editor: Editor, deps: GptelDeps, buffer: BufferModel)
   if (saved.tools != null) deps.setCustom("gptel-tools", saved.tools)
   if (typeof saved.temperature === "number") deps.setCustom("gptel-temperature", saved.temperature)
   if (typeof saved.maxTokens === "number") deps.setCustom("gptel-max-tokens", saved.maxTokens)
+  if (saved.numMessagesToSend !== undefined) deps.setCustom("gptel-num-messages-to-send", saved.numMessagesToSend)
   if (saved.useContext != null) deps.setCustom("gptel-use-context", saved.useContext)
   if (saved.includeReasoning != null) deps.setCustom("gptel-include-reasoning", saved.includeReasoning)
   if (saved.schema != null) deps.setCustom("gptel-schema", saved.schema)
@@ -717,6 +919,30 @@ function restoreGptelState(editor: Editor, deps: GptelDeps, buffer: BufferModel)
       variants: saved.lastRequest.variants,
       variantIndex: saved.lastRequest.variantIndex,
     }
+  }
+  const restoredHistories = (saved.responseHistories ?? [])
+    .filter(history => Number.isFinite(history.start) && Number.isFinite(history.end) && Array.isArray(history.variants))
+    .map(history => normalizeResponseHistory(buffer, {
+      bufferId: buffer.id,
+      start: history.start,
+      end: history.end,
+      variants: history.variants,
+      variantIndex: history.variantIndex,
+    }))
+  if (restoredHistories.length) {
+    const st = state(editor)
+    st.responseHistories = [
+      ...st.responseHistories.filter(history => history.bufferId !== buffer.id),
+      ...restoredHistories,
+    ]
+  } else if (saved.lastRequest) {
+    upsertResponseHistory(editor, buffer, {
+      bufferId: buffer.id,
+      start: saved.lastRequest.responseStart,
+      end: saved.lastRequest.responseEnd,
+      variants: saved.lastRequest.variants,
+      variantIndex: saved.lastRequest.variantIndex,
+    })
   }
   buffer.locals.set(STATE_RESTORED, true)
   return true
@@ -861,12 +1087,14 @@ function orgScopedPromptForDeps(deps: GptelDeps, buffer: BufferModel, prompt: st
   return stripOrgPromptMetadata(prompt)
 }
 
-function saveOrgGptelProperties(deps: GptelDeps, buffer: BufferModel): boolean {
+async function saveOrgGptelProperties(editor: Editor, deps: GptelDeps, buffer: BufferModel): Promise<boolean> {
   if (buffer.mode !== "org-mode") return false
+  await editor.runHook("gptel-save-state-hook", buffer)
   const heading = orgHeadingAt(buffer, buffer.point) ?? orgHeadings(buffer)[0]
   if (!heading) return false
   const existing = orgPropertiesAt(buffer, heading)
   const existingTopic = existing.GPTEL_TOPIC ?? buffer.text.slice(heading.start, heading.end).match(/^:GPTEL_TOPIC:\s*(.*)$/m)?.[1]
+  const histories = reconcileResponseHistories(editor, deps, buffer)
   setOrgProperties(buffer, heading, {
     GPTEL_TOPIC: existingTopic,
     GPTEL_SYSTEM: systemMessage(deps).replace(/\n/g, "\\n"),
@@ -875,13 +1103,21 @@ function saveOrgGptelProperties(deps: GptelDeps, buffer: BufferModel): boolean {
     GPTEL_TEMPERATURE: String(deps.getCustom<number>("gptel-temperature") ?? ""),
     GPTEL_MAX_TOKENS: String(deps.getCustom<number>("gptel-max-tokens") ?? ""),
     GPTEL_TOOLS: deps.getCustom<string>("gptel-tools"),
+    GPTEL_RESPONSE_HISTORY: histories.length
+      ? JSON.stringify(histories.map(history => ({
+        start: history.start,
+        end: history.end,
+        variants: history.variants,
+        variantIndex: history.variantIndex,
+      })))
+      : undefined,
     GPTEL_PRESET: undefined,
   })
   buffer.locals.set(STATE_RESTORED, true)
   return true
 }
 
-function restoreOrgGptelProperties(_editor: Editor, deps: GptelDeps, buffer: BufferModel): boolean {
+function restoreOrgGptelProperties(editor: Editor, deps: GptelDeps, buffer: BufferModel): boolean {
   if (buffer.mode !== "org-mode") return false
   const props = inheritedOrgProperties(buffer)
   if (!Object.keys(props).some(key => key.startsWith("GPTEL_"))) return false
@@ -891,6 +1127,28 @@ function restoreOrgGptelProperties(_editor: Editor, deps: GptelDeps, buffer: Buf
   if (props.GPTEL_TOOLS != null) deps.setCustom("gptel-tools", props.GPTEL_TOOLS)
   if (props.GPTEL_TEMPERATURE && Number.isFinite(Number(props.GPTEL_TEMPERATURE))) deps.setCustom("gptel-temperature", Number(props.GPTEL_TEMPERATURE))
   if (props.GPTEL_MAX_TOKENS && Number.isFinite(Number(props.GPTEL_MAX_TOKENS))) deps.setCustom("gptel-max-tokens", Number(props.GPTEL_MAX_TOKENS))
+  if (props.GPTEL_RESPONSE_HISTORY) {
+    try {
+      const histories = JSON.parse(props.GPTEL_RESPONSE_HISTORY) as Array<{ start: number; end: number; variants: string[]; variantIndex: number }>
+      if (Array.isArray(histories)) {
+        const st = state(editor)
+        st.responseHistories = [
+          ...st.responseHistories.filter(history => history.bufferId !== buffer.id),
+          ...histories
+            .filter(history => Number.isFinite(history.start) && Number.isFinite(history.end) && Array.isArray(history.variants))
+            .map(history => normalizeResponseHistory(buffer, {
+              bufferId: buffer.id,
+              start: history.start,
+              end: history.end,
+              variants: history.variants,
+              variantIndex: history.variantIndex,
+            })),
+        ]
+      }
+    } catch {
+      // Ignore stale or hand-edited Org property values.
+    }
+  }
   buffer.locals.set(STATE_RESTORED, true)
   return true
 }
@@ -994,8 +1252,10 @@ async function buildMessages(editor: Editor, deps: GptelDeps, buffer: BufferMode
     else messages.push({ role: "system", content: context })
   }
   const history = (buffer.mode === GPTEL_CHAT_MODE || buffer.minorModes.has(GPTEL_MODE)) ? chatHistory(buffer, markers) : []
+  const limit = deps.getCustom<number | null>("gptel-num-messages-to-send")
+  const priorHistory = typeof limit === "number" && limit >= 0 ? history.slice(0, -1).slice(-limit) : history.slice(0, -1)
   const includeReasoning = deps.getCustom<boolean | string>("gptel-include-reasoning")
-  messages.push(...history.slice(0, -1).map(message =>
+  messages.push(...priorHistory.map(message =>
     message.role === "assistant" && includeReasoning === "ignore"
       ? { ...message, content: stripReasoningBlocks(message.content) }
       : message
@@ -1020,6 +1280,11 @@ function replaceWritable(buffer: BufferModel, start: number, end: number, text: 
   buffer.readOnly = wasReadOnly
 }
 
+function appendReasoningToTarget(editor: Editor, targetName: string, reasoning: string): void {
+  const target = [...editor.buffers.values()].find(buffer => buffer.name === targetName) ?? editor.scratch(targetName, "", "markdown")
+  appendWritable(target, `${reasoning}${reasoning.endsWith("\n") ? "" : "\n"}`)
+}
+
 function selectedTools(editor: Editor, deps: GptelDeps): GptelTool[] {
   if (deps.getCustom<boolean | string>("gptel-use-tools") === false) return []
   const st = state(editor)
@@ -1035,7 +1300,9 @@ function includeToolResult(deps: GptelDeps, tool: GptelTool | undefined): boolea
   const setting = deps.getCustom<boolean | string>("gptel-include-tool-results") ?? "auto"
   if (setting === true || setting === "true") return true
   if (setting === false || setting === "false") return false
-  return tool?.include === true
+  const confirmSetting = deps.getCustom<boolean | string>("gptel-confirm-tool-calls")
+  const confirmed = confirmSetting === true || confirmSetting === "true" || confirmSetting === "t" || (confirmSetting === "auto" && tool?.confirm === true)
+  return tool?.include === true || (confirmed && tool?.confirm !== false)
 }
 
 function openAiTool(tool: GptelTool): unknown {
@@ -1325,7 +1592,12 @@ function cacheEnabled(deps: GptelDeps, part: "system" | "tool" | "message"): boo
 
 function reasoningBlock(reasoning: string, include: boolean | "ignore" | string): string {
   if (!reasoning || include === false) return ""
+  if (typeof include === "string" && include !== "ignore") return ""
   return `\`\`\` reasoning\n${reasoning.trim()}\n\`\`\`\n\n`
+}
+
+function reasoningBufferName(include: boolean | "ignore" | string): string | undefined {
+  return typeof include === "string" && include !== "ignore" ? include : undefined
 }
 
 function schemaName(): string {
@@ -1396,8 +1668,8 @@ function requestBody(
   stream: boolean,
   tools: GptelTool[] = [],
 ): unknown {
-  const temperature = deps.getCustom<number>("gptel-temperature")
-  const maxTokens = deps.getCustom<number>("gptel-max-tokens")
+  const temperature = deps.getCustom<number | null>("gptel-temperature")
+  const maxTokens = deps.getCustom<number | null>("gptel-max-tokens")
   const extra = requestParams(backend)
   const schema = currentSchema(deps)
   if (backend.kind === "anthropic") {
@@ -1408,8 +1680,8 @@ function requestBody(
     )
     return {
       model,
-      max_tokens: maxTokens || 4096,
-      temperature: temperature || undefined,
+      max_tokens: maxTokens ?? 4096,
+      temperature: temperature ?? undefined,
       stream,
       system: anthropicSystem(system, cacheEnabled(deps, "system")),
       messages: anthropicMessagesWithCache(anthropicMessages(messages), cacheEnabled(deps, "message")),
@@ -1423,8 +1695,8 @@ function requestBody(
       contents: providerMessagesForBackend(backend, messages),
       systemInstruction: messages.find(m => m.role === "system") ? { parts: [{ text: messages.find(m => m.role === "system")!.content }] } : undefined,
       generationConfig: {
-        temperature: temperature || undefined,
-        maxOutputTokens: maxTokens || undefined,
+        temperature: temperature ?? undefined,
+        maxOutputTokens: maxTokens ?? undefined,
         ...(includeReasoningSetting(deps) ? { thinkingConfig: { includeThoughts: true } } : {}),
         ...(schema ? { responseMimeType: "application/json", responseSchema: schema } : {}),
       },
@@ -1447,8 +1719,8 @@ function requestBody(
       messages: providerMessagesForBackend(backend, messages),
       system: system ? [{ text: system }, ...(cacheEnabled(deps, "system") ? [{ cachePoint: { type: "default" } }] : [])] : undefined,
       inferenceConfig: {
-        maxTokens: maxTokens || 4096,
-        temperature: temperature || undefined,
+        maxTokens: maxTokens ?? undefined,
+        temperature: temperature ?? undefined,
       },
       toolConfig: backendTools.length ? { toolChoice: { auto: {} }, tools: backendTools } : undefined,
       ...extra,
@@ -1461,8 +1733,8 @@ function requestBody(
       input: (providerMessagesForBackend(backend, messages) as any[]).map((m: any) => ({ ...m, role: m.role === "system" ? "developer" : m.role })),
       tools: tools.length ? tools.map(openAiTool) : undefined,
       text: schema ? { format: openAiResponsesSchema(schema) } : undefined,
-      temperature: temperature || undefined,
-      max_output_tokens: maxTokens || undefined,
+      temperature: temperature ?? undefined,
+      max_output_tokens: maxTokens ?? undefined,
       ...extra,
     }
   }
@@ -1473,8 +1745,8 @@ function requestBody(
     tools: tools.length ? tools.map(openAiTool) : undefined,
     tool_choice: tools.length ? "auto" : undefined,
     response_format: schema ? openAiSchema(schema) : undefined,
-    temperature: temperature || undefined,
-    max_tokens: maxTokens || undefined,
+    temperature: temperature ?? undefined,
+    max_tokens: maxTokens ?? undefined,
     ...extra,
   }
 }
@@ -1727,13 +1999,28 @@ function textFromStreamEvent(backend: GptelBackend, data: string, includeReasoni
   return choice?.delta?.content ?? choice?.text ?? ""
 }
 
+function reasoningFromStreamEvent(backend: GptelBackend, data: string): string {
+  if (!data || data === "[DONE]") return ""
+  let json: any
+  try { json = JSON.parse(data) } catch { return "" }
+  if (backend.kind === "anthropic") return json.delta?.thinking ?? ""
+  if (backend.kind === "gemini") {
+    const parts = json.candidates?.flatMap((c: any) => c.content?.parts ?? []) ?? []
+    return parts.filter((part: any) => part.thought).map((part: any) => part.text ?? "").join("")
+  }
+  if (backend.kind === "ollama") return json.message?.thinking ?? json.thinking ?? ""
+  if (backend.kind === "openai-responses") return json.type === "response.reasoning_summary_text.delta" || json.type === "response.reasoning.delta" ? json.delta ?? "" : ""
+  const choice = json.choices?.[0]
+  return choice?.delta?.reasoning ?? choice?.delta?.reasoning_content ?? ""
+}
+
 async function requestLlm(
   editor: Editor,
   deps: GptelDeps,
   backend: GptelBackend,
   model: string,
   messages: GptelMessage[],
-  options: { onDelta?: (delta: string) => void; signal?: AbortSignal; tools?: GptelTool[] } = {},
+  options: { onDelta?: (delta: string) => void; onReasoning?: (reasoning: string) => void; signal?: AbortSignal; tools?: GptelTool[] } = {},
 ): Promise<RequestResult> {
   if (backend.kind === "mock") {
     const response = `Mock response to: ${messages.at(-1)?.content ?? ""}`
@@ -1762,6 +2049,10 @@ async function requestLlm(
   if (!payload.stream || !response.body) {
     const json = await response.json()
     if (level === "debug") logJson(editor, deps, "response body", json)
+    if (reasoningBufferName(includeReasoning)) {
+      const reasoning = reasoningFromJson(backend, json)
+      if (reasoning) options.onReasoning?.(reasoning)
+    }
     return { text: textFromJson(backend, json, includeReasoning), raw: json, usage: usageFromJson(backend, json), toolCalls: toolCallsFromJson(backend, json) }
   }
 
@@ -1780,6 +2071,10 @@ async function requestLlm(
       logJson(editor, deps, "response body", event, true)
       const parsed = parseJsonMaybe(event)
       if (typeof parsed === "object" && parsed) usage = usageFromJson(backend, parsed) ?? usage
+      if (reasoningBufferName(includeReasoning)) {
+        const reasoning = reasoningFromStreamEvent(backend, event)
+        if (reasoning) options.onReasoning?.(reasoning)
+      }
       const delta = textFromStreamEvent(backend, event, includeReasoning)
       if (!delta) continue
       text += delta
@@ -1791,6 +2086,10 @@ async function requestLlm(
     logJson(editor, deps, "response body", event, true)
     const parsed = parseJsonMaybe(event)
     if (typeof parsed === "object" && parsed) usage = usageFromJson(backend, parsed) ?? usage
+    if (reasoningBufferName(includeReasoning)) {
+      const reasoning = reasoningFromStreamEvent(backend, event)
+      if (reasoning) options.onReasoning?.(reasoning)
+    }
     const delta = textFromStreamEvent(backend, event, includeReasoning)
     text += delta
     options.onDelta?.(delta)
@@ -1823,50 +2122,155 @@ export function formatToolResultBlock(call: GptelToolCall, result: GptelMessage)
   ].join("\n")
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value))
+}
+
+function makeToolResult(call: GptelToolCall, content: unknown): GptelMessage {
+  return {
+    role: "tool",
+    name: call.name,
+    toolCallId: call.id,
+    content: toolResultString(content),
+  }
+}
+
+function blockedToolResult(call: GptelToolCall, reason?: string): GptelMessage {
+  return makeToolResult(call, `<tool_call_error>\n${reason ?? `Tool ${call.name} blocked by user`}\n</tool_call_error>`)
+}
+
+type PreToolDecision = {
+  call: GptelToolCall
+  blocked?: GptelMessage
+  shortCircuit?: GptelMessage
+  stop?: boolean
+}
+
+type PostToolDecision = {
+  result: GptelMessage
+  stop?: boolean
+}
+
+type ToolExecutionResult = {
+  calls: GptelToolCall[]
+  results: GptelMessage[]
+  stop?: boolean
+}
+
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
 async function confirmToolCalls(
   editor: Editor,
   deps: GptelDeps,
   toolCalls: readonly GptelToolCall[],
   tools: ReadonlyMap<string, GptelTool>,
-): Promise<boolean> {
-  if (deps.getCustom<boolean>("gptel-confirm-tool-calls") === false) return true
-  const callsNeedingConfirmation = toolCalls.filter(call => tools.get(call.name)?.confirm !== false)
-  if (!callsNeedingConfirmation.length) return true
+): Promise<"accept" | "reject"> {
+  const setting = deps.getCustom<boolean | string>("gptel-confirm-tool-calls")
+  if (setting === false || setting === "false" || setting === "nil" || setting === "no") return "accept"
+  const callsNeedingConfirmation = setting === "auto"
+    ? toolCalls.filter(call => call.confirm === true || (call.confirm == null && tools.get(call.name)?.confirm === true))
+    : toolCalls.filter(call => call.confirm === true || (call.confirm == null && tools.get(call.name)?.confirm !== false))
+  if (!callsNeedingConfirmation.length) return "accept"
   const names = callsNeedingConfirmation.map(call => call.name).join(", ")
-  for (;;) {
-    const answer = (await editor.prompt(`Run gptel tool call${callsNeedingConfirmation.length > 1 ? "s" : ""} (${names})? y, n, or i: `, "n", "gptel-tool-confirm"))?.trim().toLowerCase()
-    if (answer === "y" || answer === "yes") return true
-    if (answer === "i" || answer === "inspect") {
-      const buffer = editor.scratch("*gptel tool calls*", `${gptelToolCallSummary(toolCalls)}\n`, "gptel-inspect")
-      buffer.readOnly = true
-      editor.switchToBuffer(buffer.id)
-      continue
+  const st = state(editor)
+  const commandDecision = new Promise<"accept" | "reject">(resolve => {
+    st.pendingToolCalls = { bufferId: editor.currentBuffer.id, calls: [...toolCalls], resolve }
+  })
+  const promptDecision = (async (): Promise<"accept" | "reject"> => {
+    for (;;) {
+      const answer = (await editor.prompt(`Run gptel tool call${callsNeedingConfirmation.length > 1 ? "s" : ""} (${names})? y, n, or i: `, "n", "gptel-tool-confirm"))?.trim().toLowerCase()
+      if (answer === "y" || answer === "yes") return "accept"
+      if (answer === "i" || answer === "inspect") {
+        const buffer = editor.scratch("*gptel tool calls*", `${gptelToolCallSummary(toolCalls)}\n`, "gptel-inspect")
+        buffer.readOnly = true
+        editor.switchToBuffer(buffer.id)
+        continue
+      }
+      return "reject"
     }
-    return false
-  }
+  })()
+  const decision = await Promise.race([commandDecision, promptDecision])
+  if (st.pendingToolCalls?.calls.every((call, index) => call === toolCalls[index])) st.pendingToolCalls = undefined
+  return decision
 }
 
-async function runPreToolCallFunctions(editor: Editor, deps: GptelDeps, buffer: BufferModel, backend: GptelBackend, model: string, call: GptelToolCall, tool: GptelTool | undefined): Promise<GptelToolCall | false> {
+function decidePendingToolCalls(editor: Editor, decision: "accept" | "reject"): boolean {
+  const pending = state(editor).pendingToolCalls
+  if (!pending) {
+    editor.message("gptel: no pending tool calls")
+    return false
+  }
+  state(editor).pendingToolCalls = undefined
+  pending.resolve(decision)
+  editor.message(decision === "accept" ? "gptel: accepted tool calls" : "gptel: rejected tool calls")
+  return true
+}
+
+async function runPreToolCallFunctions(editor: Editor, deps: GptelDeps, buffer: BufferModel, backend: GptelBackend, model: string, call: GptelToolCall, tool: GptelTool | undefined): Promise<PreToolDecision> {
   const ctx = { editor, buffer, backend, model }
   let current = call
   for (const fn of state(editor).preToolCallFunctions) {
     const next = await fn(current, tool, ctx)
-    if (next === false) return false
-    if (next) current = next
+    if (next == null || next === true) continue
+    if (next === false) return { call: current, stop: true }
+    if (!isRecord(next)) continue
+    if (hasOwn(next, "id") || (hasOwn(next, "arguments") && !hasOwn(next, "args") && !hasOwn(next, "block") && !hasOwn(next, "stop") && !hasOwn(next, "result") && !hasOwn(next, "confirm"))) {
+      current = { ...current, ...(next as Partial<GptelToolCall>) }
+      continue
+    }
+    const directive = next as Record<string, unknown>
+    if (hasOwn(directive, "name") && typeof directive.name === "string") current = { ...current, name: directive.name }
+    if (hasOwn(directive, "args") || hasOwn(directive, "arguments")) current = { ...current, arguments: hasOwn(directive, "args") ? directive.args : directive.arguments }
+    if (hasOwn(directive, "confirm") && typeof directive.confirm === "boolean") current = { ...current, confirm: directive.confirm } as GptelToolCall
+    if (directive.block) return { call: current, blocked: blockedToolResult(current, typeof directive.block === "string" ? directive.block : undefined) }
+    if (hasOwn(directive, "result")) return { call: current, shortCircuit: makeToolResult(current, directive.result) }
+    if (directive.stop) return { call: current, stop: true }
   }
   await editor.runHook("gptel-pre-tool-call-functions", buffer)
-  return current
+  return { call: current }
 }
 
-async function runPostToolCallFunctions(editor: Editor, deps: GptelDeps, buffer: BufferModel, backend: GptelBackend, model: string, call: GptelToolCall, result: GptelMessage, tool: GptelTool | undefined): Promise<GptelMessage> {
+async function runPostToolCallFunctions(editor: Editor, deps: GptelDeps, buffer: BufferModel, backend: GptelBackend, model: string, call: GptelToolCall, result: GptelMessage, tool: GptelTool | undefined): Promise<PostToolDecision> {
   const ctx = { editor, buffer, backend, model }
   let current = result
+  let stop = false
   for (const fn of state(editor).postToolCallFunctions) {
     const next = await fn(call, current, tool, ctx)
-    if (next) current = next
+    if (!next) continue
+    if (!isRecord(next)) continue
+    const directive = next as Record<string, unknown>
+    if (hasOwn(directive, "role") && directive.role === "tool") {
+      current = next as GptelMessage
+      continue
+    }
+    if (directive.block) current = blockedToolResult(call, typeof directive.block === "string" ? directive.block : undefined)
+    if (hasOwn(directive, "result")) current = { ...current, content: toolResultString(directive.result) }
+    if (directive.stop) stop = true
   }
   await editor.runHook("gptel-post-tool-call-functions", buffer)
-  return current
+  return { result: current, stop }
+}
+
+async function callGptelTool(tool: GptelTool, args: unknown, ctx: { editor: Editor; buffer: BufferModel }): Promise<unknown> {
+  if (!tool.async) return await (tool.function as (args: unknown, ctx: { editor: Editor; buffer: BufferModel }) => unknown | Promise<unknown>)(args, ctx)
+  return await new Promise<unknown>((resolve, reject) => {
+    let settled = false
+    const callback = (result: unknown) => {
+      if (settled) return
+      settled = true
+      resolve(result)
+    }
+    try {
+      ;(tool.function as (callback: (result: unknown) => void, args: unknown, ctx: { editor: Editor; buffer: BufferModel }) => void)(callback, args, ctx)
+    } catch (error) {
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    }
+  })
 }
 
 async function executeToolCalls(
@@ -1876,57 +2280,74 @@ async function executeToolCalls(
   toolCalls: readonly GptelToolCall[],
   backend: GptelBackend,
   model: string,
-): Promise<GptelMessage[] | null> {
+): Promise<ToolExecutionResult | null> {
   const st = state(editor)
-  const confirmed = await confirmToolCalls(editor, deps, toolCalls, st.tools)
-  if (!confirmed) {
-    editor.message("gptel: tool calls cancelled")
-    return null
-  }
   const results: GptelMessage[] = []
+  const resultCalls: GptelToolCall[] = []
+  const executable: Array<{ call: GptelToolCall; tool: GptelTool }> = []
   for (const requestedCall of toolCalls) {
-    let call = requestedCall
+    const initialTool = st.tools.get(requestedCall.name)
+    const decision = await runPreToolCallFunctions(editor, deps, buffer, backend, model, requestedCall, initialTool)
+    const call = decision.call
     let tool = st.tools.get(call.name)
-    const transformedCall = await runPreToolCallFunctions(editor, deps, buffer, backend, model, call, tool)
-    if (transformedCall === false) {
-      results.push(await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, {
-        role: "tool",
-        name: call.name,
-        toolCallId: call.id,
-        content: `Skipped gptel tool: ${call.name}`,
-      }, tool))
+    if (decision.blocked || decision.shortCircuit) {
+      const post = await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, decision.blocked ?? decision.shortCircuit!, tool)
+      results.push(post.result)
+      resultCalls.push(call)
+      if (decision.stop || post.stop) return { calls: resultCalls, results, stop: true }
       continue
     }
-    call = transformedCall
-    tool = st.tools.get(call.name)
+    if (decision.stop) return { calls: resultCalls, results, stop: true }
     if (!tool) {
-      results.push(await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, {
+      const post = await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, {
         role: "tool",
         name: call.name,
         toolCallId: call.id,
         content: `No such gptel tool: ${call.name}`,
-      }, tool))
+      }, tool)
+      results.push(post.result)
+      resultCalls.push(call)
+      if (post.stop) return { calls: resultCalls, results, stop: true }
       continue
     }
+    executable.push({ call, tool })
+  }
+  const confirmed = await confirmToolCalls(editor, deps, executable.map(item => item.call), st.tools)
+  if (confirmed === "reject") {
+    for (const { call, tool } of executable) {
+      const post = await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, makeToolResult(call, "Tool call declined by user"), tool)
+      results.push(post.result)
+      resultCalls.push(call)
+      if (post.stop) return { calls: resultCalls, results, stop: true }
+    }
+    return { calls: resultCalls, results }
+  }
+  for (const { call, tool } of executable) {
     try {
       editor.message(`gptel tool: ${call.name}`)
-      const value = await tool.function(call.arguments, { editor, buffer })
-      results.push(await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, {
+      const value = await callGptelTool(tool, call.arguments, { editor, buffer })
+      const post = await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, {
         role: "tool",
         name: call.name,
         toolCallId: call.id,
         content: toolResultString(value),
-      }, tool))
+      }, tool)
+      results.push(post.result)
+      resultCalls.push(call)
+      if (post.stop) return { calls: resultCalls, results, stop: true }
     } catch (error) {
-      results.push(await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, {
+      const post = await runPostToolCallFunctions(editor, deps, buffer, backend, model, call, {
         role: "tool",
         name: call.name,
         toolCallId: call.id,
         content: `Tool error: ${error instanceof Error ? error.message : String(error)}`,
-      }, tool))
+      }, tool)
+      results.push(post.result)
+      resultCalls.push(call)
+      if (post.stop) return { calls: resultCalls, results, stop: true }
     }
   }
-  return results
+  return { calls: resultCalls, results }
 }
 
 function insertIncludedToolResults(deps: GptelDeps, buffer: BufferModel, calls: readonly GptelToolCall[], results: readonly GptelMessage[], tools: ReadonlyMap<string, GptelTool>): void {
@@ -1947,7 +2368,7 @@ async function requestWithTools(
   model: string,
   messages: GptelMessage[],
   buffer: BufferModel,
-  options: { onDelta?: (delta: string) => void; onToolResults?: (calls: GptelToolCall[], results: GptelMessage[], tools: ReadonlyMap<string, GptelTool>) => void; signal?: AbortSignal } = {},
+  options: { onDelta?: (delta: string) => void; onReasoning?: (reasoning: string) => void; onToolResults?: (calls: GptelToolCall[], results: GptelMessage[], tools: ReadonlyMap<string, GptelTool>) => void; signal?: AbortSignal } = {},
 ): Promise<RequestResult> {
   const tools = selectedTools(editor, deps)
   const maxRounds = Math.max(0, deps.getCustom<number>("gptel-max-tool-rounds") ?? 3)
@@ -1958,6 +2379,7 @@ async function requestWithTools(
       ...options,
       tools,
       onDelta: round === 0 ? options.onDelta : undefined,
+      onReasoning: options.onReasoning,
     })
     if (result.text) finalText = result.text
     const calls = result.toolCalls ?? []
@@ -1966,24 +2388,47 @@ async function requestWithTools(
       ...conversation,
       { role: "assistant", content: result.text, toolCalls: calls },
     ]
-    const toolResults = await executeToolCalls(editor, deps, buffer, calls, backend, model)
-    if (!toolResults) return { ...result, text: finalText }
-    options.onToolResults?.(calls, toolResults, state(editor).tools)
-    conversation.push(...toolResults)
+    const toolExecution = await executeToolCalls(editor, deps, buffer, calls, backend, model)
+    if (!toolExecution) return { ...result, text: finalText }
+    options.onToolResults?.(toolExecution.calls, toolExecution.results, state(editor).tools)
+    conversation.push(...toolExecution.results)
+    if (toolExecution.stop) return { ...result, text: finalText }
     if (round === 0 && options.onDelta && result.text) options.onDelta("\n")
   }
   return { text: finalText }
 }
 
-function ensureChatBuffer(editor: Editor, name = GPTEL_BUFFER_PREFIX, markers: GptelChatMarkers = defaultChatMarkers()): BufferModel {
+function defaultChatMode(deps: GptelDeps): string {
+  const custom = deps.getCustom<string>("gptel-default-mode")
+  // GPTEL_CHAT_MODE is the markdown-derived chat mode (font-lock + chat keymap);
+  // upstream's markdown-mode default maps onto it.
+  if (!custom || custom === "markdown" || custom === "markdown-mode") return GPTEL_CHAT_MODE
+  return custom.replace(/-mode$/, "")
+}
+
+function displayGptelBuffer(editor: Editor, deps: GptelDeps, buffer: BufferModel): void {
+  const action = deps.getCustom<unknown>("gptel-display-buffer-action")
+  if (action === "other-window" || (Array.isArray(action) && action.includes("other-window"))) {
+    editor.displayBufferInOtherWindow(buffer.id, { select: true })
+    return
+  }
+  editor.switchToBuffer(buffer.id)
+}
+
+function ensureChatBuffer(editor: Editor, deps: GptelDeps, name = GPTEL_BUFFER_PREFIX, initial?: string): BufferModel {
   const existing = [...editor.buffers.values()].find(buffer => buffer.name === name)
   if (existing) {
-    editor.switchToBuffer(existing.id)
-    editor.enterMode(existing, GPTEL_CHAT_MODE)
+    displayGptelBuffer(editor, deps, existing)
+    editor.enableMinorMode(GPTEL_MODE, { buffer: existing })
     return existing
   }
-  const buffer = editor.scratch(name, `# Jemacs gptel\n\n${markerText(markers, "user", true)}`, GPTEL_CHAT_MODE)
+  const mode = defaultChatMode(deps)
+  const markers = chatMarkers(deps, { mode } as BufferModel)
+  const firstPrompt = `${markerText(markers, "user", true)}${initial ?? ""}`
+  const buffer = editor.scratch(name, firstPrompt, mode)
+  editor.enableMinorMode(GPTEL_MODE, { buffer })
   buffer.point = buffer.text.length
+  displayGptelBuffer(editor, deps, buffer)
   return buffer
 }
 
@@ -2049,14 +2494,41 @@ function positionalArgs(args: string[]): string[] {
   return values
 }
 
+function promptPreset(editor: Editor, prompt: string): { name: string; prompt: string } | null {
+  if (!state(editor).presets.size) return null
+  const firstLineEnd = prompt.indexOf("\n")
+  const firstLine = firstLineEnd >= 0 ? prompt.slice(0, firstLineEnd) : prompt
+  const match = firstLine.match(/(^|[\s>])@([^\s.,;:!?()[\]{}]+)\b/)
+  if (!match) return null
+  const name = match[2]!
+  if (!state(editor).presets.has(name)) return null
+  const start = match.index! + (match[1]?.length ?? 0)
+  const end = start + name.length + 1
+  const strippedFirstLine = `${firstLine.slice(0, start)}${firstLine.slice(end)}`.replace(/[ \t]{2,}/g, " ").trimStart()
+  return { name, prompt: `${strippedFirstLine}${firstLineEnd >= 0 ? prompt.slice(firstLineEnd) : ""}`.trimStart() }
+}
+
 async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferModel, args: string[] = [], priorVariants: string[] = []): Promise<void> {
   applyTransientArgs(editor, deps, args)
-  const markers = chatMarkers(deps)
+  const markers = chatMarkers(deps, buffer)
   const extracted = extractPrompt(buffer, markers)
-  const prompt = orgScopedPromptForDeps(deps, buffer, extracted.prompt, extracted.end)
+  let prompt = orgScopedPromptForDeps(deps, buffer, extracted.prompt, extracted.end)
   if (!prompt) {
     editor.message("gptel: empty prompt")
     return
+  }
+  let restorePreset: (() => void) | undefined
+  const token = promptPreset(editor, prompt)
+  if (token) {
+    const spec = presetSpec(editor, token.name)!
+    const saved = new Map(presetCustomKeys(editor, spec, deps).map(name => [name, deps.getCustom(name)]))
+    const applied = await applyPreset(editor, deps, token.name, false)
+    if (applied) {
+      prompt = token.prompt
+      restorePreset = () => {
+        for (const [name, value] of saved) deps.setCustom(name, value)
+      }
+    }
   }
   const backend = backendByName(editor, deps)
   const model = currentModel(editor, deps, backend)
@@ -2064,8 +2536,11 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
   const controller = new AbortController()
   state(editor).activeRequests.set(buffer.id, controller)
 
+  const originalPoint = buffer.point
+  const followOutput = deps.getCustom<boolean>("gptel-auto-scroll") || originalPoint === buffer.text.length
   const insertionStart = buffer.text.length
   appendWritable(buffer, markerText(markers, "assistant"))
+  if (!followOutput) buffer.point = originalPoint
   const responseStart = buffer.text.length
   editor.message(`gptel: ${backend.name}/${model}`)
   try {
@@ -2076,9 +2551,16 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
       onToolResults(calls, results, tools) {
         insertIncludedToolResults(deps, buffer, calls, results, tools)
       },
+      onReasoning(reasoning) {
+        const target = reasoningBufferName(includeReasoningSetting(deps))
+        if (target) appendReasoningToTarget(editor, target, reasoning)
+      },
       onDelta(delta) {
+        const oldPoint = buffer.point
+        const wasAtEnd = buffer.point === buffer.text.length
         appendWritable(buffer, delta)
-        buffer.point = buffer.text.length
+        if (followOutput || wasAtEnd) buffer.point = buffer.text.length
+        else buffer.point = oldPoint
         void editor.runHook("gptel-post-stream-hook", buffer)
       },
     })
@@ -2092,8 +2574,15 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
     const st = state(editor)
     st.tokenUsage = addUsage(st.tokenUsage, result.usage)
     await runPostResponseFunctions(editor, buffer, backend, model, responseStart, responseEnd)
+    const history = upsertResponseHistory(editor, buffer, {
+      bufferId: buffer.id,
+      start: responseStart,
+      end: responseEnd,
+      variants: [responseText, ...priorVariants.filter(variant => variant !== responseText)],
+      variantIndex: 0,
+    })
     appendWritable(buffer, markerText(markers, "user"))
-    buffer.point = buffer.text.length
+    buffer.point = followOutput ? buffer.text.length : originalPoint
     st.lastRequest = {
       bufferId: buffer.id,
       prompt,
@@ -2105,27 +2594,41 @@ async function sendFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferMod
       backend: backend.name,
       model,
       usage: result.usage,
-      variants: [responseText, ...priorVariants.filter(variant => variant !== responseText)],
-      variantIndex: 0,
+      variants: history.variants,
+      variantIndex: history.variantIndex,
     }
     editor.message(`gptel: done (${backend.name}/${model})`)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     appendWritable(buffer, `${markers.separator}[gptel error] ${message}${markerText(markers, "user")}`)
+    await runPostResponseFunctions(editor, buffer, backend, model, responseStart, responseStart)
     editor.message(`gptel failed: ${message}`)
   } finally {
     state(editor).activeRequests.delete(buffer.id)
+    restorePreset?.()
     void editor.changed("gptel-send")
   }
 }
 
 async function inspectQueryFromBuffer(editor: Editor, deps: GptelDeps, buffer: BufferModel, args: string[], format: "json" | "object"): Promise<void> {
   applyTransientArgs(editor, deps, args)
-  const markers = chatMarkers(deps)
+  const markers = chatMarkers(deps, buffer)
   const extracted = extractPrompt(buffer, markers)
-  const prompt = orgScopedPromptForDeps(deps, buffer, extracted.prompt, extracted.end)
+  let prompt = orgScopedPromptForDeps(deps, buffer, extracted.prompt, extracted.end)
   if (!prompt) {
     editor.message("gptel: empty prompt")
+    return
+  }
+  const token = promptPreset(editor, prompt)
+  if (token) {
+    await gptelWithPreset(editor, token.name, async () => {
+      const backend = backendByName(editor, deps)
+      const model = currentModel(editor, deps, backend)
+      const messages = await buildMessages(editor, deps, buffer, token.prompt, backend, model, markers)
+      const payload = requestPayload(backend, model, messages, deps, selectedTools(editor, deps))
+      inspectPayloadBuffer(editor, payload, format)
+    })
+    editor.message("gptel: query inspected")
     return
   }
   const backend = backendByName(editor, deps)
@@ -2136,34 +2639,64 @@ async function inspectQueryFromBuffer(editor: Editor, deps: GptelDeps, buffer: B
   editor.message("gptel: query inspected")
 }
 
-function switchLastVariant(editor: Editor, direction: number): void {
+function historyForVariantCommand(editor: Editor, deps: GptelDeps, buffer: BufferModel): GptelResponseHistory | null {
   const st = state(editor)
+  let history = responseHistoryAtPoint(editor, deps, buffer)
   const last = st.lastRequest
-  if (!last || last.variants.length < 2) {
+  if (history && last?.bufferId === buffer.id && last.responseStart === history.start && last.responseEnd === history.end) {
+    history = upsertResponseHistory(editor, buffer, {
+      ...history,
+      variants: last.variants.length > history.variants.length ? last.variants : history.variants,
+      variantIndex: last.variantIndex,
+    })
+  }
+  if (history) return history
+  if (!last || last.bufferId !== buffer.id) return null
+  return upsertResponseHistory(editor, buffer, {
+    bufferId: buffer.id,
+    start: last.responseStart,
+    end: last.responseEnd,
+    variants: last.variants,
+    variantIndex: last.variantIndex,
+  })
+}
+
+function syncLastRequestVariant(editor: Editor, history: GptelResponseHistory): void {
+  const last = state(editor).lastRequest
+  if (!last || last.bufferId !== history.bufferId) return
+  if (last.responseStart !== history.start) return
+  last.responseEnd = history.end
+  last.insertionEnd = Math.max(last.insertionEnd, history.end)
+  last.variants = history.variants
+  last.variantIndex = history.variantIndex
+}
+
+function switchResponseVariant(editor: Editor, deps: GptelDeps, buffer: BufferModel, direction: number): void {
+  const history = historyForVariantCommand(editor, deps, buffer)
+  if (!history || history.variants.length < 2) {
     editor.message("gptel: no response variants")
     return
   }
-  const buffer = editor.buffers.get(last.bufferId)
-  if (!buffer) return
-  const nextIndex = (last.variantIndex + direction + last.variants.length) % last.variants.length
-  const next = last.variants[nextIndex] ?? ""
-  const oldLength = last.responseEnd - last.responseStart
-  replaceWritable(buffer, last.responseStart, last.responseEnd, next)
+  const nextIndex = (history.variantIndex + direction + history.variants.length) % history.variants.length
+  const next = history.variants[nextIndex] ?? ""
+  const oldLength = history.end - history.start
+  replaceWritable(buffer, history.start, history.end, next)
   const delta = next.length - oldLength
-  last.responseEnd += delta
-  last.insertionEnd += delta
-  last.variantIndex = nextIndex
-  buffer.point = last.responseStart + next.length
-  editor.message(`gptel: variant ${nextIndex + 1}/${last.variants.length}`)
+  history.end += delta
+  history.variantIndex = nextIndex
+  upsertResponseHistory(editor, buffer, history)
+  syncLastRequestVariant(editor, history)
+  buffer.point = history.start + next.length
+  editor.message(`gptel: variant ${nextIndex + 1}/${history.variants.length}`)
   void editor.changed("gptel-variant")
 }
 
 function moveResponseBoundary(editor: Editor, deps: GptelDeps, buffer: BufferModel, boundary: "start" | "end", direction: number): void {
-  const markers = chatMarkers(deps)
+  const markers = chatMarkers(deps, buffer)
   const ranges = responseRanges(buffer, markers)
   const current = direction >= 0
-    ? ranges.find(range => range[boundary] > buffer.point)
-    : [...ranges].reverse().find(range => range[boundary] < buffer.point)
+    ? ranges.find(range => (buffer.point >= range.start && buffer.point < range.end) || range[boundary] > buffer.point)
+    : [...ranges].reverse().find(range => (buffer.point > range.start && buffer.point <= range.end) || range[boundary] < buffer.point)
   if (!current) {
     editor.message(`gptel: no ${direction >= 0 ? "next" : "previous"} response`)
     return
@@ -2172,7 +2705,7 @@ function moveResponseBoundary(editor: Editor, deps: GptelDeps, buffer: BufferMod
 }
 
 function markResponse(editor: Editor, deps: GptelDeps, buffer: BufferModel): void {
-  const range = responseRangeAtPoint(buffer, chatMarkers(deps))
+  const range = responseRangeAtPoint(buffer, chatMarkers(deps, buffer))
   if (!range) {
     editor.message("gptel: no response at point")
     return
@@ -2181,6 +2714,63 @@ function markResponse(editor: Editor, deps: GptelDeps, buffer: BufferModel): voi
   buffer.mark = range.end
   buffer.markActive = true
   editor.message("gptel: marked response")
+}
+
+function markdownFenceBlockAtPoint(buffer: BufferModel): { start: number; end: number } | null {
+  const line = buffer.lineAt(buffer.point)
+  const [lineStart, lineEnd] = buffer.lineBounds(line)
+  const lineText = buffer.text.slice(lineStart, lineEnd)
+  let start: number | null = null
+  let end: number | null = null
+  if (/^```[ \t]*$/.test(lineText)) {
+    end = lineEnd
+    let parity = -1
+    for (let i = line - 1; i >= 0 && parity !== 0; i--) {
+      const [candidateStart, candidateEnd] = buffer.lineBounds(i)
+      const candidate = buffer.text.slice(candidateStart, candidateEnd)
+      if (/^```[ \t]*$/.test(candidate)) parity--
+      else if (/^```[ \t]*\S+/.test(candidate)) parity++
+      if (parity === 0) start = candidateStart
+    }
+  } else {
+    let parity = 0
+    let searchLine = line
+    for (let i = line; i >= 0; i--) {
+      const [candidateStart, candidateEnd] = buffer.lineBounds(i)
+      const candidate = buffer.text.slice(candidateStart, candidateEnd)
+      if (/^```[ \t]*$/.test(candidate)) parity++
+      else if (/^```[ \t]*\S+/.test(candidate)) {
+        if (parity === 0) {
+          start = candidateStart
+          searchLine = i
+          break
+        }
+        parity--
+      }
+    }
+    if (start != null) {
+      parity = 1
+      for (let i = searchLine + 1; i < buffer.lineCount && parity !== 0; i++) {
+        const [candidateStart, candidateEnd] = buffer.lineBounds(i)
+        const candidate = buffer.text.slice(candidateStart, candidateEnd)
+        if (/^```[ \t]*$/.test(candidate)) parity--
+        else if (/^```[ \t]*\S+/.test(candidate)) parity++
+        if (parity === 0) end = candidateEnd
+      }
+    }
+  }
+  return start != null && end != null ? { start, end } : null
+}
+
+function markdownCycleBlock(editor: Editor, buffer: BufferModel): void {
+  const block = markdownFenceBlockAtPoint(buffer)
+  if (!block) {
+    editor.message("gptel: no markdown code block at point")
+    return
+  }
+  // Jemacs exposes render overlays, but no invisible-text/folding primitive yet.
+  buffer.point = buffer.point <= block.start ? block.end : block.start
+  editor.message("gptel: markdown block folding unavailable; moved to block boundary")
 }
 
 async function rewriteRegion(editor: Editor, deps: GptelDeps, buffer: BufferModel, instruction: string): Promise<void> {
@@ -2457,26 +3047,30 @@ function defaultDirectives(): Record<string, string> {
   }
 }
 
-function customDirectives(deps: GptelDeps): Record<string, string> {
-  const raw = deps.getCustom<string>("gptel-directives")
-  if (!raw?.trim()) return {}
-  try {
-    const parsed = JSON.parse(raw) as unknown
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {}
-    const entries = Object.entries(parsed as Record<string, unknown>)
-      .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    return Object.fromEntries(entries)
-  } catch {
-    return {}
-  }
+function customDirectives(deps: GptelDeps): Record<string, string | (() => string)> {
+  const raw = deps.getCustom<string | Record<string, string | (() => string)>>("gptel-directives")
+  const parsed = typeof raw === "string"
+    ? raw.trim() ? (() => {
+      try { return JSON.parse(raw) as unknown } catch { return undefined }
+    })() : undefined
+    : raw
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {}
+  const entries = Object.entries(parsed as Record<string, unknown>)
+    .filter((entry): entry is [string, string | (() => string)] => typeof entry[1] === "string" || typeof entry[1] === "function")
+  return Object.fromEntries(entries)
+}
+
+function resolveDirective(value: string | (() => string)): string {
+  return typeof value === "function" ? value() : value
 }
 
 function knownDirectives(editor: Editor, deps: GptelDeps): Record<string, string> {
-  return {
+  const directives = {
     ...defaultDirectives(),
     ...Object.fromEntries(state(editor).directives),
     ...customDirectives(deps),
   }
+  return Object.fromEntries(Object.entries(directives).map(([name, value]) => [name, resolveDirective(value)]))
 }
 
 function directiveNames(editor: Editor, deps: GptelDeps): string[] {
@@ -2832,6 +3426,7 @@ function mcpToolFromSpec(serverName: string, spec: GptelMcpToolSpec): GptelTool 
     parameters: spec.parameters ?? { type: "object", properties: {} },
     confirm: spec.confirm,
     include: spec.include,
+    async: spec.async,
     function: spec.function ?? (async () => {
       throw new Error(`gptel: MCP tool ${serverName}/${spec.name} has no callable adapter`)
     }),
@@ -2931,19 +3526,220 @@ export function gptelAddPostToolCallFunction(editor: Editor, fn: GptelPostToolCa
   return fn
 }
 
-async function applyPreset(editor: Editor, deps: GptelDeps, name: string): Promise<void> {
-  const preset = state(editor).presets.get(name)
-  if (!preset) {
-    editor.message(`gptel: no preset ${name}`)
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function isPresetModifySpec(value: unknown): value is Record<string, unknown> {
+  return isPlainObject(value) && ["append", "prepend", "remove", "merge", "eval", "function"].some(key => hasOwn(value, key))
+}
+
+function mergeObjects(current: unknown, value: unknown): Record<string, unknown> {
+  const parsedCurrent = typeof current === "string" && current.trim().startsWith("{")
+    ? (() => {
+      try { return JSON.parse(current) } catch { return current }
+    })()
+    : current
+  return { ...(isPlainObject(parsedCurrent) ? parsedCurrent : {}), ...(isPlainObject(value) ? value : {}) }
+}
+
+function removeValue(current: unknown, value: unknown): unknown {
+  if (typeof current === "string") {
+    const needle = Array.isArray(value) ? value.join("") : String(value ?? "")
+    return needle ? current.split(needle).join("") : current
+  }
+  if (Array.isArray(current)) {
+    const removed = new Set(Array.isArray(value) ? value : [value])
+    return current.filter(item => !removed.has(item))
+  }
+  return current
+}
+
+function appendValue(current: unknown, value: unknown): unknown {
+  if (typeof current === "string" || typeof value === "string") {
+    const base = String(current ?? "")
+    const suffix = String(value ?? "")
+    return base.endsWith(suffix) ? base : `${base}${suffix}`
+  }
+  return [...(Array.isArray(current) ? current : current == null ? [] : [current]), ...(Array.isArray(value) ? value : [value])]
+}
+
+function prependValue(current: unknown, value: unknown): unknown {
+  if (typeof current === "string" || typeof value === "string") {
+    const base = String(current ?? "")
+    const prefix = String(value ?? "")
+    return base.startsWith(prefix) ? base : `${prefix}${base}`
+  }
+  return [...(Array.isArray(value) ? value : [value]), ...(Array.isArray(current) ? current : current == null ? [] : [current])]
+}
+
+async function modifyPresetValue(current: unknown, spec: unknown): Promise<unknown> {
+  if (!isPresetModifySpec(spec)) return spec
+  let next = current
+  for (const key of ["append", "prepend", "remove", "merge", "eval", "function"]) {
+    if (!hasOwn(spec, key)) continue
+    const value = spec[key]
+    if (key === "append") next = appendValue(next, value)
+    else if (key === "prepend") next = prependValue(next, value)
+    else if (key === "remove") next = removeValue(next, value)
+    else if (key === "merge") next = mergeObjects(next, value)
+    else if (key === "eval") next = typeof value === "function" ? await (value as () => unknown)() : value
+    else if (key === "function" && typeof value === "function") next = await (value as (current: unknown) => unknown)(next)
+  }
+  return next
+}
+
+function presetNames(preset: GptelPreset): Array<string | GptelPreset> {
+  const parents = preset.parents
+  if (!parents) return []
+  return Array.isArray(parents) ? parents : [parents]
+}
+
+function presetSpec(editor: Editor, preset: string | GptelPreset): GptelPreset | undefined {
+  return typeof preset === "string" ? state(editor).presets.get(preset) : preset
+}
+
+function presetKeyToCustomName(key: string): string {
+  const kebab = key.replace(/[A-Z]/g, match => `-${match.toLowerCase()}`)
+  return `gptel-${kebab}`
+}
+
+function selectedToolValueNames(value: unknown): string[] {
+  if (typeof value === "string") return value.split(/[, ]+/).map(name => name.trim()).filter(Boolean)
+  if (Array.isArray(value)) return value.flatMap(selectedToolValueNames)
+  if (isPlainObject(value) && typeof value.name === "string") return [value.name]
+  return []
+}
+
+function presetCustomKeys(editor: Editor, preset: GptelPreset, deps: Pick<GptelDeps, "getCustomVariable">): string[] {
+  const names: string[] = []
+  for (const parent of presetNames(preset)) {
+    const spec = presetSpec(editor, parent)
+    if (spec) names.push(...presetCustomKeys(editor, spec, deps))
+  }
+  for (const key of Object.keys(preset)) {
+    if (["name", "description", "parents", "pre", "post"].includes(key)) continue
+    if (key === "system" || key === "system-prompt" || key === "system-message") names.push("gptel-system-prompt", "gptel-system-message")
+    else if (key === "rewrite-directive" || key === "rewriteDirective") names.push("gptel-rewrite-directive")
+    else {
+      const custom = presetKeyToCustomName(key)
+      if (deps.getCustomVariable(custom)) names.push(custom)
+    }
+  }
+  return [...new Set(names)]
+}
+
+async function applyPresetValue(editor: Editor, deps: GptelDeps, key: string, raw: unknown): Promise<void> {
+  if (["description", "parents", "pre", "post", "name"].includes(key)) return
+  if (key === "system" || key === "system-prompt" || key === "system-message") {
+    const value = await modifyPresetValue(systemMessage(deps), raw)
+    const directives = knownDirectives(editor, deps)
+    const resolved = typeof value === "string" && directives[value] ? directives[value] : value
+    if (typeof resolved === "string") setSystemMessage(deps, resolved)
     return
   }
-  if (preset.backend) deps.setCustom("gptel-backend", preset.backend)
-  if (preset.model) deps.setCustom("gptel-model", preset.model)
-  if (preset.system) setSystemMessage(deps, preset.system)
-  if (typeof preset.temperature === "number") deps.setCustom("gptel-temperature", preset.temperature)
-  if (preset.schema != null) deps.setCustom("gptel-schema", typeof preset.schema === "string" ? preset.schema : JSON.stringify(preset.schema))
-  if (preset.tools) deps.setCustom("gptel-tools", preset.tools.join(","))
-  editor.message(`gptel: applied preset ${name}`)
+  if (key === "backend") {
+    const current = deps.getCustom<string>("gptel-backend")
+    const value = await modifyPresetValue(current, raw)
+    const backend = typeof value === "string" ? gptelGetBackend(editor, value) : value as GptelBackend | undefined
+    if (!backend?.name) {
+      editor.message(`gptel preset: Cannot find backend ${String(value)}`)
+      return
+    }
+    deps.setCustom("gptel-backend", backend.name)
+    return
+  }
+  if (key === "tools") {
+    const current = selectedToolNames(deps)
+    const value = await modifyPresetValue(current, raw)
+    setSelectedToolNames(deps, selectedToolValueNames(value))
+    return
+  }
+  if (key === "schema") {
+    const value = await modifyPresetValue(deps.getCustom("gptel-schema"), raw)
+    deps.setCustom("gptel-schema", typeof value === "string" ? value : value == null ? "" : JSON.stringify(value))
+    return
+  }
+  const custom = key === "rewrite-directive" || key === "rewriteDirective" ? "gptel-rewrite-directive" : presetKeyToCustomName(key)
+  if (!deps.getCustomVariable(custom)) {
+    editor.message(`gptel preset: setting for ${key} not found, ignoring.`)
+    return
+  }
+  deps.setCustom(custom, await modifyPresetValue(deps.getCustom(custom), raw))
+}
+
+async function applyPreset(editor: Editor, deps: GptelDeps, preset: string | GptelPreset, message = true): Promise<boolean> {
+  const spec = presetSpec(editor, preset)
+  if (!spec) {
+    editor.message(`gptel: no preset ${typeof preset === "string" ? preset : preset.name}`)
+    return false
+  }
+  await spec.pre?.()
+  for (const parent of presetNames(spec)) {
+    const ok = await applyPreset(editor, deps, parent, false)
+    if (!ok) return false
+  }
+  for (const key of Object.keys(spec)) await applyPresetValue(editor, deps, key, spec[key])
+  await spec.post?.()
+  if (message) editor.message(`gptel: applied preset ${spec.name}`)
+  return true
+}
+
+export async function gptelWithPreset<T>(editor: Editor, preset: string | GptelPreset, fn: () => T | Promise<T>): Promise<T> {
+  const deps = await loadDeps()
+  const spec = presetSpec(editor, preset)
+  if (!spec) throw new Error(`gptel: no preset ${typeof preset === "string" ? preset : preset.name}`)
+  const customNames = presetCustomKeys(editor, spec, deps)
+  const saved = new Map(customNames.map(name => [name, deps.getCustom(name)]))
+  try {
+    await applyPreset(editor, deps, preset, false)
+    return await fn()
+  } finally {
+    for (const [name, value] of saved) deps.setCustom(name, value)
+  }
+}
+
+function directiveNameForSystem(editor: Editor, deps: GptelDeps, system: string): string | undefined {
+  return Object.entries(knownDirectives(editor, deps)).find(([, value]) => value === system)?.[0]
+}
+
+function tsValue(value: unknown): string {
+  return JSON.stringify(value, null, 2)
+}
+
+function presetSnippet(preset: GptelPreset): string {
+  const lines = [
+    "gptelMakePreset(editor, {",
+    `  name: ${tsValue(preset.name)},`,
+  ]
+  for (const [key, value] of Object.entries(preset)) {
+    if (key === "name" || value === undefined || value === "") continue
+    const property = /^[A-Za-z_$][\w$]*$/.test(key) ? key : tsValue(key)
+    lines.push(`  ${property}: ${tsValue(value)},`)
+  }
+  lines.push("})")
+  return lines.join("\n")
+}
+
+function savePreset(editor: Editor, deps: GptelDeps, name: string, description = ""): GptelPreset {
+  const system = systemMessage(deps)
+  const directive = directiveNameForSystem(editor, deps, system)
+  const preset: GptelPreset = {
+    name,
+    description: description.trim() || undefined,
+    backend: deps.getCustom<string>("gptel-backend"),
+    model: deps.getCustom<string>("gptel-model"),
+    system: directive ?? system,
+    tools: selectedToolNames(deps),
+    stream: deps.getCustom<boolean>("gptel-stream") !== false,
+    temperature: deps.getCustom<number | null>("gptel-temperature") ?? null,
+    "max-tokens": deps.getCustom<number | null>("gptel-max-tokens") ?? null,
+    "use-context": deps.getCustom<string | boolean>("gptel-use-context"),
+    "track-media": deps.getCustom<boolean>("gptel-track-media") === true,
+    "include-reasoning": deps.getCustom<string | boolean>("gptel-include-reasoning"),
+  }
+  gptelMakePreset(editor, preset)
+  return preset
 }
 
 export async function install(editor: Editor): Promise<void> {
@@ -2954,14 +3750,15 @@ export async function install(editor: Editor): Promise<void> {
 
   deps.defcustom("gptel-backend", "string", "Claude", "Active gptel backend.", "gptel")
   deps.defcustom("gptel-model", "string", "claude-sonnet-4-5-20250929", "Active gptel model.", "gptel")
-  deps.defcustom("gptel-api-key", "string", "", "Default API key used by gptel backends without an explicit key.", "gptel")
+  deps.defcustom("gptel-api-key", "sexp", "", "Default API key used by gptel backends without an explicit key.", "gptel")
   deps.defcustom("gptel-proxy", "string", "", "HTTP proxy for upstream gptel compatibility; fetch-based Jemacs requests do not use it directly.", "gptel")
   deps.defcustom("gptel-use-curl", "boolean", false, "Curl transport toggle for upstream gptel compatibility; Jemacs uses fetch.", "gptel")
   deps.defcustom("gptel-system-message", "string", DEFAULT_SYSTEM_MESSAGE, "System message used for gptel requests.", "gptel")
-  deps.defcustom("gptel-system-prompt", "string", DEFAULT_SYSTEM_MESSAGE, "Upstream-compatible alias for gptel-system-message.", "gptel")
-  deps.defcustom("gptel-directives", "string", "", "JSON object of named gptel system directives.", "gptel")
-  deps.defcustom("gptel-temperature", "number", 0.7, "Sampling temperature for gptel requests.", "gptel")
-  deps.defcustom("gptel-max-tokens", "number", 4096, "Maximum output tokens for gptel requests.", "gptel")
+  deps.defcustom("gptel-system-prompt", "sexp", DEFAULT_SYSTEM_MESSAGE, "Upstream-compatible alias for gptel-system-message.", "gptel")
+  deps.defcustom("gptel-directives", "sexp", "", "JSON object or object of named gptel system directives.", "gptel")
+  deps.defcustom("gptel-temperature", "sexp", null, "Sampling temperature for gptel requests, or null for the API default.", "gptel")
+  deps.defcustom("gptel-max-tokens", "sexp", null, "Maximum output tokens for gptel requests, or null for the API default.", "gptel")
+  deps.defcustom("gptel-num-messages-to-send", "sexp", null, "Number of prior chat messages to send, or null for all.", "gptel")
   deps.defcustom("gptel-stream", "boolean", true, "Stream gptel responses into the current buffer.", "gptel")
   deps.defcustom("gptel-log-level", "string", "", "Logging level for gptel requests: off, info, or debug.", "gptel")
   deps.defcustom("gptel-track-response", "boolean", true, "Track response metadata for upstream gptel compatibility.", "gptel")
@@ -2971,17 +3768,24 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-tools", "string", "", "Comma or space separated gptel tool names to include with requests.", "gptel")
   deps.defcustom("gptel-include-tool-results", "string", "auto", "Whether tool results are inserted in gptel buffers: auto, true, or false.", "gptel")
   deps.defcustom("gptel-max-tool-rounds", "number", 3, "Maximum number of tool-call continuation rounds.", "gptel")
-  deps.defcustom("gptel-confirm-tool-calls", "boolean", true, "Ask before running gptel tool calls.", "gptel")
+  deps.defcustom("gptel-confirm-tool-calls", "sexp", true, "Ask before running gptel tool calls: true, false, or auto.", "gptel")
   deps.defcustom("gptel-use-context", "string", "system", "How gptel sends context: system, user, or false.", "gptel")
   deps.defcustom("gptel-schema", "string", "", "Structured JSON output schema as JSON or gptel shorthand.", "gptel")
   deps.defcustom("gptel-include-reasoning", "string", "ignore", "Reasoning handling: ignore, true, false, or a buffer name.", "gptel")
-  deps.defcustom("gptel-prompt-prefix", "string", "User:\n", "String inserted before user prompts in gptel chat buffers.", "gptel")
-  deps.defcustom("gptel-response-prefix", "string", "Assistant:\n", "String inserted before assistant responses in gptel chat buffers.", "gptel")
+  deps.defcustom("gptel-rewrite-directive", "sexp", "", "Directive used by gptel rewrite commands and presets.", "gptel")
+  deps.defcustom("gptel-default-mode", "string", "markdown", "Major mode for new dedicated gptel chat buffers.", "gptel")
+  deps.defcustom("gptel-display-buffer-action", "sexp", "same-window", "Display hint for gptel chat buffers; supports same-window or other-window in Jemacs.", "gptel")
+  deps.defcustom("gptel-prompt-prefix-alist", "sexp", defaultPromptPrefixAlist(), "Mode-specific prompt prefixes for dedicated gptel chat buffers.", "gptel")
+  deps.defcustom("gptel-response-prefix-alist", "sexp", defaultResponsePrefixAlist(), "Mode-specific response prefixes for dedicated gptel chat buffers.", "gptel")
+  deps.defcustom("gptel-prompt-prefix", "sexp", null, "Compatibility prompt prefix override for the current mode.", "gptel")
+  deps.defcustom("gptel-response-prefix", "sexp", null, "Compatibility response prefix override for the current mode.", "gptel")
   deps.defcustom("gptel-response-separator", "string", "\n\n", "String inserted between gptel prompt and response sections.", "gptel")
+  deps.defcustom("gptel-auto-scroll", "boolean", false, "Follow streaming gptel output as it arrives.", "gptel")
   deps.defcustom("gptel-pre-response-hook", "string", "", "Hook run before inserting a gptel response.", "gptel")
   deps.defcustom("gptel-post-response-functions", "string", "", "Hook run after inserting a gptel response.", "gptel")
   deps.defcustom("gptel-post-stream-hook", "string", "", "Hook run after each streaming response insertion.", "gptel")
   deps.defcustom("gptel-post-request-hook", "string", "", "Hook run after sending a gptel request.", "gptel")
+  deps.defcustom("gptel-save-state-hook", "string", "", "Hook run before gptel state is saved.", "gptel")
   deps.defcustom("gptel-post-rewrite-functions", "string", "", "Hook run after a gptel rewrite is inserted.", "gptel")
   deps.defcustom("gptel-pre-tool-call-functions", "string", "", "Hook run before gptel tool calls.", "gptel")
   deps.defcustom("gptel-post-tool-call-functions", "string", "", "Hook run after gptel tool calls.", "gptel")
@@ -2989,8 +3793,18 @@ export async function install(editor: Editor): Promise<void> {
   deps.defcustom("gptel-org-branching-context", "boolean", false, "Use heading lineage as gptel context in Org buffers.", "gptel")
 
   editor.command("gptel", async ({ editor, args }) => {
-    const name = args.join(" ") || GPTEL_BUFFER_PREFIX
-    ensureChatBuffer(editor, name, chatMarkers(deps))
+    const existing = [...editor.buffers.values()]
+      .filter(buffer => buffer.minorModes.has(GPTEL_MODE) || buffer.mode === GPTEL_CHAT_MODE)
+      .map(buffer => buffer.name)
+    const backend = backendByName(editor, deps)
+    const defaultName = `*${backend.name}*`
+    const name = args[0] ?? await editor.completingRead("Create or choose gptel buffer: ", {
+      collection: existing,
+      initialValue: defaultName,
+      history: "gptel-buffer",
+    })
+    if (!name) return
+    ensureChatBuffer(editor, deps, name, args.slice(1).join(" ") || activeRegionText(editor.activeBuffer) || undefined)
   }, "Start or switch to a gptel chat buffer.")
 
   editor.command("gptel-add-and-open-buffer", async ({ editor, buffer }) => {
@@ -3003,12 +3817,16 @@ export async function install(editor: Editor): Promise<void> {
     } else {
       state(editor).context.push({ type: "buffer", name: editor.bufferDisplayName(source), bufferId: source.id, text: source.text })
     }
-    const chat = ensureChatBuffer(editor, `${GPTEL_BUFFER_PREFIX}<${Date.now()}>`, chatMarkers(deps))
+    const chat = ensureChatBuffer(editor, deps, `${GPTEL_BUFFER_PREFIX}<${Date.now()}>`)
     editor.displayBufferInOtherWindow(chat.id, { select: true })
     editor.message("gptel: added current buffer context")
   }, "Add current buffer or region to gptel context and open a chat buffer in another window.")
 
-  editor.command("gptel-send", async ({ editor, buffer, args }) => {
+  editor.command("gptel-send", async ({ editor, buffer, args, prefixArgument }) => {
+    if (prefixArgument != null) {
+      editor.openTransient(gptelMenuDefinition)
+      return
+    }
     if (buffer.mode !== GPTEL_CHAT_MODE && !buffer.minorModes.has(GPTEL_MODE)) editor.enableMinorMode(GPTEL_MODE, { buffer })
     restoreGptelStateOnce(editor, deps, buffer)
     await sendFromBuffer(editor, deps, buffer, args)
@@ -3017,6 +3835,14 @@ export async function install(editor: Editor): Promise<void> {
   editor.command("gptel-menu", ({ editor }) => {
     editor.openTransient(gptelMenuDefinition)
   }, "Open a compact gptel command menu.")
+
+  editor.command("gptel-accept-tool-calls", ({ editor }) => {
+    decidePendingToolCalls(editor, "accept")
+  }, "Accept pending gptel tool calls.")
+
+  editor.command("gptel-reject-tool-calls", ({ editor }) => {
+    decidePendingToolCalls(editor, "reject")
+  }, "Reject pending gptel tool calls.")
 
   editor.command("gptel-add", async ({ editor, buffer }) => {
     const region = activeRegionText(buffer)
@@ -3109,8 +3935,8 @@ export async function install(editor: Editor): Promise<void> {
     editor.message(`gptel: topic ${topic}`)
   }, "Set GPTEL_TOPIC on the current Org heading.")
 
-  editor.command("gptel-org-set-properties", ({ editor, buffer }) => {
-    if (saveOrgGptelProperties(deps, buffer)) editor.message("gptel: added configuration to current Org headline")
+  editor.command("gptel-org-set-properties", async ({ editor, buffer }) => {
+    if (await saveOrgGptelProperties(editor, deps, buffer)) editor.message("gptel: added configuration to current Org headline")
     else editor.message("gptel: no Org heading for properties")
   }, "Store active gptel configuration as Org properties.")
 
@@ -3179,27 +4005,38 @@ export async function install(editor: Editor): Promise<void> {
     const buffer = editor.buffers.get(last.bufferId)
     if (!buffer) return
     const currentResponse = buffer.text.slice(last.responseStart, last.responseEnd)
-    const priorVariants = [currentResponse, ...last.variants.filter(variant => variant !== currentResponse)]
+    const history = upsertResponseHistory(editor, buffer, {
+      bufferId: buffer.id,
+      start: last.responseStart,
+      end: last.responseEnd,
+      variants: [currentResponse, ...last.variants.filter(variant => variant !== currentResponse)],
+      variantIndex: 0,
+    })
+    const priorVariants = history.variants
     replaceWritable(buffer, last.insertionStart, last.insertionEnd, "")
+    state(editor).responseHistories = state(editor).responseHistories.filter(item =>
+      item.bufferId !== buffer.id || item.start < last.insertionStart || item.start >= last.insertionEnd)
     buffer.point = buffer.text.length
     await sendFromBuffer(editor, deps, buffer, [], priorVariants)
   }, "Regenerate the previous gptel response.")
 
-  editor.command("gptel-previous-variant", ({ editor }) => {
-    switchLastVariant(editor, 1)
+  editor.command("gptel-previous-variant", ({ editor, buffer, args }) => {
+    const count = Number(args[0] ?? 1) || 1
+    switchResponseVariant(editor, deps, buffer, count)
   }, "Switch the last gptel response to the previous variant.")
 
-  editor.command("gptel-next-variant", ({ editor }) => {
-    switchLastVariant(editor, -1)
+  editor.command("gptel-next-variant", ({ editor, buffer, args }) => {
+    const count = Number(args[0] ?? 1) || 1
+    switchResponseVariant(editor, deps, buffer, -count)
   }, "Switch the last gptel response to the next variant.")
 
   editor.command("gptel-beginning-of-response", ({ editor, buffer, args }) => {
-    const count = Math.max(1, Number(args[0] ?? 1) || 1)
+    const count = Math.abs(Number(args[0] ?? 1) || 1)
     for (let i = 0; i < count; i++) moveResponseBoundary(editor, deps, buffer, "start", -1)
   }, "Move point to the beginning of a gptel response.")
 
   editor.command("gptel-end-of-response", ({ editor, buffer, args }) => {
-    const count = Math.max(1, Number(args[0] ?? 1) || 1)
+    const count = Math.abs(Number(args[0] ?? 1) || 1)
     for (let i = 0; i < count; i++) moveResponseBoundary(editor, deps, buffer, "end", 1)
   }, "Move point to the end of a gptel response.")
 
@@ -3208,7 +4045,7 @@ export async function install(editor: Editor): Promise<void> {
   }, "Mark the gptel response at point.")
 
   editor.command("gptel-copy-last-response", ({ editor, buffer }) => {
-    const response = lastAssistantResponse(buffer, chatMarkers(deps))
+    const response = lastAssistantResponse(buffer, chatMarkers(deps, buffer))
     if (!response) {
       editor.message("gptel: no assistant response in this buffer")
       return
@@ -3221,6 +4058,21 @@ export async function install(editor: Editor): Promise<void> {
     const name = args[0] ?? await editor.completingRead("Preset: ", { collection: [...state(editor).presets.keys()], history: "gptel-preset" })
     if (name) await applyPreset(editor, deps, name)
   }, "Apply a gptel preset.")
+
+  editor.command("gptel-save-preset", async ({ editor, args }) => {
+    const name = args[0] ?? await editor.completingRead("Save gptel settings to preset: ", { collection: [...state(editor).presets.keys()], history: "gptel-preset" })
+    if (!name) return
+    const description = args[1] ?? await editor.prompt("Description (optional): ", "", "gptel-preset-description") ?? ""
+    const preset = savePreset(editor, deps, name, description)
+    const snippet = presetSnippet(preset)
+    deps.killNew(editor, snippet)
+    const bufferName = `*gptel preset ${name}*`
+    const existing = [...editor.buffers.values()].find(buffer => buffer.name === bufferName)
+    const buffer = existing ?? editor.scratch(bufferName, "", "typescript")
+    buffer.setText(snippet)
+    editor.switchToBuffer(buffer.id)
+    editor.message(`gptel: preset ${name} saved`)
+  }, "Save current gptel settings as a preset.")
 
   editor.command("gptel-system-prompt", ({ editor }) => {
     editor.openTransient(gptelSystemPromptDefinition(editor, deps))
@@ -3303,8 +4155,8 @@ export async function install(editor: Editor): Promise<void> {
     editor.message("gptel.ts 0.9.9.5-compatible")
   }, "Show the gptel.ts compatibility version.")
 
-  editor.command("gptel-markdown-cycle-block", ({ editor }) => {
-    editor.message("gptel: markdown block cycling is not needed in Jemacs yet")
+  editor.command("gptel-markdown-cycle-block", ({ editor, buffer }) => {
+    markdownCycleBlock(editor, buffer)
   }, "Upstream-compatible placeholder for cycling Markdown block visibility.")
 
   editor.command("gptel-inspect", ({ editor }) => {
@@ -3324,10 +4176,10 @@ export async function install(editor: Editor): Promise<void> {
     editor.switchToBuffer(buffer.id)
   }, "Open the gptel log buffer.")
 
-  editor.command("gptel-save-state", ({ editor, buffer }) => {
-    if (saveOrgGptelProperties(deps, buffer)) editor.message("gptel: org state saved")
+  editor.command("gptel-save-state", async ({ editor, buffer }) => {
+    if (await saveOrgGptelProperties(editor, deps, buffer)) editor.message("gptel: org state saved")
     else {
-      saveGptelState(editor, deps, buffer)
+      await saveGptelState(editor, deps, buffer)
       editor.message("gptel: state saved")
     }
   }, "Persist gptel state in the current buffer.")

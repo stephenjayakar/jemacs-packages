@@ -28,8 +28,10 @@ import {
   gptelMakeOpenAIOAuth,
   gptelMakeOpenAIResponses,
   gptelMakePerplexity,
+  gptelMakePreset,
   gptelMakePrivateGPT,
   gptelMakeTool,
+  gptelWithPreset,
   gptelMakeXAI,
   gptelGetBackend,
   gptelGetTool,
@@ -48,7 +50,7 @@ import {
   type GptelBackend,
   type GptelMessage,
 } from "./gptel"
-import { BufferModel, Editor, getCustom, setCustom } from "@jemacs/core"
+import { addHook, BufferModel, Editor, getCustom, removeHook, setCustom } from "@jemacs/core"
 
 test("default backends include Stephen's configured Claude backend", () => {
   const claude = defaultBackends().find(backend => backend.name === "Claude")
@@ -229,6 +231,7 @@ test("gptel-add-and-open-buffer mirrors Stephen's Emacs helper", async () => {
   expect(state.context[0]).toMatchObject({ type: "buffer", text: "const answer = 42" })
   expect(editor.activeBuffer.name).toStartWith("*ChatGPT*<")
   expect(editor.activeBuffer.mode).toBe("gptel-chat")
+  expect(editor.activeBuffer.minorModes.has("gptel-mode")).toBe(true)
 })
 
 test("mimeTypeForPath identifies common gptel media types", () => {
@@ -394,6 +397,29 @@ test("gptel variant commands switch the last response in place", async () => {
   expect(state.lastRequest.variantIndex).toBe(1)
 })
 
+test("Batch 4: variant commands use the response at point with numeric movement", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const text = "User:\none\n\nAssistant:\nfirst\n\nUser:\ntwo\n\nAssistant:\nsecond"
+  const buffer = editor.scratch("*ChatGPT-variants-at-point*", text, "gptel-chat")
+  editor.switchToBuffer(buffer.id)
+  const ranges = responseRanges(buffer)
+  const state = editor.locals.get("gptel-state") as {
+    responseHistories: Array<{ bufferId: string; start: number; end: number; variants: string[]; variantIndex: number }>
+  }
+  state.responseHistories.push(
+    { bufferId: buffer.id, start: ranges[0]!.start, end: ranges[0]!.end, variants: ["first", "first alt 1", "first alt 2"], variantIndex: 0 },
+    { bufferId: buffer.id, start: ranges[1]!.start, end: ranges[1]!.end, variants: ["second", "second alt"], variantIndex: 0 },
+  )
+
+  buffer.point = ranges[0]!.start + 1
+  await editor.run("gptel-previous-variant", ["2"])
+
+  const nextRanges = responseRanges(buffer)
+  expect(buffer.text.slice(nextRanges[0]!.start, nextRanges[0]!.end)).toBe("first alt 2")
+  expect(buffer.text.slice(nextRanges[1]!.start, nextRanges[1]!.end)).toBe("second")
+})
+
 test("gptel prompt transforms, response filters, and post-response functions run", async () => {
   const editor = new Editor()
   await install(editor)
@@ -412,6 +438,217 @@ test("gptel prompt transforms, response filters, and post-response functions run
 
   expect(buffer.text).toContain("Mock response to: hello filtered")
   expect(seen).toHaveLength(2)
+})
+
+test("Batch 4: post-response functions run on failed requests with an empty failure region", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "FailingBackend", { endpoint: "http://fail.test/v1/chat/completions", models: ["m"], defaultModel: "m", stream: false })
+  setCustom("gptel-backend", "FailingBackend")
+  setCustom("gptel-model", "m")
+  setCustom("gptel-stream", false)
+  const seen: Array<[number, number]> = []
+  gptelAddPostResponseFunction(editor, (start, end) => {
+    seen.push([start, end])
+  })
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response("nope", { status: 500, statusText: "Nope" })) as unknown as typeof fetch
+  try {
+    const buffer = editor.scratch("*ChatGPT-failure-hook*", "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    await editor.run("gptel-send")
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0]![0]).toBe(seen[0]![1])
+    expect(buffer.text).toContain("[gptel error]")
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-stream", true)
+  }
+})
+
+test("Batch 1: chat buffer options, mode prefixes, prefix send menu, auto-scroll, and save hook parity", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-default-mode", "text")
+  setCustom("gptel-prompt-prefix", null)
+  setCustom("gptel-response-prefix", null)
+  setCustom("gptel-prompt-prefix-alist", { text: "T> ", markdown: "M> ", "org-mode": "O> " })
+  setCustom("gptel-response-prefix-alist", { text: "R> ", markdown: "A> ", "org-mode": "AO> " })
+  setCustom("gptel-display-buffer-action", "same-window")
+
+  await editor.run("gptel", ["*batch-chat*", "seed"])
+  const chat = editor.activeBuffer
+  expect(chat.name).toBe("*batch-chat*")
+  expect(chat.mode).toBe("text")
+  expect(chat.minorModes.has("gptel-mode")).toBe(true)
+  expect(chat.text).toBe("T> seed")
+
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  chat.point = chat.text.length
+  await editor.run("gptel-send")
+  expect(chat.text).toContain("\n\nR> Mock response to: seed")
+
+  editor.prefixArg.universalArgument()
+  await editor.run("gptel-send")
+  expect(editor.transient?.definition.name).toBe("gptel-menu")
+
+  setCustom("gptel-auto-scroll", false)
+  const still = editor.scratch("*batch-scroll-still*", "hello trailing", "text")
+  still.mark = 0
+  still.markActive = true
+  still.point = 5
+  editor.switchToBuffer(still.id)
+  await editor.run("gptel-send")
+  expect(still.point).toBe(5)
+  expect(still.text).toContain("Mock response to: hello")
+
+  setCustom("gptel-auto-scroll", true)
+  const follow = editor.scratch("*batch-scroll-follow*", "User:\nhello", "gptel-chat")
+  follow.point = follow.text.length
+  editor.switchToBuffer(follow.id)
+  await editor.run("gptel-send")
+  expect(follow.point).toBe(follow.text.length)
+
+  let hookRan = false
+  const saveHook = ({ buffer }: { buffer: BufferModel }) => {
+    hookRan = true
+    buffer.insert("\nhook text")
+  }
+  addHook("gptel-save-state-hook", saveHook)
+  await editor.run("gptel-save-state")
+  expect(hookRan).toBe(true)
+  expect(follow.text).toContain("hook text")
+  removeHook("gptel-save-state-hook", saveHook)
+
+  setCustom("gptel-default-mode", "markdown")
+  setCustom("gptel-prompt-prefix-alist", { "markdown": "### ", "org-mode": "*** ", "text": "### " })
+  setCustom("gptel-response-prefix-alist", { "markdown": "", "org-mode": "", "text": "" })
+  setCustom("gptel-display-buffer-action", "same-window")
+  setCustom("gptel-auto-scroll", false)
+})
+
+test("Batch 1: null generation defaults, flexible option functions, and message limit resolve at request time", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "BatchBackend", { endpoint: "http://batch.test/v1/chat/completions", models: ["m"], defaultModel: "m", stream: false })
+  setCustom("gptel-backend", "BatchBackend")
+  setCustom("gptel-model", "m")
+  setCustom("gptel-stream", false)
+  setCustom("gptel-temperature", null)
+  setCustom("gptel-max-tokens", null)
+  setCustom("gptel-num-messages-to-send", 2)
+  setCustom("gptel-api-key", () => "dynamic-key")
+  setCustom("gptel-system-prompt", () => "dynamic system")
+
+  const bodies: any[] = []
+  const headers: any[] = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    headers.push(init?.headers)
+    bodies.push(JSON.parse(String(init?.body ?? "{}")))
+    return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200, headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  try {
+    const buffer = editor.scratch("*BatchPayload*", [
+      "User:",
+      "one",
+      "",
+      "Assistant:",
+      "two",
+      "",
+      "User:",
+      "three",
+      "",
+      "Assistant:",
+      "four",
+      "",
+      "User:",
+      "five",
+    ].join("\n"), "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    await editor.run("gptel-send")
+
+    expect(headers[0].authorization).toBe("Bearer dynamic-key")
+    expect(bodies[0].temperature).toBeUndefined()
+    expect(bodies[0].max_tokens).toBeUndefined()
+    expect(bodies[0].messages[0]).toEqual({ role: "system", content: "dynamic system" })
+    expect(bodies[0].messages.map((message: any) => message.content)).toEqual(["dynamic system", "three", "four", "five"])
+
+    setCustom("gptel-temperature", 0.4)
+    setCustom("gptel-max-tokens", 77)
+    const second = editor.scratch("*BatchPayload2*", "User:\nhello", "gptel-chat")
+    second.point = second.text.length
+    editor.switchToBuffer(second.id)
+    await editor.run("gptel-send")
+    expect(bodies[1].temperature).toBe(0.4)
+    expect(bodies[1].max_tokens).toBe(77)
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-stream", true)
+    setCustom("gptel-num-messages-to-send", null)
+    setCustom("gptel-api-key", "")
+    setCustom("gptel-system-prompt", "You are a helpful assistant.")
+    setCustom("gptel-temperature", null)
+    setCustom("gptel-max-tokens", null)
+  }
+})
+
+test("Batch 1: function directives and auto tool confirmation semantics", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-directives", { dynamic: () => "dynamic directive" })
+  await editor.run("gptel-system-prompt-set", ["dynamic"])
+  expect(getCustom<string>("gptel-system-message")).toBe("dynamic directive")
+
+  gptelMakeOpenAI(editor, "AutoToolBackend", { endpoint: "http://autotool.test/v1/chat/completions", models: ["m"], defaultModel: "m", stream: false })
+  gptelMakeTool(editor, {
+    name: "safe",
+    description: "Safe tool.",
+    include: true,
+    parameters: { type: "object", properties: {} },
+    function: () => "safe result",
+  })
+  setCustom("gptel-backend", "AutoToolBackend")
+  setCustom("gptel-model", "m")
+  setCustom("gptel-tools", "safe")
+  setCustom("gptel-confirm-tool-calls", "auto")
+  setCustom("gptel-stream", false)
+  const originalPrompt = editor.prompt.bind(editor)
+  let prompted = false
+  editor.prompt = (async (...args: Parameters<typeof editor.prompt>) => {
+    prompted = true
+    return originalPrompt(...args)
+  }) as typeof editor.prompt
+  const originalFetch = globalThis.fetch
+  let callCount = 0
+  globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) => {
+    callCount += 1
+    if (callCount === 1) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: "", tool_calls: [{ id: "call_1", type: "function", function: { name: "safe", arguments: "{}" } }] } }],
+      }), { status: 200, headers: { "content-type": "application/json" } })
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200, headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  try {
+    const buffer = editor.scratch("*AutoTool*", "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    await editor.run("gptel-send")
+    expect(prompted).toBe(false)
+    expect(buffer.text).toContain("safe result")
+  } finally {
+    editor.prompt = originalPrompt
+    globalThis.fetch = originalFetch
+    setCustom("gptel-directives", "")
+    setCustom("gptel-tools", "")
+    setCustom("gptel-confirm-tool-calls", true)
+    setCustom("gptel-stream", true)
+  }
 })
 
 test("gptel-send converts markdown responses in org-mode buffers", async () => {
@@ -592,6 +829,22 @@ test("gptel response navigation and marking use response ranges", async () => {
   expect(buffer.text.slice(Math.min(buffer.point, buffer.mark!), Math.max(buffer.point, buffer.mark!))).toBe("four")
 })
 
+test("Batch 4: response navigation starts from response at point and repeats", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const buffer = editor.scratch("*ChatGPT-nav-prefix*", "User:\none\n\nAssistant:\ntwo\n\nUser:\nthree\n\nAssistant:\nfour", "gptel-chat")
+  const ranges = responseRanges(buffer)
+  editor.switchToBuffer(buffer.id)
+
+  buffer.point = ranges[0]!.start + 1
+  await editor.run("gptel-end-of-response")
+  expect(buffer.point).toBe(ranges[0]!.end)
+  await editor.run("gptel-beginning-of-response")
+  expect(buffer.point).toBe(ranges[0]!.start)
+  await editor.run("gptel-end-of-response", ["2"])
+  expect(buffer.point).toBe(ranges[1]!.end)
+})
+
 test("gptel rewrite accept and reject manage pending rewrite state", async () => {
   const editor = new Editor()
   await install(editor)
@@ -675,6 +928,90 @@ test("gptel-send sends tools and inserts included tool results", async () => {
     editor.switchToBuffer(second.id)
     await editor.run("gptel-send")
     expect(bodies[0].tools).toBeUndefined()
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-tools", "")
+    setCustom("gptel-use-tools", true)
+    setCustom("gptel-include-tool-results", "auto")
+    setCustom("gptel-confirm-tool-calls", true)
+    setCustom("gptel-stream", true)
+  }
+})
+
+test("gptel accept and reject commands resolve parked tool calls", async () => {
+  const waitForPending = async (editor: Editor): Promise<void> => {
+    for (let i = 0; i < 20; i += 1) {
+      const pending = (editor.locals.get("gptel-state") as { pendingToolCalls?: unknown }).pendingToolCalls
+      if (pending) return
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    throw new Error("tool calls were not parked")
+  }
+  const runDecision = async (decision: "accept" | "reject"): Promise<{ bodies: any[]; executed: string[]; text: string }> => {
+    const editor = new Editor()
+    await install(editor)
+    gptelMakeOpenAI(editor, `Parked-${decision}`, { endpoint: `http://parked-${decision}.test/v1/chat/completions`, models: ["tool-model"], defaultModel: "tool-model", stream: false })
+    const executed: string[] = []
+    gptelMakeTool(editor, {
+      name: "lookup",
+      description: "Lookup a value.",
+      confirm: true,
+      include: true,
+      parameters: { type: "object", properties: { q: { type: "string" } } },
+      function: args => {
+        executed.push((args as { q?: string }).q ?? "")
+        return `result:${(args as { q?: string }).q ?? ""}`
+      },
+    })
+    setCustom("gptel-backend", `Parked-${decision}`)
+    setCustom("gptel-model", "tool-model")
+    setCustom("gptel-tools", "lookup")
+    setCustom("gptel-use-tools", true)
+    setCustom("gptel-include-tool-results", "auto")
+    setCustom("gptel-confirm-tool-calls", true)
+    setCustom("gptel-stream", false)
+    editor.prompt = (async (..._args: Parameters<typeof editor.prompt>) => await new Promise<string>(() => {})) as typeof editor.prompt
+    const bodies: any[] = []
+    let callCount = 0
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")))
+      callCount += 1
+      if (callCount === 1) {
+        return new Response(JSON.stringify({
+          choices: [{
+            message: {
+              content: "",
+              tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{\"q\":\"parked\"}" } }],
+            },
+          }],
+        }), { status: 200, headers: { "content-type": "application/json" } })
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: `${decision}:done` } }] }), { status: 200, headers: { "content-type": "application/json" } })
+    }) as typeof fetch
+
+    const buffer = editor.scratch(`*ChatGPT-${decision}-parked*`, "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    const send = editor.run("gptel-send")
+    await waitForPending(editor)
+    await editor.run(decision === "accept" ? "gptel-accept-tool-calls" : "gptel-reject-tool-calls")
+    await send
+    return { bodies, executed, text: buffer.text }
+  }
+
+  const originalFetch = globalThis.fetch
+  try {
+    const rejected = await runDecision("reject")
+    expect(rejected.executed).toEqual([])
+    expect(JSON.stringify(rejected.bodies[1].messages)).toContain("Tool call declined by user")
+    expect(rejected.text).toContain("Tool call declined by user")
+    expect(rejected.text).toContain("reject:done")
+
+    const accepted = await runDecision("accept")
+    expect(accepted.executed).toEqual(["parked"])
+    expect(JSON.stringify(accepted.bodies[1].messages)).toContain("result:parked")
+    expect(accepted.text).toContain("result:parked")
+    expect(accepted.text).toContain("accept:done")
   } finally {
     globalThis.fetch = originalFetch
     setCustom("gptel-tools", "")
@@ -775,6 +1112,65 @@ test("gptel pre and post tool call functions can alter calls and results", async
     expect(seen).toEqual(["pre:lookup", "post:result:rewritten"])
     expect(buffer.text).toContain("result:rewritten:filtered")
     expect(buffer.text).not.toContain("result:original")
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-tools", "")
+    setCustom("gptel-use-tools", true)
+    setCustom("gptel-include-tool-results", "auto")
+    setCustom("gptel-confirm-tool-calls", true)
+    setCustom("gptel-stream", true)
+  }
+})
+
+test("gptel async callback tools send callback result to the follow-up request", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "AsyncToolBackend", { endpoint: "http://async-tool.test/v1/chat/completions", models: ["tool-model"], defaultModel: "tool-model", stream: false })
+  gptelMakeTool(editor, {
+    name: "lookup",
+    description: "Lookup a value asynchronously.",
+    async: true,
+    confirm: false,
+    include: true,
+    parameters: { type: "object", properties: { q: { type: "string" } } },
+    function: (callback: (result: unknown) => void, args: unknown) => {
+      setTimeout(() => callback(`async:${(args as { q?: string }).q ?? ""}`), 0)
+    },
+  })
+  setCustom("gptel-backend", "AsyncToolBackend")
+  setCustom("gptel-model", "tool-model")
+  setCustom("gptel-tools", "lookup")
+  setCustom("gptel-use-tools", true)
+  setCustom("gptel-include-tool-results", "auto")
+  setCustom("gptel-confirm-tool-calls", false)
+  setCustom("gptel-stream", false)
+  const bodies: any[] = []
+  const originalFetch = globalThis.fetch
+  let callCount = 0
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body ?? "{}")))
+    callCount += 1
+    if (callCount === 1) {
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: "",
+            tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{\"q\":\"callback\"}" } }],
+          },
+        }],
+      }), { status: 200, headers: { "content-type": "application/json" } })
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200, headers: { "content-type": "application/json" } })
+  }) as typeof fetch
+  try {
+    const buffer = editor.scratch("*ChatGPT-async-tool*", "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    await editor.run("gptel-send")
+
+    expect(JSON.stringify(bodies[1].messages)).toContain("async:callback")
+    expect(buffer.text).toContain("async:callback")
+    expect(buffer.text).toContain("done")
   } finally {
     globalThis.fetch = originalFetch
     setCustom("gptel-tools", "")
@@ -916,6 +1312,36 @@ test("gptel include-reasoning ignore displays reasoning but omits it from follow
   }
 })
 
+test("gptel include-reasoning buffer name routes reasoning outside the response", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "ReasoningBufferBackend", { endpoint: "http://reasoning-buffer.test/openai", models: ["m"], defaultModel: "m", stream: false })
+  setCustom("gptel-backend", "ReasoningBufferBackend")
+  setCustom("gptel-model", "m")
+  setCustom("gptel-stream", false)
+  setCustom("gptel-include-reasoning", "*gptel reasoning*")
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({
+    choices: [{ message: { reasoning_content: "private chain", content: "final answer" } }],
+  }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch
+  try {
+    const buffer = editor.scratch("*ReasoningTarget*", "User:\nhello", "gptel-chat")
+    buffer.point = buffer.text.length
+    editor.switchToBuffer(buffer.id)
+    await editor.run("gptel-send")
+
+    const reasoningBuffer = [...editor.buffers.values()].find(candidate => candidate.name === "*gptel reasoning*")
+    expect(reasoningBuffer?.text).toBe("private chain\n")
+    expect(buffer.text).toContain("final answer")
+    expect(buffer.text).not.toContain("private chain")
+    expect(buffer.text).not.toContain("``` reasoning")
+  } finally {
+    globalThis.fetch = originalFetch
+    setCustom("gptel-include-reasoning", "ignore")
+    setCustom("gptel-stream", true)
+  }
+})
+
 test("gptel inspect reports last and session token usage", async () => {
   const editor = new Editor()
   await install(editor)
@@ -987,6 +1413,46 @@ test("gptel save and restore state round-trips buffer metadata and variants", as
   expect(restoredState.lastRequest.variantIndex).toBe(1)
 })
 
+test("Batch 4: save and restore preserves per-response histories", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const buffer = editor.scratch("*stateful-response-history*", "User:\none\n\nAssistant:\ntwo\n\nUser:\nthree\n\nAssistant:\nfour", "gptel-chat")
+  editor.switchToBuffer(buffer.id)
+  const ranges = responseRanges(buffer)
+  const originalState = editor.locals.get("gptel-state") as {
+    responseHistories: Array<{ bufferId: string; start: number; end: number; variants: string[]; variantIndex: number }>
+  }
+  originalState.responseHistories.push(
+    { bufferId: buffer.id, start: ranges[0]!.start, end: ranges[0]!.end, variants: ["two", "two old"], variantIndex: 0 },
+    { bufferId: buffer.id, start: ranges[1]!.start, end: ranges[1]!.end, variants: ["four", "four old"], variantIndex: 0 },
+  )
+  await editor.run("gptel-save-state")
+  originalState.responseHistories = []
+
+  await editor.run("gptel-restore-state")
+  const restoredRanges = responseRanges(buffer)
+  buffer.point = restoredRanges[0]!.start
+  await editor.run("gptel-previous-variant")
+
+  const nextRanges = responseRanges(buffer)
+  expect(buffer.text.slice(nextRanges[0]!.start, nextRanges[0]!.end)).toBe("two old")
+  expect(buffer.text.slice(nextRanges[1]!.start, nextRanges[1]!.end)).toBe("four")
+})
+
+test("Batch 4: markdown cycle block moves between fence boundaries without rewriting text", async () => {
+  const editor = new Editor()
+  await install(editor)
+  const text = "before\n```ts\nconst x = 1\n```\nafter"
+  const buffer = editor.scratch("*markdown-cycle*", text, "markdown")
+  editor.switchToBuffer(buffer.id)
+  buffer.point = text.indexOf("const")
+  await editor.run("gptel-markdown-cycle-block")
+  expect(buffer.point).toBe(text.indexOf("```ts"))
+  await editor.run("gptel-markdown-cycle-block")
+  expect(buffer.point).toBe(text.indexOf("```\nafter") + 3)
+  expect(buffer.text).toBe(text)
+})
+
 test("gptel inspect-query builds request payload without sending it", async () => {
   const editor = new Editor()
   await install(editor)
@@ -1015,6 +1481,133 @@ test("gptel inspect-query builds request payload without sending it", async () =
     globalThis.fetch = originalFetch
     setCustom("gptel-stream", true)
   }
+})
+
+test("Batch 3: presets apply parents, upstream keys, directives, and value modification specs", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeDirective(editor, { name: "preset-review", prompt: "Review carefully." })
+  gptelMakeOpenAI(editor, "PresetBackend", { endpoint: "http://preset.test/v1/chat/completions", models: ["preset-model"], defaultModel: "preset-model" })
+  setCustom("gptel-system-message", "Base")
+  setCustom("gptel-tools", "alpha,beta")
+  setCustom("gptel-schema", JSON.stringify({ a: 1 }))
+
+  const calls: string[] = []
+  gptelMakePreset(editor, {
+    name: "parent-preset",
+    pre: () => { calls.push("parent-pre") },
+    post: () => { calls.push("parent-post") },
+    backend: "PresetBackend",
+    model: "preset-model",
+    system: "preset-review",
+    tools: { append: ["gamma"], remove: ["alpha"] },
+    schema: { merge: { b: 2 } },
+    "max-tokens": 77,
+    "use-context": false,
+  })
+  gptelMakePreset(editor, {
+    name: "child-preset",
+    parents: "parent-preset",
+    pre: () => { calls.push("child-pre") },
+    post: () => { calls.push("child-post") },
+    system: { append: "\nChild" },
+    tools: { prepend: ["root"], function: current => (current as string[]).filter(name => name !== "beta") },
+    temperature: { eval: () => 0.4 },
+    stream: false,
+    "include-reasoning": true,
+    "confirm-tool-calls": "auto",
+    "track-media": true,
+  })
+
+  await editor.run("gptel-preset", ["child-preset"])
+
+  expect(calls).toEqual(["child-pre", "parent-pre", "parent-post", "child-post"])
+  expect(getCustom<string>("gptel-backend")).toBe("PresetBackend")
+  expect(getCustom<string>("gptel-model")).toBe("preset-model")
+  expect(getCustom<string>("gptel-system-message")).toBe("Review carefully.\nChild")
+  expect(getCustom<string>("gptel-tools")).toBe("root,gamma")
+  expect(JSON.parse(getCustom<string>("gptel-schema") ?? "")).toEqual({ a: 1, b: 2 })
+  expect(getCustom<number>("gptel-temperature")).toBe(0.4)
+  expect(getCustom<number>("gptel-max-tokens")).toBe(77)
+  expect(getCustom<boolean>("gptel-stream")).toBe(false)
+  expect(getCustom<boolean>("gptel-use-context")).toBe(false)
+  expect(getCustom<boolean>("gptel-include-reasoning")).toBe(true)
+  expect(getCustom<string>("gptel-confirm-tool-calls")).toBe("auto")
+  expect(getCustom<boolean>("gptel-track-media")).toBe(true)
+})
+
+test("Batch 3: gptel-save-preset registers a preset and opens an equivalent TypeScript snippet", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeDirective(editor, { name: "saved-directive", prompt: "Saved directive text" })
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  setCustom("gptel-system-message", "Saved directive text")
+  setCustom("gptel-system-prompt", "Saved directive text")
+  setCustom("gptel-tools", "lookup,read")
+  setCustom("gptel-stream", false)
+  setCustom("gptel-temperature", 0.2)
+  setCustom("gptel-max-tokens", 321)
+  setCustom("gptel-use-context", "user")
+  setCustom("gptel-track-media", true)
+  setCustom("gptel-include-reasoning", "ignore")
+
+  await editor.run("gptel-save-preset", ["saved-preset", "Saved description"])
+
+  const st = editor.locals.get("gptel-state") as { presets: Map<string, any> }
+  expect(st.presets.get("saved-preset")?.system).toBe("saved-directive")
+  expect(st.presets.get("saved-preset")?.tools).toEqual(["lookup", "read"])
+  expect(editor.activeBuffer.name).toBe("*gptel preset saved-preset*")
+  expect(editor.activeBuffer.text).toContain("gptelMakePreset(editor, {")
+  expect(editor.activeBuffer.text).toContain('"max-tokens": 321')
+})
+
+test("Batch 3: gptelWithPreset restores settings after async work", async () => {
+  const editor = new Editor()
+  await install(editor)
+  setCustom("gptel-model", "before")
+  setCustom("gptel-temperature", 0.1)
+  gptelMakePreset(editor, { name: "scoped", model: "inside", temperature: 0.9 })
+
+  const seen = await gptelWithPreset(editor, "scoped", async () => ({
+    model: getCustom<string>("gptel-model"),
+    temperature: getCustom<number>("gptel-temperature"),
+  }))
+
+  expect(seen).toEqual({ model: "inside", temperature: 0.9 })
+  expect(getCustom<string>("gptel-model")).toBe("before")
+  expect(getCustom<number>("gptel-temperature")).toBe(0.1)
+})
+
+test("Batch 3: @preset applies per request and strips the token from the sent prompt", async () => {
+  const editor = new Editor()
+  await install(editor)
+  gptelMakeOpenAI(editor, "CookieBackend", { endpoint: "http://cookie.test/v1/chat/completions", models: ["cookie"], defaultModel: "cookie", stream: false })
+  setCustom("gptel-backend", "Mock")
+  setCustom("gptel-model", "mock")
+  setCustom("gptel-system-message", "Before")
+  setCustom("gptel-stream", true)
+  gptelMakePreset(editor, {
+    name: "cookie",
+    backend: "CookieBackend",
+    model: "cookie",
+    system: "Cookie system",
+    stream: false,
+  })
+
+  const buffer = editor.scratch("*ChatGPT-cookie*", "User:\n@cookie explain this", "gptel-chat")
+  buffer.point = buffer.text.length
+  editor.switchToBuffer(buffer.id)
+  await editor.run("gptel-inspect-query-json")
+
+  const body = JSON.parse(editor.activeBuffer.text)
+  expect(body.model).toBe("cookie")
+  expect(body.messages[0]).toEqual({ role: "system", content: "Cookie system" })
+  expect(body.messages.at(-1).content).toBe("explain this")
+  expect(getCustom<string>("gptel-backend")).toBe("Mock")
+  expect(getCustom<string>("gptel-model")).toBe("mock")
+  expect(getCustom<string>("gptel-system-message")).toBe("Before")
+  expect(getCustom<boolean>("gptel-stream")).toBe(true)
 })
 
 test("upstream gptel-api-key and gptel-system-prompt aliases affect request payloads", async () => {
