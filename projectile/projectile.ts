@@ -66,6 +66,9 @@ export const projectileDefaultOtherFileAlist: ProjectileOtherFileAlist = [
   ["spec.jsx", ["jsx", "js"]],
 ]
 
+defcustom("projectile-known-projects-file", "string", join(homedir(), ".jemacs", "projectile-bookmarks.json"),
+  "File where Projectile known project roots are persisted.")
+
 /** Test-only: clear module caches between cases. */
 export function resetProjectileStateForTests(): void {
   knownProjects = null
@@ -545,8 +548,6 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
     "When t enables project files caching for the session.")
   defcustom("projectile-keymap-prefix", "string", "C-c p",
     "Projectile keymap prefix (Stephen: C-c p).")
-  defcustom("projectile-known-projects-file", "string", join(jemacsDir(), "projectile-bookmarks.json"),
-    "File where Projectile known project roots are persisted.")
   defcustom("projectile-switch-project-action", "string", "projectile-find-file",
     "Command invoked after switching projects.")
   defcustom("projectile-require-project-root", "sexp", false,
