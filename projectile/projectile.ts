@@ -1,6 +1,6 @@
 import { access, mkdir, readFile, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { basename, dirname, join, resolve } from "node:path"
+import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 
 import type { Editor, BufferModel } from "@jemacs/core"
 import { addHook, Keymap, defcustom, getCustom } from "@jemacs/core"
@@ -15,6 +15,8 @@ type ProjectileDeps = {
   lastCompileCommand: typeof import("@jemacs/core/../../plugins/compile").lastCompileCommand
 }
 
+export type ProjectileOtherFileAlist = Array<[string, string[]]>
+
 const ROOT_MARKERS_BOTTOM_UP = [
   ".git", ".hg", ".fslckout", "_FOSSIL_", ".bzr", "_darcs", ".pijul", ".sl", ".jj",
 ]
@@ -26,6 +28,43 @@ const projectRootCache = new Map<string, string | null>()
 const projectsCache = new Map<string, string[]>()
 
 let knownProjects: string[] | null = null
+
+export const projectileDefaultOtherFileAlist: ProjectileOtherFileAlist = [
+  ["cpp", ["h", "hpp", "ipp"]],
+  ["ipp", ["h", "hpp", "cpp"]],
+  ["hpp", ["h", "ipp", "cpp", "cc"]],
+  ["cxx", ["hxx", "ixx"]],
+  ["ixx", ["cxx", "hxx"]],
+  ["hxx", ["ixx", "cxx"]],
+  ["c", ["h"]],
+  ["m", ["h"]],
+  ["mm", ["h"]],
+  ["h", ["c", "cc", "cpp", "cxx", "m", "mm"]],
+  ["cc", ["h", "hh", "hpp"]],
+  ["hh", ["cc"]],
+  ["vert", ["frag"]],
+  ["frag", ["vert"]],
+  ["cu", ["cuh"]],
+  ["cuh", ["cu"]],
+  ["ino", ["h"]],
+  ["pde", ["h"]],
+  ["S", ["R"]],
+  ["R", ["S"]],
+  ["vim", ["lua"]],
+  ["lua", ["vim"]],
+  ["ts", ["test.ts", "spec.ts", "tsx"]],
+  ["tsx", ["test.tsx", "spec.tsx", "ts"]],
+  ["js", ["test.js", "spec.js", "jsx"]],
+  ["jsx", ["test.jsx", "spec.jsx", "js"]],
+  ["test.ts", ["ts", "tsx"]],
+  ["spec.ts", ["ts", "tsx"]],
+  ["test.tsx", ["tsx", "ts"]],
+  ["spec.tsx", ["tsx", "ts"]],
+  ["test.js", ["js", "jsx"]],
+  ["spec.js", ["js", "jsx"]],
+  ["test.jsx", ["jsx", "js"]],
+  ["spec.jsx", ["jsx", "js"]],
+]
 
 /** Test-only: clear module caches between cases. */
 export function resetProjectileStateForTests(): void {
@@ -260,6 +299,81 @@ function selectDwimFiles(files: string[], needle: string): string[] {
   return files.filter(f => f.includes(normalized))
 }
 
+function otherFileSuffix(suffix: string): string {
+  return suffix.startsWith(".") ? suffix : `.${suffix}`
+}
+
+function splitOtherFile(path: string, fromSuffix: string): { stem: string; dir: string; base: string } | null {
+  const suffix = otherFileSuffix(fromSuffix)
+  if (!path.endsWith(suffix)) return null
+  const stem = path.slice(0, -suffix.length)
+  return { stem, dir: dirname(stem), base: basename(stem) }
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)]
+}
+
+export function projectileOtherFileCandidates(
+  file: string,
+  projectFiles: string[],
+  alist: ProjectileOtherFileAlist = projectileDefaultOtherFileAlist,
+): string[] {
+  const direct: string[] = []
+  const basenameMatches: string[] = []
+  const sortedAlist = [...alist].sort((a, b) => otherFileSuffix(b[0]).length - otherFileSuffix(a[0]).length)
+
+  for (const [from, tos] of sortedAlist) {
+    const split = splitOtherFile(file, from)
+    if (!split) continue
+    for (const to of tos) {
+      const target = `${split.stem}${otherFileSuffix(to)}`
+      if (projectFiles.includes(target) && target !== file) direct.push(target)
+      const targetBase = `${split.base}${otherFileSuffix(to)}`
+      for (const candidate of projectFiles) {
+        if (candidate !== file && basename(candidate) === targetBase) basenameMatches.push(candidate)
+      }
+    }
+  }
+
+  return uniqueStrings([...direct, ...basenameMatches])
+}
+
+function projectDirs(files: string[]): string[] {
+  return [...new Set(files.map(f => {
+    const d = dirname(f)
+    return d === "." ? "" : d + "/"
+  }).filter(Boolean))].sort()
+}
+
+function projectFilesInDirectory(files: string[], directory: string): string[] {
+  const normalized = directory.replace(/^\.\//, "").replace(/\/$/, "")
+  if (!normalized || normalized === ".") return [...files]
+  const dir = normalized + "/"
+  return files.filter(f => f.startsWith(dir))
+}
+
+function projectRelativeDirectory(root: string, directory: string): string {
+  if (!isAbsolute(directory)) return directory
+  const resolvedRoot = resolve(root)
+  const resolvedDirectory = resolve(directory)
+  if (resolvedDirectory === resolvedRoot) return ""
+  return resolvedDirectory.startsWith(resolvedRoot + "/")
+    ? resolvedDirectory.slice(resolvedRoot.length + 1)
+    : directory
+}
+
+async function recentfList(): Promise<string[] | null> {
+  try {
+    // TODO: @jemacs/builtin-plugins — see ProjectileDeps note above.
+    const persistModule = "@jemacs/core/../../plugins/persist"
+    const persist = await import(persistModule)
+    return [...persist.recentfList]
+  } catch {
+    return null
+  }
+}
+
 async function findFileDwim(
   editor: Editor,
   invalidate: number | boolean | null | undefined,
@@ -326,15 +440,28 @@ function testFilePredicate(file: string): boolean {
   return /(?:^|\/)(?:test|spec|tests)\/|(?:_test|\.test|\.spec)\./.test(file)
 }
 
-function complementaryTestPath(file: string): string {
-  if (/_test\.[^/]+$/.test(file)) return file.replace(/_test(\.[^/]+)$/, "$1")
-  if (/\.test\.[^/]+$/.test(file)) return file.replace(/\.test(\.[^/]+)$/, "$1")
-  if (/\/test\//.test(file)) return file.replace(/\/test\//, "/")
+function implementationOrTestTarget(file: string, files: string[]): string | undefined {
+  if (testFilePredicate(file)) {
+    const implementation = file
+      .replace(/_test(\.[^/]+)$/, "$1")
+      .replace(/\.test(\.[^/]+)$/, "$1")
+      .replace(/\.spec(\.[^/]+)$/, "$1")
+      .replace(/\/test\//, "/")
+    return files.find(f => f === implementation)
+  }
+
   const base = basename(file)
   const dir = dirname(file)
   const stem = base.replace(/\.[^.]+$/, "")
   const ext = base.includes(".") ? base.slice(base.lastIndexOf(".")) : ""
-  return join(dir, `${stem}_test${ext}`)
+  const candidates = [
+    join(dir, `${stem}_test${ext}`),
+    join(dir, `${stem}.test${ext}`),
+    join(dir, `${stem}.spec${ext}`),
+    file.replace(/(^|\/)(src|lib)\//, "$1test/"),
+    file.replace(/(^|\/)(src|lib)\//, "$1tests/"),
+  ]
+  return uniqueStrings(candidates).find(candidate => files.includes(candidate))
 }
 
 const PROJECTILE_COMMAND_MAP: Array<[string, string]> = [
@@ -353,10 +480,12 @@ const PROJECTILE_COMMAND_MAP: Array<[string, string]> = [
   ["d", "projectile-find-dir"],
   ["D", "projectile-dired"],
   ["e", "projectile-recentf"],
+  ["C-f", "projectile-find-file-in-directory"],
   ["g", "projectile-find-file-dwim"],
   ["F", "projectile-find-file-in-known-projects"],
   ["f", "projectile-find-file"],
   ["i", "projectile-invalidate-cache"],
+  ["I", "projectile-ibuffer"],
   ["k", "projectile-kill-buffers"],
   ["p", "projectile-switch-project"],
   ["q", "projectile-switch-open-project"],
@@ -387,6 +516,8 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
     "Projects not added to projectile-known-projects.")
   defcustom("projectile-track-known-projects-automatically", "boolean", true,
     "Register projects when visiting files.")
+  defcustom("projectile-other-file-alist", "sexp", projectileDefaultOtherFileAlist,
+    "Alist mapping file suffixes to related file suffixes.")
 
   const projectileMap = new Keymap("projectile-command-map")
   const defaultOpen: FindFileOp = async (ed, path) => { await ed.openFile(path) }
@@ -502,8 +633,26 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
   }, "Search the project with ripgrep.")
 
   editor.command("projectile-recentf", async ({ editor }) => {
-    await editor.run("recentf-open")
-  }, "Open a recent file.")
+    const root = await acquireRoot(editor)
+    if (!root) return
+    const list = await recentfList()
+    if (!list) {
+      editor.message("projectile-recentf: recentf plugin is not available; falling back to recentf-open")
+      await editor.run("recentf-open")
+      return
+    }
+    const resolvedRoot = resolve(root)
+    const files = list.filter(f => {
+      const path = resolve(f)
+      return path === resolvedRoot || path.startsWith(resolvedRoot + "/")
+    })
+    if (!files.length) {
+      editor.message("No recent files in current project")
+      return
+    }
+    const choice = await projectileCompletingRead(editor, "Open recent file: ", files, root, "file")
+    if (choice) await editor.openFile(choice)
+  }, "Open a recent file from the current project.")
 
   editor.command("projectile-add-known-project", async ({ editor, args }) => {
     const root = args[0] ?? await editor.prompt("Add to known projects: ", editor.currentBuffer.directory() ?? process.cwd())
@@ -530,6 +679,20 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
     await editor.run("switch-to-buffer-other-window", [choice])
   }, "Switch to a project buffer in another window.")
 
+  editor.command("projectile-ibuffer", async ({ editor }) => {
+    const root = await acquireRoot(editor)
+    if (!root) return
+    const buffers = projectBufferFiles(editor, root)
+    if (!buffers.length) {
+      editor.message("No project buffers")
+      return
+    }
+    const names = buffers.map(b => editor.bufferDisplayName(b))
+    const choice = await projectileCompletingRead(editor, "Project buffer: ", names, root, "projectile-buffer")
+    if (!choice) return
+    editor.switchToBuffer(choice)
+  }, "Select a project buffer (Jemacs has no native ibuffer UI).")
+
   editor.command("projectile-kill-buffers", async ({ editor }) => {
     const root = await acquireRoot(editor)
     if (!root) return
@@ -543,14 +706,30 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
     if (!root) return
     maybeInvalidateCache(prefixArgument, root)
     const files = await projectileProjectFiles(root)
-    const dirs = [...new Set(files.map(f => {
-      const d = dirname(f)
-      return d === "." ? "" : d + "/"
-    }).filter(Boolean))].sort()
+    const dirs = projectDirs(files)
     const choice = await projectileCompletingRead(editor, "Find directory: ", dirs, root, "projectile-dir")
     if (!choice) return
     await editor.run("dired", [join(root, choice)])
   }, "Jump to a project directory.")
+
+  editor.command("projectile-find-file-in-directory", async ({ editor, args, prefixArgument }) => {
+    const root = await acquireRoot(editor)
+    if (!root) return
+    maybeInvalidateCache(prefixArgument, root)
+    const files = await projectileProjectFiles(root)
+    const dirs = projectDirs(files)
+    const directory = args[0]
+      ?? await projectileCompletingRead(editor, "Find file in directory: ", dirs, root, "projectile-dir")
+    if (!directory) return
+    const relDir = projectRelativeDirectory(root, directory)
+    const choices = projectFilesInDirectory(files, relDir)
+    if (!choices.length) {
+      editor.message(`No tracked files in ${directory}`)
+      return
+    }
+    const choice = await projectileCompletingRead(editor, "Find file: ", choices, root, "projectile-file")
+    if (choice) await editor.openFile(join(root, choice))
+  }, "Find a project file under a selected project directory.")
 
   editor.command("projectile-find-test-file", async ({ editor, prefixArgument }) => {
     const root = await acquireRoot(editor)
@@ -571,9 +750,7 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
     }
     const rel = path.startsWith(root) ? path.slice(root.length + 1) : basename(path)
     const files = await projectileProjectFiles(root)
-    const target = testFilePredicate(rel)
-      ? files.find(f => f === rel.replace(/_test(\.[^/]+)$/, "$1").replace(/\.test(\.[^/]+)$/, "$1").replace(/\/test\//, "/"))
-      : files.find(f => f === complementaryTestPath(rel))
+    const target = implementationOrTestTarget(rel, files)
     if (!target) {
       editor.message("No matching implementation/test file found")
       return
@@ -581,16 +758,67 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
     await editor.openFile(join(root, target))
   }, "Toggle between implementation and test file.")
 
-  editor.command("projectile-find-other-file", async ({ editor }) => {
-    editor.message("projectile-find-other-file: not yet implemented")
+  editor.command("projectile-find-other-file", async ({ editor, prefixArgument }) => {
+    const path = editor.currentBuffer.path
+    const root = path ? await projectileProjectRoot(dirname(path)) : null
+    if (!path || !root) {
+      editor.message("Not in a project file")
+      return
+    }
+    maybeInvalidateCache(prefixArgument, root)
+    const rel = path.startsWith(root) ? path.slice(root.length + 1) : basename(path)
+    const files = await projectileProjectFiles(root)
+    const alist = getCustom<ProjectileOtherFileAlist>("projectile-other-file-alist")
+      ?? projectileDefaultOtherFileAlist
+    const candidates = projectileOtherFileCandidates(rel, files, alist)
+    if (!candidates.length) {
+      editor.message("No matching other file found")
+      return
+    }
+    const choice = candidates.length === 1
+      ? candidates[0]!
+      : await projectileCompletingRead(editor, "Find other file: ", candidates, root, "projectile-file")
+    if (choice) await editor.openFile(join(root, choice))
   }, "Switch between files with the same basename and different extensions.")
 
-  editor.command("projectile-find-other-file-other-window", async ({ editor }) => {
-    await editor.run("projectile-find-other-file")
+  editor.command("projectile-find-other-file-other-window", async ({ editor, prefixArgument }) => {
+    const path = editor.currentBuffer.path
+    const root = path ? await projectileProjectRoot(dirname(path)) : null
+    if (!path || !root) {
+      editor.message("Not in a project file")
+      return
+    }
+    maybeInvalidateCache(prefixArgument, root)
+    const rel = path.startsWith(root) ? path.slice(root.length + 1) : basename(path)
+    const files = await projectileProjectFiles(root)
+    const alist = getCustom<ProjectileOtherFileAlist>("projectile-other-file-alist")
+      ?? projectileDefaultOtherFileAlist
+    const candidates = projectileOtherFileCandidates(rel, files, alist)
+    if (!candidates.length) {
+      editor.message("No matching other file found")
+      return
+    }
+    const choice = candidates.length === 1
+      ? candidates[0]!
+      : await projectileCompletingRead(editor, "Find other file: ", candidates, root, "projectile-file")
+    if (choice) await editor.run("find-file-other-window", [join(root, choice)])
   })
 
   editor.command("projectile-find-implementation-or-test-other-window", async ({ editor }) => {
-    await editor.run("projectile-toggle-between-implementation-and-test")
+    const path = editor.currentBuffer.path
+    const root = path ? await projectileProjectRoot(dirname(path)) : null
+    if (!path || !root) {
+      editor.message("Not in a project file")
+      return
+    }
+    const rel = path.startsWith(root) ? path.slice(root.length + 1) : basename(path)
+    const files = await projectileProjectFiles(root)
+    const target = implementationOrTestTarget(rel, files)
+    if (!target) {
+      editor.message("No matching implementation/test file found")
+      return
+    }
+    await editor.run("find-file-other-window", [join(root, target)])
   })
 
   editor.command("projectile-find-file-in-known-projects", async ({ editor }) => {
@@ -618,6 +846,7 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
   }, "Add the current file to the project cache.")
 
   editor.command("projectile-replace", async ({ editor }) => {
+    editor.message("projectile-replace: project-wide replacement is not available; running query-replace in current buffer")
     await editor.run("query-replace")
   }, "Replace in the current buffer.")
 
@@ -628,6 +857,7 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
   editor.command("projectile-vc", async ({ editor }) => {
     const root = await acquireRoot(editor)
     if (!root) return
+    editor.message("projectile-vc: Jemacs has no vc-dir integration; opening project root in dired")
     await editor.run("dired", [root])
   }, "Open version control at project root.")
 
@@ -661,6 +891,7 @@ export async function install(editor: Editor, deps?: ProjectileDeps): Promise<vo
   }, "Run the project.")
 
   editor.command("projectile-commander", async ({ editor }) => {
+    editor.message("projectile-commander: command menu is not implemented; using execute-extended-command")
     await editor.run("execute-extended-command")
   }, "Projectile commander (M-x fallback).")
 
