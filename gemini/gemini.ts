@@ -1,7 +1,6 @@
-import { homedir } from "node:os"
 import { join } from "node:path"
-import type { BufferModel } from "../../jemacs-opentui/src/kernel/buffer"
-import type { Editor } from "../../jemacs-opentui/src/kernel/editor"
+import type { BufferModel, Editor } from "@jemacs/core"
+import { jemacsHome } from "../core-path"
 import {
   GEMINI_HISTORY,
   GEMINI_PENDING,
@@ -14,18 +13,18 @@ import {
   renderWelcomeBanner,
   turnFromJson,
   type GeminiSection,
-  type GeminiTurn,
 } from "./render"
+import type { GeminiTurn } from "./types"
 import { runGeminiJson } from "./run"
 
 type GeminiDeps = {
-  Keymap: typeof import("../../jemacs-opentui/src/kernel/keymap").Keymap
-  defineMode: typeof import("../../jemacs-opentui/src/modes/mode").defineMode
-  defcustom: typeof import("../../jemacs-opentui/src/runtime/custom").defcustom
-  getCustom: typeof import("../../jemacs-opentui/src/runtime/custom").getCustom
-  defface: typeof import("../../jemacs-opentui/src/runtime/faces").defface
-  spawnProcess: typeof import("../../jemacs-opentui/src/platform/runtime").spawnProcess
-  whichExecutable: typeof import("../../jemacs-opentui/src/platform/runtime").whichExecutable
+  Keymap: typeof import("@jemacs/core").Keymap
+  defineMode: typeof import("@jemacs/core").defineMode
+  defcustom: typeof import("@jemacs/core").defcustom
+  getCustom: typeof import("@jemacs/core").getCustom
+  defface: typeof import("@jemacs/core").defface
+  spawnProcess: typeof import("@jemacs/core").spawnProcess
+  whichExecutable: typeof import("@jemacs/core").whichExecutable
 }
 
 const GEMINI_BUFFER = "*Gemini*"
@@ -34,10 +33,6 @@ const GEMINI_LAST_PROMPT = "gemini-last-prompt"
 const GEMINI_LAST_STDIN = "gemini-last-stdin"
 
 type HistoryEntry = { prompt: string; turn: GeminiTurn; stdin?: string }
-
-function jemacsHome(): string {
-  return process.env.JEMACS_HOME ?? join(homedir(), "programming", "jemacs", "jemacs-opentui")
-}
 
 async function loadDeps(): Promise<GeminiDeps> {
   const home = jemacsHome()

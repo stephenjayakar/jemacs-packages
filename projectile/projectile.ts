@@ -3,16 +3,14 @@ import { homedir } from "node:os"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 
 import type { Editor, BufferModel } from "@jemacs/core"
-import { addHook, Keymap, defcustom, getCustom } from "@jemacs/core"
-import { defineMinorMode } from "@jemacs/core/modes/minor-mode"
-import { spawnProcess } from "@jemacs/core/platform/runtime"
+import { addHook, Keymap, defcustom, defineMinorMode, getCustom, spawnProcess } from "@jemacs/core"
+import { jemacsHome } from "../core-path"
 
 type FindFileOp = (editor: Editor, path: string) => Promise<void>
 
-// TODO: @jemacs/builtin-plugins — plugins/ is not part of @jemacs/core's export surface.
 type ProjectileDeps = {
-  compilationStart: typeof import("@jemacs/core/../../plugins/compile").compilationStart
-  lastCompileCommand: typeof import("@jemacs/core/../../plugins/compile").lastCompileCommand
+  compilationStart(editor: Editor, command: string, cwd: string): Promise<BufferModel>
+  lastCompileCommand(editor: Editor): string
 }
 
 export type ProjectileOtherFileAlist = Array<[string, string[]]>
@@ -387,9 +385,7 @@ function projectRelativeDirectory(root: string, directory: string): string {
 
 async function recentfList(): Promise<string[] | null> {
   try {
-    // TODO: @jemacs/builtin-plugins — see ProjectileDeps note above.
-    const persistModule = "@jemacs/core/../../plugins/persist"
-    const persist = await import(persistModule)
+    const persist = await import(join(jemacsHome(), "plugins/persist/index.ts"))
     return [...persist.recentfList]
   } catch {
     return null

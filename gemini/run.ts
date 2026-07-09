@@ -1,4 +1,4 @@
-import type { SpawnHandle } from "../../jemacs-opentui/src/platform/runtime"
+import type { SpawnHandle } from "@jemacs/core"
 import type { GeminiJsonResponse } from "./types"
 
 export type RunGeminiOptions = {

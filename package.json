@@ -7,11 +7,12 @@
     "@ai-sdk/anthropic": "3.0.81",
     "@ai-sdk/google": "3.0.80",
     "@ai-sdk/openai": "3.0.68",
-    "@jemacs/core": "file:../jemacs-opentui/packages/jemacs-core",
     "ai": "6.0.197",
     "zod": "4.4.3"
   },
   "scripts": {
+    "postinstall": "scripts/link-core.sh",
+    "link:core": "scripts/link-core.sh",
     "check": "bun x tsc --noEmit -p .",
     "test": "bun test"
   },

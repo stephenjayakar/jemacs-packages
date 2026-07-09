@@ -3,15 +3,6 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "paths": {
-      "@jemacs/core": ["../jemacs-opentui/packages/jemacs-core/index.ts"],
-      "@jemacs/core/kernel/*": ["../jemacs-opentui/src/kernel/*"],
-      "@jemacs/core/modes/*": ["../jemacs-opentui/src/modes/*"],
-      "@jemacs/core/runtime/*": ["../jemacs-opentui/src/runtime/*"],
-      "@jemacs/core/platform/*": ["../jemacs-opentui/src/platform/*"],
-      "@jemacs/core/display/*": ["../jemacs-opentui/src/display/*"],
-      "@jemacs/core/lsp/*": ["../jemacs-opentui/src/lsp/*"]
-    },
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,

@@ -1,6 +1,6 @@
-import { homedir } from "node:os"
 import { join } from "node:path"
 import { BufferModel, type Editor } from "@jemacs/core"
+import { jemacsHome } from "../core-path"
 
 type JtermModule = {
   spawnSession: (
@@ -36,10 +36,6 @@ export type JagentTerminalDisplayOptions = {
 
 const JAGENT_TERMINAL_BUFFER = "*Jagent Terminal*"
 const JTERM_SESSION_LOCAL = "jterm-session"
-
-function jemacsHome(): string {
-  return process.env.JEMACS_HOME ?? join(homedir(), "programming", "jemacs", "jemacs-opentui")
-}
 
 async function loadJterm(): Promise<JtermModule> {
   return await import(join(jemacsHome(), "plugins/jterm/index.ts")) as JtermModule

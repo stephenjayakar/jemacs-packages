@@ -1,7 +1,6 @@
 import { basename, resolve } from "node:path"
 import type { BufferModel, Editor, PluginContext } from "@jemacs/core"
-import { Keymap, createPluginContext, defcustom, getCustom } from "@jemacs/core"
-import { defineMode } from "@jemacs/core/modes/mode"
+import { Keymap, createPluginContext, defcustom, defineMode, getCustom } from "@jemacs/core"
 import { runJagentAgent, clearJagentAgent, abortJagentAgent, type JagentAgentState } from "./agent"
 import { refreshJagentBuffer, jagentFontLock } from "./render"
 import { showJagentTerminal } from "./terminal"

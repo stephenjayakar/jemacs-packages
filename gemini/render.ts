@@ -1,5 +1,4 @@
-import type { BufferModel } from "../../jemacs-opentui/src/kernel/buffer"
-import type { FaceName, TextSpan } from "../../jemacs-opentui/src/modes/mode"
+import type { BufferModel, FaceName, TextSpan } from "@jemacs/core"
 import type { GeminiJsonError, GeminiJsonResponse, GeminiTokenStats, GeminiTurn } from "./types"
 
 export const GEMINI_SECTIONS = "gemini-sections"

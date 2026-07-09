@@ -11,14 +11,11 @@ import {
 import { projectileProjectFiles, projectileProjectRoot } from "../projectile/projectile"
 
 import type { Editor, BufferModel } from "@jemacs/core"
-import { addHook, Keymap, findWindowLeaf, listWindowLeaves, defcustom, getCustom } from "@jemacs/core"
-import { defineMode } from "@jemacs/core/modes/mode"
-import { defineMinorMode } from "@jemacs/core/modes/minor-mode"
+import { addHook, Keymap, findWindowLeaf, listWindowLeaves, defcustom, defineMode, defineMinorMode, getCustom } from "@jemacs/core"
 
-// TODO: @jemacs/builtin-plugins — plugins/ is not part of @jemacs/core's export surface.
 type FileSidebarDeps = {
-  projectRoot: typeof import("@jemacs/core/../../plugins/project/index").projectRoot
-  projectFiles: typeof import("@jemacs/core/../../plugins/project/index").projectFiles
+  projectRoot(dir: string): Promise<string | null>
+  projectFiles(root: string): Promise<string[]>
 }
 
 const SIDEBAR_BUFFER = "*File Sidebar*"

@@ -1,40 +1,50 @@
 # Setup
 
-This repo depends on `@jemacs/core` from a **sibling checkout** of the `jemacs` repo:
-
-```
-~/src/
-  jemacs/             # github.com/stephenjayakar/jemacs
-  jemacs-packages/    # this repo
-```
-
-The `file:../jemacs/packages/jemacs-core` dep in `package.json` resolves through that layout. If your checkout is named differently (e.g. `jemacs-opentui`), either rename it or symlink: `ln -s jemacs-opentui jemacs`.
+The packages repository no longer requires a sibling core checkout. Install the
+core globally, then install packages:
 
 ```sh
-bun install          # links @jemacs/core
-bun run check        # tsc
+/path/to/jemacs-core/scripts/install.sh
+./scripts/install.sh
+```
+
+The default layout is:
+
+```text
+~/.local/share/jemacs/       core installation
+~/.jemacs/packages/          this repository
+```
+
+For development against an uninstalled checkout:
+
+```sh
+JEMACS_HOME=/path/to/jemacs-core bun install
+bun run check
 bun test
 ```
 
+`bun install` runs `scripts/link-core.sh`, which creates
+`node_modules/@jemacs/core` from `JEMACS_HOME` (or the global default). No
+relative checkout path is encoded in `package.json` or `tsconfig.json`.
+
 ## Pinning
 
-`.jemacs-core-pin` holds the `jemacs` SHA this repo is tested against. CI checks out exactly that rev as the sibling. Bump it when you need a newer core:
+`.jemacs-core-pin` records the Jemacs revision used by CI. Update it explicitly
+when packages require a newer core API:
 
 ```sh
-git -C ../jemacs rev-parse HEAD > .jemacs-core-pin
+git -C /path/to/jemacs-core rev-parse HEAD > .jemacs-core-pin
 ```
-
-## Why not a submodule?
-
-Multiple consumer repos (this one + a work-packages repo) depend on one core — that's a package dependency, not vendored source. Submodules would put packages *inside* jemacs and add git friction (`--recursive`, detached HEAD) for nothing a `file:` dep doesn't already give you. When `@jemacs/core` publishes to npm, this becomes `"@jemacs/core": "^0.x"` and the sibling-checkout requirement goes away.
 
 ## Importing
 
+Use the public barrel instead of reaching into the core checkout:
+
 ```ts
 import type { Editor } from "@jemacs/core"
-import { Keymap, addHook } from "@jemacs/core"
-import { defineMinorMode } from "@jemacs/core/modes/minor-mode"
-import { spawnProcess } from "@jemacs/core/platform/runtime"
+import { Keymap, addHook, defineMinorMode, spawnProcess } from "@jemacs/core"
 ```
 
-Plugin-to-plugin deps (e.g. `plugins/compile`'s `compilationStart`) aren't in `@jemacs/core` — for now reach them via `@jemacs/core/../../plugins/compile` or take them as a deps-bag in `install(editor, deps)`. A `@jemacs/builtin-plugins` package is the eventual answer.
+Built-in plugins are not part of `@jemacs/core`. Accept them as a dependency
+bag in `install(editor, deps)`, or dynamically import them from `JEMACS_HOME`
+when integration with a built-in is unavoidable.

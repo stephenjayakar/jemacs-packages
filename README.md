@@ -2,7 +2,18 @@
 
 Experimental jemacs plugins not yet upstreamed. Each package is a directory with `index.ts` exporting `install(editor)`.
 
-Loaded automatically by `jemacs-stephen-config` from `~/.jemacs/packages/` (symlinked by `deploy.sh`).
+Loaded automatically by `jemacs-stephen-config` from `~/.jemacs/packages/`.
+
+Install this checkout independently of the core and config:
+
+```bash
+./scripts/install.sh
+```
+
+The script links this repository at `~/.jemacs/packages`, links
+`node_modules/@jemacs/core` to the globally installed core at
+`${XDG_DATA_HOME:-~/.local/share}/jemacs`, and runs checks. Set `JEMACS_HOME`
+when developing against a different core checkout.
 
 ## Getting Started With Packages
 
@@ -14,12 +25,12 @@ jemacs-packages/
     index.ts
 ```
 
-`index.ts` must export an `install` function. The config loader imports packages alphabetically from `~/.jemacs/packages/<name>/index.ts`, so deploy once, restart `jemacs`, and the symlinked checkout is what gets loaded.
+`index.ts` must export an `install` function. The config loader imports packages alphabetically from `~/.jemacs/packages/<name>/index.ts`, so install once, restart `jemacs`, and the linked checkout is what gets loaded.
 
 Start with the smallest useful package:
 
 ```ts
-type Editor = import("../../jemacs-opentui/src/kernel/editor").Editor
+import type { Editor } from "@jemacs/core"
 
 export function install(editor: Editor): void {
   editor.command("my-package-hello", ({ editor }) => {
@@ -45,32 +56,15 @@ This is the pattern used by `projectile/` and `file-sidebar/`. It keeps the load
 
 ## Importing Jemacs APIs
 
-Packages live outside `jemacs-opentui`, so imports usually do one of two things.
-
-For types, static relative imports are fine:
+Packages use the public core package for both types and runtime APIs:
 
 ```ts
-type Editor = import("../../jemacs-opentui/src/kernel/editor").Editor
-type BufferModel = import("../../jemacs-opentui/src/kernel/buffer").BufferModel
+import type { BufferModel, Editor } from "@jemacs/core"
+import { defineMinorMode, Keymap } from "@jemacs/core"
 ```
 
-For runtime APIs, prefer resolving through `JEMACS_HOME` so the package follows the deployed editor checkout:
-
-```ts
-import { homedir } from "node:os"
-import { join } from "node:path"
-
-function jemacsHome(): string {
-  return process.env.JEMACS_HOME ?? join(homedir(), "programming", "jemacs", "jemacs-opentui")
-}
-
-export async function install(editor: Editor): Promise<void> {
-  const { defineMinorMode } = await import(join(jemacsHome(), "src/modes/minor-mode.ts"))
-  // use defineMinorMode(...)
-}
-```
-
-That fallback path is only for dev convenience. Normal launches set `JEMACS_HOME` through the `jemacs` wrapper.
+For a built-in plugin that is not part of the public core API, resolve it from
+`JEMACS_HOME`; `core-path.ts` provides the canonical global fallback.
 
 ## Commands And Keys
 
@@ -100,11 +94,9 @@ editor.defineKey("my-minor-mode", "C-c x", "my-package-toggle")
 For a toggleable package, define a minor mode. Use a package-prefixed mode name and a short lighter:
 
 ```ts
-import { Keymap } from "../../jemacs-opentui/src/kernel/keymap"
+import { defineMinorMode, Keymap } from "@jemacs/core"
 
 export async function install(editor: Editor): Promise<void> {
-  const { defineMinorMode } = await import(join(jemacsHome(), "src/modes/minor-mode.ts"))
-
   const keymap = new Keymap("my-package-mode-map")
   keymap.bind("C-c m x", "my-package-do-thing")
 
@@ -162,7 +154,7 @@ For reload-friendly packages, accept a plugin context and register through it:
 import {
   createPluginContext,
   type PluginContext,
-} from "../../jemacs-opentui/src/runtime/plugin-context"
+} from "@jemacs/core"
 
 export function install(editor: Editor, ctx?: PluginContext): void {
   const c = ctx ?? createPluginContext(editor)
@@ -177,13 +169,17 @@ Built-in plugins use `ctx.command`, `ctx.key`, `ctx.hook`, `ctx.advice`, `ctx.mi
 
 ## Testing
 
-For pure helpers, export them and test them directly. The sibling `jemacs-opentui/packages-test/` directory is reserved for tests that import this repo without making `bun test` pick them up by default.
+For pure helpers, export them and test them directly. The core repository's
+`packages-test/` directory contains additional integration tests. Point those
+tests at this checkout with `JEMACS_PACKAGES` when it is not installed at the
+default path.
 
 Example:
 
 ```bash
-cd ../jemacs-opentui
-bun test packages-test/projectile.ts packages-test/file-sidebar.ts
+cd /path/to/jemacs-core
+JEMACS_PACKAGES=/path/to/jemacs-packages \
+  bun test ./packages-test/projectile.ts ./packages-test/file-sidebar.ts
 ```
 
 For package changes that touch kernel behavior, run the normal checks in `jemacs-opentui`:

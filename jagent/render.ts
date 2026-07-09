@@ -1,5 +1,5 @@
 import type { BufferModel } from "@jemacs/core"
-import type { FaceName, TextSpan } from "@jemacs/core/modes/mode"
+import type { FaceName, TextSpan } from "@jemacs/core"
 import { describeJagentSettings } from "./provider"
 import type { JagentEvent, JagentMessage, JagentSettings, JagentToolResult } from "./types"
 

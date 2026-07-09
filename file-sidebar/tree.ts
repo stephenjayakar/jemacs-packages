@@ -1,4 +1,4 @@
-import type { TextSpan } from "@jemacs/core/modes/mode"
+import type { TextSpan } from "@jemacs/core"
 
 export type FileTreeNode = {
   name: string

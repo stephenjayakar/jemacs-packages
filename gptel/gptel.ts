@@ -3,21 +3,20 @@ import { existsSync, readFileSync, statSync } from "node:fs"
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises"
 import { dirname, join, relative, resolve } from "node:path"
 import { homedir } from "node:os"
-import type { BufferModel } from "../../jemacs-opentui/src/kernel/buffer"
-import type { Editor, TransientDefinition } from "../../jemacs-opentui/src/kernel/editor"
-import type { TextSpan } from "../../jemacs-opentui/src/kernel/extension-points"
+import type { BufferModel, Editor, TextSpan, TransientDefinition } from "@jemacs/core"
+import { jemacsHome } from "../core-path"
 
 type GptelDeps = {
-  Keymap: typeof import("../../jemacs-opentui/src/kernel/keymap").Keymap
-  defineMode: typeof import("../../jemacs-opentui/src/modes/mode").defineMode
-  defineMinorMode: typeof import("../../jemacs-opentui/src/modes/minor-mode").defineMinorMode
-  defcustom: typeof import("../../jemacs-opentui/src/runtime/custom").defcustom
-  getCustom: typeof import("../../jemacs-opentui/src/runtime/custom").getCustom
-  setCustom: typeof import("../../jemacs-opentui/src/runtime/custom").setCustom
-  getCustomVariable: typeof import("../../jemacs-opentui/src/runtime/custom").getCustomVariable
-  defface: typeof import("../../jemacs-opentui/src/runtime/faces").defface
-  killNew: typeof import("../../jemacs-opentui/src/runtime/kill-ring").killNew
-  currentKill: typeof import("../../jemacs-opentui/src/runtime/kill-ring").currentKill
+  Keymap: typeof import("@jemacs/core").Keymap
+  defineMode: typeof import("@jemacs/core").defineMode
+  defineMinorMode: typeof import("@jemacs/core").defineMinorMode
+  defcustom: typeof import("@jemacs/core").defcustom
+  getCustom: typeof import("@jemacs/core").getCustom
+  setCustom: typeof import("@jemacs/core").setCustom
+  getCustomVariable: typeof import("@jemacs/core").getCustomVariable
+  defface: typeof import("@jemacs/core").defface
+  killNew: typeof import("@jemacs/core").killNew
+  currentKill: typeof import("@jemacs/core").currentKill
 }
 
 export type GptelMessage = {
@@ -382,10 +381,6 @@ export type GptelChatMarkers = {
   promptPrefix: string
   responsePrefix: string
   separator: string
-}
-
-function jemacsHome(): string {
-  return process.env.JEMACS_HOME ?? join(homedir(), "programming", "jemacs", "jemacs-opentui")
 }
 
 async function loadDeps(): Promise<GptelDeps> {
