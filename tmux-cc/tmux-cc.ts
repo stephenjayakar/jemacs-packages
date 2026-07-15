@@ -442,9 +442,17 @@ export class TmuxCcController {
       for (const paneId of paneIds(parsed)) this.createPane(paneId)
       if (!this.paneForBuffer(this.editor.currentBuffer)) return
       const selectedWindowId = this.editor.selectedWindowId
-      const tree = tmuxLayoutToWindowTree(parsed, paneId => this.createPane(paneId).buffer, selectedWindowId)
+      const existingWindows = new Map(
+        listWindowLeaves(this.editor.windowLayout).map(leaf => [leaf.bufferId, leaf.id]),
+      )
+      const tree = tmuxLayoutToWindowTree(
+        parsed,
+        paneId => this.createPane(paneId).buffer,
+        selectedWindowId,
+        paneId => existingWindows.get(this.createPane(paneId).buffer.id),
+      )
       this.editor.mutateWindowLayout(() => tree, "tmux-cc-layout")
-      this.scheduleGeometry(true)
+      this.scheduleGeometry()
     } catch (error) {
       this.editor.message(`tmux-cc layout: ${error instanceof Error ? error.message : String(error)}`)
     }

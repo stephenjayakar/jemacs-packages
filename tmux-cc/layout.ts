@@ -66,20 +66,21 @@ export function tmuxLayoutToWindowTree(
   node: TmuxLayoutNode,
   bufferForPane: (paneId: string) => BufferModel,
   firstWindowId?: WindowId,
+  windowIdForPane?: (paneId: string) => WindowId | undefined,
 ): WindowNode {
   if (node.type === "pane") {
     if (!node.paneId) throw new Error("tmux pane node has no id")
     const buffer = bufferForPane(node.paneId)
     return {
       kind: "leaf",
-      id: firstWindowId ?? crypto.randomUUID(),
+      id: windowIdForPane?.(node.paneId) ?? firstWindowId ?? crypto.randomUUID(),
       bufferId: buffer.id,
       point: buffer.point,
       startLine: 0,
       dedicated: false,
     }
   }
-  return buildChildren(node, node.children, bufferForPane, firstWindowId)
+  return buildChildren(node, node.children, bufferForPane, firstWindowId, windowIdForPane)
 }
 
 function buildChildren(
@@ -87,14 +88,15 @@ function buildChildren(
   children: TmuxLayoutNode[],
   bufferForPane: (paneId: string) => BufferModel,
   firstWindowId?: WindowId,
+  windowIdForPane?: (paneId: string) => WindowId | undefined,
 ): WindowNode {
   const first = children[0]!
-  if (children.length === 1) return tmuxLayoutToWindowTree(first, bufferForPane, firstWindowId)
+  if (children.length === 1) return tmuxLayoutToWindowTree(first, bufferForPane, firstWindowId, windowIdForPane)
   const rest = children.slice(1)
-  const firstTree = tmuxLayoutToWindowTree(first, bufferForPane, firstWindowId)
+  const firstTree = tmuxLayoutToWindowTree(first, bufferForPane, firstWindowId, windowIdForPane)
   const restTree = rest.length === 1
-    ? tmuxLayoutToWindowTree(rest[0]!, bufferForPane)
-    : buildChildren(parent, rest, bufferForPane)
+    ? tmuxLayoutToWindowTree(rest[0]!, bufferForPane, undefined, windowIdForPane)
+    : buildChildren(parent, rest, bufferForPane, undefined, windowIdForPane)
   const total = parent.type === "horizontal"
     ? children.reduce((sum, child) => sum + child.width, 0) + children.length - 1
     : children.reduce((sum, child) => sum + child.height, 0) + children.length - 1

@@ -130,6 +130,7 @@ describe("tmux-cc controller", () => {
     expect(map?.get("M-x")).toBeUndefined()
     expect(map?.get("C-t 2")).toBe("tmux-cc-split-vertical")
     expect(map?.get("C-tab")).toBe("tmux-cc-smart-next-window")
+    expect(map?.get("C-x o")).toBe("tmux-cc-focus-next-pane")
     expect(map?.get("C-t S-s")).toBe("tmux-cc-new-session")
     expect(map?.get("C-t s")).toBe("tmux-cc-switch-session")
   })
@@ -166,8 +167,24 @@ describe("tmux-cc controller", () => {
     controller.handleLayout("@0", "abcd,80x24,0,0{40x24,0,0,0,39x24,41,0,1}")
     expect(listWindowLeaves(editor.windowLayout)).toHaveLength(oneWindow)
     controller.showPane("%0")
-    controller.handleLayout("@0", "abcd,80x24,0,0{40x24,0,0,0,39x24,41,0,1}")
+    const splitLayout = "abcd,80x24,0,0{40x24,0,0,0,39x24,41,0,1}"
+    controller.handleLayout("@0", splitLayout)
     expect(listWindowLeaves(editor.windowLayout)).toHaveLength(2)
+
+    controller.smartOtherWindow(1)
+    const selectedPane = controller.paneForBuffer(editor.currentBuffer)
+    expect(selectedPane?.id).toBe("%1")
+    const selectedWindow = editor.selectedWindowId
+    controller.handleLayout("@0", splitLayout)
+    expect(editor.selectedWindowId).toBe(selectedWindow)
+    expect(controller.paneForBuffer(editor.currentBuffer)?.id).toBe("%1")
+
+    await Bun.sleep(75)
+    const geometryCommands = () => control.commands.filter(command => command.startsWith("refresh-client -C")).length
+    const firstGeometryCount = geometryCommands()
+    controller.handleLayout("@0", splitLayout)
+    await Bun.sleep(75)
+    expect(geometryCommands()).toBe(firstGeometryCount)
 
     pane.session.writeRaw("Aé\r")
     await settle(() => control.commands.some(command => command.includes("send-keys") && command.includes("41 C3 A9 0D")), "JTerm input was not routed to tmux")
