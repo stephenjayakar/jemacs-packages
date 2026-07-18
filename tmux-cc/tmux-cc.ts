@@ -107,7 +107,16 @@ export function controllerFor(editor: Editor): TmuxCcController | undefined {
 }
 
 async function loadJterm(): Promise<JTermModule> {
-  return await import(join(jemacsHome(), "plugins/jterm/index.ts")) as JTermModule
+  const [jterm, session] = await Promise.all([
+    import(join(jemacsHome(), "plugins/jterm/index.ts")),
+    import(join(jemacsHome(), "plugins/jterm/session.ts")),
+  ])
+  return {
+    sessions: jterm.sessions,
+    keyToPtyBytes: jterm.keyToPtyBytes,
+    spawnPtyTransport: session.spawnPtyTransport,
+    attachTransportSession: session.attachTransportSession,
+  } as JTermModule
 }
 
 class TmuxPaneTransport implements JTermTransport {
