@@ -104,6 +104,7 @@ describe("DAP session", () => {
     for (let attempt = 0; attempt < 50 && !session.selectedFrame; attempt++) await Bun.sleep(10)
     expect(session.selectedFrame?.line).toBe(4)
     expect(session.scopes[0]?.variables[0]?.value).toBe("42")
+    expect(session.scopes[0]?.variables[1]?.variablesReference).toBe(21)
     expect((await session.evaluate("answer")).result).toBe("42")
     await session.continue()
     expect(session.state).toBe("running")

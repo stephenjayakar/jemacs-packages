@@ -152,9 +152,9 @@ The panes currently render mostly static text. GNU panes are interactive,
 refreshable trees with expandable variables, sessions, threads, frames,
 sources, and breakpoints.
 
-- [ ] Add expandable nested variables with lazy `variables` requests,
-      named/indexed paging, and `dap-ui-default-fetch-count`.
-- [ ] Add `setVariable` and editable local values.
+- [x] Add expandable nested variables with lazy `variables` requests.
+- [ ] Add named/indexed paging and `dap-ui-default-fetch-count`.
+- [x] Add `setVariable` and editable local values.
 - [ ] Implement `dap-ui-variable-length` truncation with access to full values.
 - [ ] Make Sessions rows select/delete sessions, threads, and frames.
 - [ ] Implement Breakpoints pane commands:
@@ -239,9 +239,8 @@ lifecycle hooks.
 - [ ] Implement `dap-register-debug-template` semantics and
       `dap-debug-template-configurations`.
 - [ ] Implement `dap-debug-edit-template` and the `*DAP Templates*` workflow.
-- [ ] Store a real recent-configuration ring so `dap-debug-last` and
-      `dap-debug-recent` match GNU behavior; the current recent command merely
-      reopens the full selection list.
+- [x] Store a real recent-configuration ring so `dap-debug-last` and
+      `dap-debug-recent` match GNU behavior.
 - [ ] Preserve launch arguments on sessions so restart/recent are lossless.
 - [ ] Port `.vscode/launch.json` discovery and selection behavior from
       `dap-launch.el`, including multi-root workspaces.

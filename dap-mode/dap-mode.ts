@@ -38,6 +38,7 @@ import type {
   DapLaunchConfiguration,
   DapSourceBreakpoint,
   DapSessionState,
+  DapVariable,
   LaunchJson,
 } from "./types"
 
@@ -63,6 +64,7 @@ type PersistedProject = {
   breakpoints: DapSourceBreakpoint[]
   watches: string[]
   lastSelection?: string
+  recentSelections?: string[]
 }
 type PersistedState = { version: 1; projects: Record<string, PersistedProject> }
 type UiAction =
@@ -70,6 +72,7 @@ type UiAction =
   | { kind: "frame"; sessionId: string; frameId: number }
   | { kind: "breakpoint"; id: string }
   | { kind: "session"; sessionId: string }
+  | { kind: "variable"; sessionId: string; variablesReference: number; name: string }
 
 type EditorState = {
   loaded: boolean
@@ -472,9 +475,20 @@ function renderSidebar(editor: Editor): void {
   render(LOCALS_NAME, "Locals", (lines, actions) => {
     const stopped = currentSession(editor)
     if (!stopped?.scopes.length) return actionLine(lines, actions, "  Nothing to display...")
+    const renderVariables = (variables: DapVariable[], depth: number): void => {
+      for (const variable of variables) {
+        const key = `${stopped.id}:var:${variable.variablesReference}`
+        const expanded = variable.variablesReference > 0 && st.expanded.has(key)
+        const marker = variable.variablesReference > 0 ? (expanded ? "▾" : "▸") : " "
+        actionLine(lines, actions, `${"  ".repeat(depth)}${marker} ${variable.name}: ${variable.value}`, variable.variablesReference > 0 ? {
+          kind: "variable", sessionId: stopped.id, variablesReference: variable.variablesReference, name: variable.name,
+        } : undefined)
+        if (expanded) renderVariables(stopped.variableChildren.get(variable.variablesReference) ?? [], depth + 1)
+      }
+    }
     for (const scope of stopped.scopes) {
       actionLine(lines, actions, `▾ ${scope.name}`)
-      for (const variable of scope.variables) actionLine(lines, actions, `  ${variable.name}: ${variable.value}`)
+      renderVariables(scope.variables, 1)
     }
   })
 
@@ -733,6 +747,7 @@ async function startConfigurations(
   if (!allowActive && st.sessions.some(session => session.state !== "terminated")) throw new Error("A dap session group is already active")
   const persisted = projectState(editor, context.projectRoot)
   persisted.lastSelection = selectionName
+  persisted.recentSelections = [selectionName, ...(persisted.recentSelections ?? []).filter(name => name !== selectionName)].slice(0, 20)
   await saveState(editor)
   st.stopAll = stopAll
   st.postDebugTasks = []
@@ -1027,7 +1042,13 @@ export function install(editor: Editor, ctx: PluginContext = createPluginContext
     } catch (error) { editor.message(error instanceof Error ? error.message : String(error)) }
   }, "Reload launch.json and start the last dap configuration.")
   command("dap-debug-recent", async ({ editor }) => {
-    try { await debugSelection(editor) } catch (error) { editor.message(error instanceof Error ? error.message : String(error)) }
+    try {
+      const context = await contextFor(editor)
+      const recent = projectState(editor, context.projectRoot).recentSelections ?? []
+      if (!recent.length) { editor.message("No recent dap configurations for this project"); return }
+      const selection = await editor.completingRead("Recent dap configuration: ", { collection: recent, history: "dap-recent-configuration" })
+      if (selection) await debugSelection(editor, selection)
+    } catch (error) { editor.message(error instanceof Error ? error.message : String(error)) }
   }, "Select and restart a recently used debug configuration.")
   command("dap-python-debug-test-at-point", async ({ editor }) => {
     try { await debugSelection(editor, "Python :: Run pytest (at point)") }
@@ -1192,6 +1213,19 @@ export function install(editor: Editor, ctx: PluginContext = createPluginContext
     } catch (error) { editor.message(error instanceof Error ? error.message : String(error)) }
   }, "Evaluate the selected expression in a buffer.")
   command("dap-ui-eval-variable-in-buffer", async ({ editor, buffer }) => { await editor.run("dap-ui-eval-in-buffer", [], null) }, "Evaluate the selected variable in a buffer.")
+  command("dap-ui-set-variable", async ({ editor, buffer }) => {
+    const action = (buffer.locals.get(UI_ACTIONS) as Array<UiAction | undefined> | undefined)?.[buffer.lineAt(buffer.point)]
+    if (action?.kind !== "variable") { editor.message("No expandable variable selected"); return }
+    const session = state(editor).sessions.find(candidate => candidate.id === action.sessionId)
+    if (!session) return
+    const value = await editor.prompt(`Set ${action.name}: `, "", "dap-set-variable")
+    if (value == null) return
+    try {
+      await session.setVariable(action.variablesReference, action.name, value)
+      await session.variables(action.variablesReference)
+      renderSidebar(editor)
+    } catch (error) { editor.message(error instanceof Error ? error.message : String(error)) }
+  }, "Set the selected DAP variable.")
   command("dap-tooltip-at-point", async ({ editor, buffer }) => {
     const left = buffer.text.slice(0, buffer.point).match(/[A-Za-z_$][\w.$]*$/)?.[0] ?? ""
     const right = buffer.text.slice(buffer.point).match(/^[\w.$]*/)?.[0] ?? ""
@@ -1384,6 +1418,16 @@ export function install(editor: Editor, ctx: PluginContext = createPluginContext
     } else if (action.kind === "session") {
       const session = state(editor).sessions.find(candidate => candidate.id === action.sessionId)
       if (session) { selectCurrentSession(editor, session); runDapHook(editor, "dap-session-changed-hook"); renderSidebar(editor); await refreshWatches(editor) }
+    } else if (action.kind === "variable") {
+      const session = state(editor).sessions.find(candidate => candidate.id === action.sessionId)
+      if (!session) return
+      const key = `${session.id}:var:${action.variablesReference}`
+      if (state(editor).expanded.has(key)) state(editor).expanded.delete(key)
+      else {
+        state(editor).expanded.add(key)
+        await session.variables(action.variablesReference)
+      }
+      renderSidebar(editor)
     } else if (action.kind === "breakpoint") {
       const breakpoint = Object.values(state(editor).persisted.projects).flatMap(project => project.breakpoints).find(item => item.id === action.id)
       if (breakpoint) {

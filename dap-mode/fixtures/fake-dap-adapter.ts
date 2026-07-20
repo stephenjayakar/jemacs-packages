@@ -38,7 +38,10 @@ function handle(request: DapRequest): void {
     case "pause": respond(request); event("stopped", { reason: "pause", threadId: 1 }); break
     case "stackTrace": respond(request, { stackFrames: [{ id: 10, name: "main", source: { name: "fake.ts", path: "/tmp/fake.ts" }, line: 4, column: 1 }] }); break
     case "scopes": respond(request, { scopes: [{ name: "Locals", variablesReference: 20, expensive: false }] }); break
-    case "variables": respond(request, { variables: [{ name: "answer", value: "42", type: "number", variablesReference: 0 }] }); break
+    case "variables": respond(request, { variables: [
+      { name: "answer", value: "42", type: "number", variablesReference: 0 },
+      { name: "obj", value: "{…}", type: "object", variablesReference: 21 },
+    ] }); break
     case "evaluate": respond(request, { result: "42", type: "number", variablesReference: 0 }); break
     case "continue": respond(request); event("continued", { threadId: 1, allThreadsContinued: true }); break
     case "restart": respond(request); break

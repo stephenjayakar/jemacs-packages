@@ -50,6 +50,7 @@ export class DapSession {
   frames: DapStackFrame[] = []
   selectedFrame?: DapStackFrame
   scopes: Array<DapScope & { variables: DapVariable[] }> = []
+  readonly variableChildren = new Map<number, DapVariable[]>()
   output: Array<{ category: string; text: string }> = []
   error?: string
   private transport?: OpenDapTransport
@@ -255,7 +256,9 @@ export class DapSession {
       start,
       count,
     })
-    return array<DapVariable>(body.variables)
+    const variables = array<DapVariable>(body.variables)
+    this.variableChildren.set(reference, variables)
+    return variables
   }
 
   async setVariable(variablesReference: number, name: string, value: string): Promise<DapVariable> {
