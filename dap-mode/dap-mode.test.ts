@@ -1,9 +1,10 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Editor, setCustom } from "@jemacs/core"
 import { install } from "./dap-mode"
+import { registerDapAdapter } from "./api"
 import { DapConnection } from "./connection"
 import { ContentLengthMessageParser, serializeContentLength } from "./content-length"
 import { expandLaunchConfiguration, parseLaunchJson } from "./config"
@@ -61,6 +62,13 @@ describe("GNU dap-mode parity", () => {
     expect(editor.commands.get("dap-breakpoint-toggle")).toBeDefined()
     expect(editor.commands.get("dap-debug")).toBeDefined()
     expect(editor.gutterDecorations(buffer).map(item => item.line)).toEqual([2, 4])
+    buffer.splice(0, 0, "# inserted above the breakpoints\n")
+    await Bun.sleep(0)
+    expect(editor.gutterDecorations(buffer).map(item => item.line)).toEqual([3, 5])
+    await buffer.save({ runHook: (name, target) => editor.runHook(name, target) })
+    const rewrittenGNUStore = await readFile(breakpoints, "utf8")
+    expect(rewrittenGNUStore).toContain(":point")
+    expect(rewrittenGNUStore).toContain(`:point ${point2 + "# inserted above the breakpoints\n".length}`)
 
     let templates: string[] = []
     editor.completingRead = async (_prompt, options) => { templates = [...(options.collection ?? [])]; return null }
@@ -101,5 +109,47 @@ describe("DAP session", () => {
     expect(session.state).toBe("running")
     await session.disconnect()
     expect(session.state).toBe("terminated")
+  })
+
+  test("compound sessions keep stepping scoped to the selected current session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jemacs-dap-compound-"))
+    temporaryPaths.push(root)
+    const source = join(root, "main.ts")
+    const log = join(root, "adapter.log")
+    await writeFile(source, "console.log(1)\n")
+    await mkdir(join(root, ".vscode"), { recursive: true })
+    await writeFile(join(root, ".vscode", "launch.json"), JSON.stringify({
+      version: "0.2.0",
+      configurations: [
+        { name: "one", type: "fake-test", request: "launch", program: source },
+        { name: "two", type: "fake-test", request: "launch", program: source },
+      ],
+      compounds: [{ name: "both", configurations: ["one", "two"] }],
+    }))
+    const disposeAdapter = registerDapAdapter({
+      types: ["fake-test"],
+      resolve: () => ({ kind: "stdio", command: [process.execPath, join(import.meta.dir, "fixtures", "fake-dap-adapter.ts")], cwd: root, env: { FAKE_DAP_LOG: log } }),
+    })
+    try {
+      const editor = new Editor()
+      install(editor)
+      await editor.openFile(source)
+      editor.completingRead = async () => "both"
+      await editor.run("dap-debug")
+      await Bun.sleep(100)
+      editor.completingRead = async () => "two"
+      await editor.run("dap-switch-session")
+      await editor.run("dap-pause")
+      await Bun.sleep(100)
+      const pauseCount = (await readFile(log, "utf8")).split("\n").filter(line => line.endsWith(" pause")).length
+      expect(pauseCount).toBe(1)
+      await editor.run("dap-debug-restart")
+      await Bun.sleep(150)
+      const launchCount = (await readFile(log, "utf8")).split("\n").filter(line => line.endsWith(" launch")).length
+      expect(launchCount).toBe(3)
+      await editor.run("dap-delete-all-sessions")
+    } finally {
+      disposeAdapter()
+    }
   })
 })

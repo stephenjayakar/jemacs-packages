@@ -23,6 +23,13 @@ parity has two completion levels:
 The current implementation passes a real debugpy smoke test, but it has not
 reached either completion level.
 
+The first implementation tranche below is now landed and verified: current
+session/thread targeting, compound-session isolation, GNU-style relaunch,
+edit-aware breakpoint anchors, GNU breakpoint-store writes, stack-trace
+limits, lifecycle hook dispatch, output buffers, and the missing public command
+entry points are implemented. The unchecked items remain real parity work, not
+just documentation TODOs.
+
 ## What already works
 
 - DAP Content-Length transport over stdio and TCP.
@@ -49,22 +56,22 @@ before adding more surface area.
 
 ### Current-session semantics
 
-GNU commands operate on the current session and current thread. Jemacs uses
-`eachActive`, so continue, pause, stepping, restart, and disconnect are sent to
-every non-terminated session.
+GNU commands operate on the current session and current thread. The original
+Jemacs implementation used `eachActive`, so continue, pause, stepping,
+restart, and disconnect were sent to every non-terminated session.
 
-- [ ] Add explicit `currentSession`, `currentThread`, and current-frame state.
-- [ ] Make `dap-continue`, `dap-pause`, `dap-next`, `dap-step-in`,
+- [x] Add explicit `currentSession`, `currentThread`, and current-frame state.
+- [x] Make `dap-continue`, `dap-pause`, `dap-next`, `dap-step-in`,
       `dap-step-out`, `dap-restart-frame`, and `dap-disconnect` target only the
       current session/thread.
-- [ ] Make `dap-switch-session` update current state and run the corresponding
+- [x] Make `dap-switch-session` update current state and run the corresponding
       lifecycle hooks; do not implement selection by reordering an array.
-- [ ] Make `dap-switch-thread` and frame navigation preserve independent
+- [x] Make `dap-switch-thread` and frame navigation preserve independent
       selections per session and thread.
-- [ ] Add prefix-argument behavior to `dap-up-stack-frame` and
+- [x] Add prefix-argument behavior to `dap-up-stack-frame` and
       `dap-down-stack-frame`.
-- [ ] Implement `dap-stop-thread` when the adapter advertises support.
-- [ ] Test two simultaneous sessions and a compound configuration so an
+- [x] Implement `dap-stop-thread` when the adapter advertises support.
+- [x] Test two simultaneous sessions and a compound configuration so an
       operation on one cannot accidentally resume or kill the other.
 
 ### Restart and session deletion
@@ -73,11 +80,11 @@ GNU `dap-debug-restart` disconnects/relaunches the current launch arguments and
 honors `dap-debug-restart-keep-session`. Jemacs currently sends the protocol
 `restart` request to every active adapter, which is different behavior.
 
-- [ ] Reimplement `dap-debug-restart` as GNU-style relaunch.
-- [ ] Add `dap-debug-restart-keep-session` and prefix-argument inversion.
-- [ ] Keep protocol-level `restart` as an internal capability, not the public
+- [x] Reimplement `dap-debug-restart` as GNU-style relaunch.
+- [x] Add `dap-debug-restart-keep-session` and prefix-argument inversion.
+- [x] Keep protocol-level `restart` as an internal capability, not the public
       behavior of `dap-debug-restart`.
-- [ ] Implement `dap-delete-session` and `dap-delete-all-sessions`, including
+- [x] Implement `dap-delete-session` and `dap-delete-all-sessions`, including
       terminated-session cleanup and output-buffer disposal.
 - [ ] Handle adapters that terminate during relaunch without leaking windows,
       processes, pending requests, or current-session state.
@@ -88,11 +95,11 @@ GNU stores buffer positions backed by moving markers. Jemacs imports positions
 once, converts them to line numbers, and then persists a separate JSON file.
 The two editors consequently drift, and breakpoints do not follow edits.
 
-- [ ] Represent breakpoints with edit-aware buffer markers/anchors rather than
+- [x] Represent breakpoints with edit-aware buffer markers/anchors rather than
       fixed line numbers.
-- [ ] Update anchors on every buffer splice and serialize the current point when
+- [x] Update anchors on every buffer splice and serialize the current point when
       a file buffer is saved or killed.
-- [ ] Read and write GNU-compatible `.dap-breakpoints` data, preserving
+- [x] Read and write GNU-compatible `.dap-breakpoints` data, preserving
       condition, hit condition, and log message fields.
 - [ ] Define a conflict policy when both the GNU store and the Jemacs state file
       changed; do not silently duplicate breakpoints.
@@ -220,7 +227,7 @@ lifecycle hooks.
       `dap-loaded-sources-changed-hook`, `dap-breakpoints-changed-hook`, and
       `dap-terminated-hook`.
 - [ ] Pass the same conceptual session/frame data to hook handlers.
-- [ ] Add `dap-stack-trace-limit` and enforce it in `stackTrace` requests.
+- [x] Add `dap-stack-trace-limit` and enforce it in `stackTrace` requests.
 - [ ] Port the remaining core/UI/mouse/Python custom variables with matching
       types, defaults, and runtime effects; omit or rename only with a written
       incompatibility rationale.

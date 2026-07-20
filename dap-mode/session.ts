@@ -32,6 +32,8 @@ export type DapSessionHooks = {
   breakpoints(): DapSourceBreakpoint[]
   breakpointChanged?(breakpoint: DapSourceBreakpoint): void
   runInTerminal?(args: Record<string, unknown>): Promise<Record<string, unknown>>
+  stackTraceLimit?(): number
+  executed?(command: string): void
   changed(session: DapSession): void
 }
 
@@ -100,6 +102,10 @@ export class DapSession {
         columnsStartAt1: true,
         supportsVariableType: true,
         supportsVariablePaging: true,
+        supportsCompletionsRequest: true,
+        supportsSetVariable: true,
+        supportsSourceRequest: true,
+        supportsProgressReporting: true,
         supportsRunInTerminalRequest: this.hooks.runInTerminal != null,
         locale: "en-US",
       })
@@ -181,6 +187,14 @@ export class DapSession {
   async stepIn(): Promise<void> { await this.threadRequest("stepIn") }
   async stepOut(): Promise<void> { await this.threadRequest("stepOut") }
 
+  async stopThread(threadId = this.selectedThreadId): Promise<void> {
+    if (!this.transport || threadId == null) throw new Error("No debug thread is selected")
+    if (this.capabilities.supportsTerminateThreadsRequest !== true) {
+      throw new Error("This debug adapter does not support stopping individual threads")
+    }
+    await this.transport.connection.request("terminateThreads", { threadIds: [threadId] })
+  }
+
   async restart(): Promise<void> {
     if (!this.transport) return
     if (this.capabilities.supportsRestartRequest === true) {
@@ -244,6 +258,36 @@ export class DapSession {
     return array<DapVariable>(body.variables)
   }
 
+  async setVariable(variablesReference: number, name: string, value: string): Promise<DapVariable> {
+    if (!this.transport) throw new Error("No active DAP connection")
+    if (this.capabilities.supportsSetVariable !== true) throw new Error("This debug adapter does not support setting variables")
+    const body = await this.transport.connection.request("setVariable", { variablesReference, name, value })
+    return body as unknown as DapVariable
+  }
+
+  async completions(text: string, column?: number): Promise<Array<{ label: string; text?: string; type?: string }>> {
+    if (!this.transport) throw new Error("No active DAP connection")
+    if (this.capabilities.supportsCompletionsRequest !== true) return []
+    const body = await this.transport.connection.request("completions", {
+      frameId: this.selectedFrame?.id,
+      text,
+      column: column ?? text.length,
+    })
+    return array<{ label: string; text?: string; type?: string }>(body.targets)
+  }
+
+  async source(sourceReference: number, path?: string): Promise<{ content: string; mimeType?: string }> {
+    if (!this.transport) throw new Error("No active DAP connection")
+    const body = await this.transport.connection.request("source", { sourceReference, source: { path, sourceReference } })
+    return { content: String(body.content ?? ""), mimeType: typeof body.mimeType === "string" ? body.mimeType : undefined }
+  }
+
+  async exceptionInfo(threadId = this.selectedThreadId): Promise<Record<string, unknown>> {
+    if (!this.transport || threadId == null) throw new Error("No debug thread is selected")
+    if (this.capabilities.supportsExceptionInfoRequest !== true) return {}
+    return this.transport.connection.request("exceptionInfo", { threadId })
+  }
+
   async evaluate(expression: string, context: "watch" | "repl" | "hover" = "repl"): Promise<{ result: string; variablesReference: number; type?: string }> {
     if (!this.transport) throw new Error("No active DAP connection")
     const body = await this.transport.connection.request("evaluate", {
@@ -263,6 +307,7 @@ export class DapSession {
     const threadId = this.selectedThreadId ?? this.threads[0]?.id
     if (threadId == null) throw new Error("No debug thread is selected")
     await this.transport.connection.request(command, { threadId })
+    this.hooks.executed?.(command)
     if (invalidate) {
       this.state = "running"
       this.invalidateStoppedState()
@@ -348,7 +393,11 @@ export class DapSession {
       this.changed()
       return
     }
-    const body = await this.transport.connection.request("stackTrace", { threadId: this.selectedThreadId, startFrame: 0, levels: 100 })
+    const body = await this.transport.connection.request("stackTrace", {
+      threadId: this.selectedThreadId,
+      startFrame: 0,
+      levels: this.hooks.stackTraceLimit?.() ?? 100,
+    })
     if (generation !== this.stoppedGeneration) return
     this.frames = array<DapStackFrame>(body.stackFrames)
     this.selectedFrame = this.frames[0]

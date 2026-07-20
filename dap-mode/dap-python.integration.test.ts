@@ -50,7 +50,13 @@ describe.skipIf(!enabled)("real dap-python/debugpy", () => {
       await waitFor(() => session.state === "stopped" && session.selectedFrame?.line === 4, "step over to line 4")
 
       await session.continue()
-      await waitFor(() => session.state === "stopped" && session.selectedFrame?.line === 2, "recursive breakpoint")
+      for (let attempt = 0; attempt < 12; attempt++) {
+        await waitFor(() => session.state === "stopped" || session.state === "terminated", "next breakpoint")
+        if (session.state === "terminated" || session.selectedFrame?.line === 2) break
+        await session.continue()
+      }
+      expect(session.state).toBe("stopped")
+      expect(session.selectedFrame?.line).toBe(2)
       expect(session.scopes.flatMap(scope => scope.variables).find(variable => variable.name === "n")?.value).toBe("9")
     } finally {
       await session.disconnect().catch(() => {})

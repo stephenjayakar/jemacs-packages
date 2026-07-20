@@ -1,4 +1,5 @@
 import { ContentLengthMessageParser, serializeContentLength } from "../content-length"
+import { appendFileSync } from "node:fs"
 import type { DapMessage, DapRequest, DapResponse } from "../types"
 
 const parser = new ContentLengthMessageParser<DapMessage>()
@@ -13,6 +14,8 @@ function respond(request: DapRequest, body: Record<string, unknown> = {}): void 
 function event(name: string, body: Record<string, unknown> = {}): void { send({ seq: ++sequence, type: "event", event: name, body }) }
 
 function handle(request: DapRequest): void {
+  const log = process.env.FAKE_DAP_LOG
+  if (log) appendFileSync(log, `${process.pid} ${request.command}\n`)
   switch (request.command) {
     case "initialize":
       respond(request, { supportsConfigurationDoneRequest: true, supportsTerminateRequest: true, supportsRestartRequest: true })
