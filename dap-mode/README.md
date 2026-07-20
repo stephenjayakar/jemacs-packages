@@ -6,6 +6,8 @@ enables `dap-auto-configure-mode`, loads Python support with `debugpy`, and
 shows GNU-style Breakpoints, Locals, Expressions, and Debug Sessions windows
 when execution stops.
 
+The remaining compatibility work is tracked in [DAP_PLAN.md](./DAP_PLAN.md).
+
 ## Python quick start
 
 1. Make `debugpy` importable by `dap-python-executable` (default: `python`).
