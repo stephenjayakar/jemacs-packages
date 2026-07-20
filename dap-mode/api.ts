@@ -3,12 +3,14 @@ import type {
   DapCommandVariableResolver,
   DapConfigurationProvider,
   DapTaskProvider,
+  DapLaunchConfiguration,
 } from "./types"
 
 const adapters = new Map<string, DapAdapterDescriptor>()
 const configurationProviders = new Set<DapConfigurationProvider>()
 const commandVariables = new Map<string, DapCommandVariableResolver>()
 let taskProvider: DapTaskProvider | null = null
+const debugTemplates = new Map<string, DapLaunchConfiguration>()
 
 export function registerDapAdapter(descriptor: DapAdapterDescriptor): () => void {
   for (const type of descriptor.types) adapters.set(type, descriptor)
@@ -47,4 +49,14 @@ export function registerDapTaskProvider(provider: DapTaskProvider): () => void {
 
 export function dapTaskProvider(): DapTaskProvider | null {
   return taskProvider
+}
+
+export function registerDapDebugTemplate(name: string, configuration: DapLaunchConfiguration): () => void {
+  const template = { ...configuration, name }
+  debugTemplates.set(name, template)
+  return () => { if (debugTemplates.get(name) === template) debugTemplates.delete(name) }
+}
+
+export function listDapDebugTemplates(): DapLaunchConfiguration[] {
+  return [...debugTemplates.values()].map(configuration => ({ ...configuration }))
 }

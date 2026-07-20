@@ -18,12 +18,22 @@ function handle(request: DapRequest): void {
   if (log) appendFileSync(log, `${process.pid} ${request.command}\n`)
   switch (request.command) {
     case "initialize":
-      respond(request, { supportsConfigurationDoneRequest: true, supportsTerminateRequest: true, supportsRestartRequest: true })
+      respond(request, {
+        supportsConfigurationDoneRequest: true,
+        supportsTerminateRequest: true,
+        supportsRestartRequest: true,
+        supportsTerminateThreadsRequest: true,
+        supportsSetVariable: true,
+        supportsCompletionsRequest: true,
+        supportsSourceRequest: true,
+        supportsExceptionInfoRequest: true,
+      })
       break
     case "launch":
     case "attach":
       launchRequest = request
       event("initialized")
+      event("loadedSource", { reason: "new", source: { name: "virtual.py", sourceReference: 77 } })
       break
     case "setBreakpoints": {
       const points = Array.isArray(request.arguments?.breakpoints) ? request.arguments.breakpoints as Array<{ line: number }> : []
@@ -43,6 +53,10 @@ function handle(request: DapRequest): void {
       { name: "obj", value: "{…}", type: "object", variablesReference: 21 },
     ] }); break
     case "evaluate": respond(request, { result: "42", type: "number", variablesReference: 0 }); break
+    case "setVariable": respond(request, { value: String(request.arguments?.value ?? ""), variablesReference: 0 }); break
+    case "completions": respond(request, { targets: [{ label: "answer", text: "answer", type: "variable" }] }); break
+    case "source": respond(request, { content: "# virtual source\nanswer = 42\n", mimeType: "text/x-python" }); break
+    case "terminateThreads": respond(request); break
     case "continue": respond(request); event("continued", { threadId: 1, allThreadsContinued: true }); break
     case "restart": respond(request); break
     case "terminate": respond(request); break

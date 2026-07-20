@@ -14,6 +14,7 @@ export type DapEvent = DapProtocolMessage & { type: "event"; event: string; body
 export type DapMessage = DapRequest | DapResponse | DapEvent
 
 export type DapSource = { name?: string; path?: string; sourceReference?: number }
+export type DapLoadedSource = DapSource & { reason?: string }
 export type DapThread = { id: number; name: string }
 export type DapStackFrame = {
   id: number
@@ -112,4 +113,6 @@ export type DapSourceBreakpoint = {
   logMessage?: string
   verified?: boolean
   message?: string
+  actualLine?: number
 }
+export type DapPathMapping = { localRoot: string; remoteRoot: string }

@@ -9,6 +9,7 @@ import type {
   DapThread,
   DapVariable,
   DapLaunchConfiguration,
+  DapLoadedSource,
   DapSourceBreakpoint,
   DapTransportDescriptor,
 } from "./types"
@@ -25,6 +26,10 @@ export type DapSessionSnapshot = {
   selectedFrame?: DapStackFrame
   scopes: Array<DapScope & { variables: DapVariable[] }>
   output: Array<{ category: string; text: string }>
+  loadedSources: DapLoadedSource[]
+  exception?: Record<string, unknown>
+  preserveFocusHint?: boolean
+  hitBreakpointIds?: number[]
   error?: string
 }
 
@@ -34,6 +39,12 @@ export type DapSessionHooks = {
   runInTerminal?(args: Record<string, unknown>): Promise<Record<string, unknown>>
   stackTraceLimit?(): number
   executed?(command: string): void
+  loadedSourcesChanged?(): void
+  exceptionFilters?(): string[]
+  defaultFetchCount?(): number
+  pathForAdapter?(path: string): string
+  pathForEditor?(path: string): string
+  startDebugging?(args: Record<string, unknown>): Promise<boolean>
   changed(session: DapSession): void
 }
 
@@ -51,7 +62,12 @@ export class DapSession {
   selectedFrame?: DapStackFrame
   scopes: Array<DapScope & { variables: DapVariable[] }> = []
   readonly variableChildren = new Map<number, DapVariable[]>()
+  readonly variableCounts = new Map<number, number>()
   output: Array<{ category: string; text: string }> = []
+  loadedSources: DapLoadedSource[] = []
+  exception?: Record<string, unknown>
+  preserveFocusHint = false
+  hitBreakpointIds: number[] = []
   error?: string
   private transport?: OpenDapTransport
   private initializedResolve?: () => void
@@ -79,6 +95,10 @@ export class DapSession {
       selectedFrame: this.selectedFrame,
       scopes: this.scopes,
       output: this.output,
+      loadedSources: this.loadedSources,
+      exception: this.exception,
+      preserveFocusHint: this.preserveFocusHint,
+      hitBreakpointIds: this.hitBreakpointIds,
       error: this.error,
     }
   }
@@ -151,7 +171,7 @@ export class DapSession {
     for (const path of paths) {
       const sourceBreakpoints = grouped.get(path) ?? []
       const body = await this.transport.connection.request("setBreakpoints", {
-        source: { path },
+        source: { path: this.hooks.pathForAdapter?.(path) ?? path },
         breakpoints: sourceBreakpoints.map(item => ({
           line: item.line,
           condition: item.condition,
@@ -166,7 +186,7 @@ export class DapSession {
         if (!result) return
         breakpoint.verified = result.verified
         breakpoint.message = result.message
-        if (result.line) breakpoint.line = result.line
+        if (result.line) breakpoint.actualLine = result.line
         this.hooks.breakpointChanged?.(breakpoint)
       })
       if (sourceBreakpoints.length) this.synchronizedBreakpointPaths.add(path)
@@ -174,9 +194,8 @@ export class DapSession {
     }
     const exceptionFilters = array<{ filter: string; default?: boolean }>(this.capabilities.exceptionBreakpointFilters)
     if (exceptionFilters.length) {
-      const filters = exceptionFilters
-        .filter(item => item.filter === "uncaught" || (item.default === true && item.filter !== "raised" && item.filter !== "userUnhandled"))
-        .map(item => item.filter)
+      const requested = this.hooks.exceptionFilters?.() ?? ["uncaught"]
+      const filters = exceptionFilters.filter(item => requested.includes(item.filter)).map(item => item.filter)
       await this.transport.connection.request("setExceptionBreakpoints", { filters })
     }
     this.changed()
@@ -239,7 +258,7 @@ export class DapSession {
     const scopes = array<DapScope>(body.scopes)
     this.scopes = await Promise.all(scopes.map(async scope => ({
       ...scope,
-      variables: await this.variables(scope.variablesReference),
+      variables: await this.variables(scope.variablesReference, 0, this.hooks.defaultFetchCount?.()),
     })))
     this.changed()
   }
@@ -257,8 +276,11 @@ export class DapSession {
       count,
     })
     const variables = array<DapVariable>(body.variables)
-    this.variableChildren.set(reference, variables)
-    return variables
+    const existing = start && start > 0 ? this.variableChildren.get(reference) ?? [] : []
+    this.variableChildren.set(reference, start && start > 0 ? [...existing, ...variables] : variables)
+    const total = Math.max(Number(body.namedVariables ?? 0), Number(body.indexedVariables ?? 0))
+    if (total > 0) this.variableCounts.set(reference, total)
+    return start && start > 0 ? [...existing, ...variables] : variables
   }
 
   async setVariable(variablesReference: number, name: string, value: string): Promise<DapVariable> {
@@ -328,11 +350,32 @@ export class DapSession {
       case "output":
         this.appendOutput(String(body.category ?? "console"), String(body.output ?? ""))
         break
+      case "loadedSource": {
+        const source = body.source as DapLoadedSource | undefined
+        if (source) {
+          const key = source.sourceReference ? `ref:${source.sourceReference}` : source.path ?? source.name ?? ""
+          this.loadedSources = [
+            ...this.loadedSources.filter(item => (item.sourceReference ? `ref:${item.sourceReference}` : item.path ?? item.name ?? "") !== key),
+            source,
+          ]
+          this.hooks.loadedSourcesChanged?.()
+        }
+        this.changed()
+        break
+      }
       case "stopped":
         this.state = "stopped"
+        this.preserveFocusHint = body.preserveFocusHint === true
+        this.hitBreakpointIds = Array.isArray(body.hitBreakpointIds) ? body.hitBreakpointIds.map(Number).filter(Number.isFinite) : []
         await this.refreshStopped(typeof body.threadId === "number" ? body.threadId : undefined)
+        if (body.reason === "exception") this.exception = await this.exceptionInfo(typeof body.threadId === "number" ? body.threadId : undefined).catch(() => undefined)
         break
       case "continued":
+        if (body.allThreadsContinued === false && typeof body.threadId === "number" && body.threadId !== this.selectedThreadId) {
+          await this.refreshThreads().catch(() => {})
+          this.changed()
+          break
+        }
         this.state = "running"
         this.invalidateStoppedState()
         this.changed()
@@ -345,10 +388,23 @@ export class DapSession {
         this.capabilities = { ...this.capabilities, ...(body.capabilities as Record<string, unknown> | undefined) }
         this.changed()
         break
+      case "process":
+      case "module":
+        this.appendOutput("telemetry", `${event.event}: ${JSON.stringify(body)}\n`)
+        break
+      case "progressStart":
+      case "progressUpdate":
+      case "progressEnd":
+        this.appendOutput("telemetry", `${event.event}: ${String(body.message ?? body.title ?? "")}\n`)
+        break
+      case "invalidated":
+        if (this.state === "stopped") await this.refreshStopped(this.selectedThreadId).catch(() => {})
+        break
       case "breakpoint": {
         const actual = body.breakpoint as DapBreakpoint | undefined
         if (actual?.source?.path && actual.line) {
-          const local = this.hooks.breakpoints().find(item => item.path === actual.source!.path && item.line === actual.line)
+          const actualPath = this.hooks.pathForEditor?.(actual.source!.path) ?? actual.source!.path
+          const local = this.hooks.breakpoints().find(item => item.path === actualPath && (item.line === actual.line || item.actualLine === actual.line))
           if (local) {
             local.verified = actual.verified
             local.message = actual.message
@@ -373,6 +429,15 @@ export class DapSession {
       try {
         const body = await this.hooks.runInTerminal(request.arguments ?? {})
         this.transport.connection.respond(request, body)
+      } catch (error) {
+        this.transport.connection.respond(request, {}, error instanceof Error ? error : new Error(String(error)))
+      }
+      return
+    }
+    if (request.command === "startDebugging" && this.hooks.startDebugging) {
+      try {
+        const success = await this.hooks.startDebugging(request.arguments ?? {})
+        this.transport.connection.respond(request, { success })
       } catch (error) {
         this.transport.connection.respond(request, {}, error instanceof Error ? error : new Error(String(error)))
       }
@@ -413,6 +478,7 @@ export class DapSession {
     this.frames = []
     this.selectedFrame = undefined
     this.scopes = []
+    this.exception = undefined
   }
 
   private appendOutput(category: string, text: string): void {

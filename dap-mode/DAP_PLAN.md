@@ -20,8 +20,21 @@ parity has two completion levels:
    hooks, UI features, protocol behavior, and adapter modules shipped by the
    installed GNU package are available with matching semantics.
 
-The current implementation passes a real debugpy smoke test, but it has not
-reached either completion level.
+The current implementation passes focused unit tests, the full package suite,
+and a real debugpy breakpoint/step/continue smoke test against
+`/Users/stephen/programming/vibe/temp/main.py`, but it has not reached either
+completion level.
+
+## Remaining parity at a glance
+
+The largest gaps are not basic DAP transport anymore. They are GNU-compatible
+editing and UI semantics: a full `*DAP Templates*` workflow, complete
+breakpoint-pane behavior across all visiting buffers, tooltip/mouse behavior,
+pane focus and teardown fidelity, multiline REPL/evaluation presentation,
+terminal routing, Python/LSP/pyenv template fidelity, stale-response and
+request-cancellation handling, and cross-editor verification against GNU
+Emacs. The complete upstream package also contains many adapter-specific
+modules that are not yet ported.
 
 The first implementation tranche below is now landed and verified: current
 session/thread targeting, compound-session isolation, GNU-style relaunch,
@@ -86,7 +99,7 @@ honors `dap-debug-restart-keep-session`. Jemacs currently sends the protocol
       behavior of `dap-debug-restart`.
 - [x] Implement `dap-delete-session` and `dap-delete-all-sessions`, including
       terminated-session cleanup and output-buffer disposal.
-- [ ] Handle adapters that terminate during relaunch without leaking windows,
+- [x] Handle adapters that terminate during relaunch without leaking windows,
       processes, pending requests, or current-session state.
 
 ### Breakpoint fidelity
@@ -101,14 +114,14 @@ The two editors consequently drift, and breakpoints do not follow edits.
       a file buffer is saved or killed.
 - [x] Read and write GNU-compatible `.dap-breakpoints` data, preserving
       condition, hit condition, and log message fields.
-- [ ] Define a conflict policy when both the GNU store and the Jemacs state file
+- [x] Define a conflict policy when both the GNU store and the Jemacs state file
       changed; do not silently duplicate breakpoints.
 - [ ] Match GNU behavior for add, toggle, delete, condition, hit condition, log
       message, and delete-all in both source and Breakpoints panes.
 - [ ] Run breakpoint-changed behavior for every affected visiting buffer.
-- [ ] Preserve verified/pending adapter responses without changing the user's
+- [x] Preserve verified/pending adapter responses without changing the user's
       requested source position incorrectly.
-- [ ] Make exception breakpoints configurable from adapter-provided filters
+- [x] Make exception breakpoints configurable from adapter-provided filters
       instead of hard-coding only `uncaught`.
 - [ ] Add tests that insert/delete lines above breakpoints, restart Jemacs, then
       open the same file in GNU Emacs and confirm identical positions.
@@ -119,9 +132,12 @@ The two editors consequently drift, and breakpoints do not follow edits.
       `dap-python`, rather than the current backwards regex scan.
 - [ ] Verify all five Python templates against real debugpy:
       run file, pytest buffer, pytest at point, process attach, and project-cwd.
-- [ ] Implement the actual `dap-python-debugger` choice contract or explicitly
+- [x] Implement the actual `dap-python-debugger` choice contract and explicitly
       reject unsupported `ptvsd` instead of exposing a misleading option.
-- [ ] Add `dap-python-default-debug-port`, `dap-python-terminal`, pyenv-aware
+- [x] Add `dap-python-terminal` and use it for generated Python configurations.
+- [x] Add `dap-python-default-debug-port` and a direct debugpy port-attach
+      command.
+- [ ] Add pyenv-aware
       executable discovery, and GNU-compatible defaults.
 - [ ] Test spaces, Unicode paths, virtual environments, pytest classes,
       parametrized tests, modules, process attach, and failed adapter startup.
@@ -133,17 +149,20 @@ The two editors consequently drift, and breakpoints do not follow edits.
 `dap-ui-controls-mode` and `dap-tooltip-mode` currently only toggle names in
 the global mode set. They do not implement their GNU behavior.
 
-- [ ] Add `dap-auto-configure-features` with GNU's default:
+- [x] Add `dap-auto-configure-features` with GNU's default:
       sessions, locals, breakpoints, expressions, controls, and tooltip.
-- [ ] Make `dap-auto-configure-mode` enable/disable exactly the selected
+- [x] Make `dap-auto-configure-mode` enable/disable exactly the selected
       features and clean up their resources.
-- [ ] Implement real `dap-ui-controls-mode` controls with capability-aware
+- [x] Implement real `dap-ui-controls-mode` controls with current-session
       buttons and current-session state.
-- [ ] Implement `dap-tooltip-mode`, `dap-tooltip-at-point`, configurable delay,
-      and echo-area/child-frame presentation.
+- [ ] Hide controls whose adapter capability is unavailable.
+- [x] Implement `dap-tooltip-at-point`, configurable delay, and
+      echo-area/child-frame presentation.
+- [ ] Make `dap-tooltip-mode` install/remove mouse tracking globally and add
+      host-specific fallback behavior.
 - [ ] Implement the global `dap-ui-mode` hooks rather than treating it only as
       a boolean flag.
-- [ ] Add the buffer-local `dap-ui-sessions-mode` and
+- [x] Add the buffer-local `dap-ui-sessions-mode` and
       `dap-ui-breakpoints-mode` command/keymap behavior.
 
 ### Interactive tree panes
@@ -153,16 +172,19 @@ refreshable trees with expandable variables, sessions, threads, frames,
 sources, and breakpoints.
 
 - [x] Add expandable nested variables with lazy `variables` requests.
-- [ ] Add named/indexed paging and `dap-ui-default-fetch-count`.
+- [x] Add `dap-ui-default-fetch-count` to lazy variable requests.
+- [x] Add named/indexed paging.
 - [x] Add `setVariable` and editable local values.
-- [ ] Implement `dap-ui-variable-length` truncation with access to full values.
-- [ ] Make Sessions rows select/delete sessions, threads, and frames.
-- [ ] Implement Breakpoints pane commands:
+- [x] Implement `dap-ui-variable-length` truncation.
+- [ ] Add an action to reveal full truncated values.
+- [x] Make Sessions rows select/delete sessions, threads, and frames.
+- [x] Implement Breakpoints pane commands:
       `dap-ui-breakpoints-goto`, `-delete`, `-browse`, `-delete-selected`, and
       `-list`.
-- [ ] Implement Expressions add-prompt, remove, refresh, duplicate detection,
-      error rendering, persistence, and expandable results.
-- [ ] Implement `dap-ui-loaded-sources`, including adapter `loadedSource`
+- [x] Implement Expressions add-prompt, remove, refresh, duplicate detection,
+      error rendering, and persistence.
+- [x] Add expandable expression results.
+- [x] Implement `dap-ui-loaded-sources`, including adapter `loadedSource`
       events and source-reference-only entries.
 - [ ] Match GNU pane focus, dedicated-window, sizing, refresh, quit, and
       teardown behavior.
@@ -173,7 +195,7 @@ sources, and breakpoints.
 
 ### Controls, hydra, and mouse behavior
 
-- [ ] Replace the current one-line `dap-hydra` message with an interactive
+- [x] Replace the current one-line `dap-hydra` message with an interactive
       hydra/transient matching the GNU key groups and repeat/exit behavior.
 - [ ] Add gutter/margin mouse breakpoint toggling.
 - [ ] Add hover evaluation and clickable controls where supported by each host.
@@ -188,27 +210,29 @@ GNU dap-mode owns a per-session output buffer with category filtering,
 automatic display rules, labels, height limits, and terminal routing. Jemacs
 only accumulates output arrays and exposes a partial REPL.
 
-- [ ] Create one output buffer per session and implement
+- [x] Create one output buffer per session and implement
       `dap-go-to-output-buffer`.
-- [ ] Add `dap-print-io`, `dap-output-buffer-filter`,
-      `dap-label-output-buffer-category`, `dap-auto-show-output`,
-      `dap-output-window-min-height`, `dap-output-window-max-height`, and
-      `dap-inhibit-io`.
-- [ ] Distinguish stdout, stderr, console, telemetry, important, and adapter
+- [x] Add runtime filtering/labels for `dap-print-io`,
+      `dap-output-buffer-filter`, `dap-label-output-buffer-category`, and
+      `dap-auto-show-output`.
+- [ ] Apply `dap-output-window-min-height`,
+      `dap-output-window-max-height`, and `dap-inhibit-io` with GNU-compatible
+      window and message behavior.
+- [x] Distinguish stdout, stderr, console, telemetry, important, and adapter
       output categories.
-- [ ] Preserve output for terminated sessions until the session is deleted.
+- [x] Preserve output for terminated sessions until the session is deleted.
 - [ ] Route external/integrated/internal terminal kinds according to
       `dap-default-terminal-kind`, `dap-external-terminal`, and
       `dap-internal-terminal`.
 
 ### REPL and evaluation
 
-- [ ] Use GNU's `>> ` prompt, input history, per-session context, and history
+- [x] Use GNU's `>> ` prompt, input history, per-session context, and history
       file behavior.
-- [ ] Implement adapter-backed `completions` and `dap-ui-repl-company` parity.
+- [x] Implement adapter-backed `completions` and `dap-ui-repl-company` parity.
 - [ ] Add multiline input and robust prompt-boundary editing.
-- [ ] Implement `dap-ui-eval-in-buffer` and
-      `dap-ui-eval-variable-in-buffer` with expandable values.
+- [x] Implement `dap-ui-eval-in-buffer` and `dap-ui-eval-variable-in-buffer`.
+- [ ] Add expandable values to evaluation buffers.
 - [ ] Match region/symbol evaluation errors, stopped-session selection, and
       overlay/echo presentation.
 - [ ] Cancel or ignore stale evaluation/variable responses after continue,
@@ -217,10 +241,11 @@ only accumulates output arrays and exposes a partial REPL.
 ## P1 — Lifecycle hooks and customization contract
 
 The installed GNU core defines 26 custom variables and ten public lifecycle
-hooks; the Jemacs package currently defines ten custom variables and no DAP
-lifecycle hooks.
+hooks. Jemacs now defines the principal lifecycle hooks and a substantially
+larger customization surface, but several variables still lack matching
+runtime effects and reload semantics.
 
-- [ ] Implement and order these hooks consistently:
+- [x] Implement and order these hooks consistently:
       `dap-session-created-hook`, `dap-session-changed-hook`,
       `dap-stopped-hook`, `dap-continue-hook`, `dap-executed-hook`,
       `dap-position-changed-hook`, `dap-stack-frame-changed-hook`,
@@ -236,7 +261,7 @@ lifecycle hooks.
 
 ## P2 — Templates, providers, tasks, and launch configuration
 
-- [ ] Implement `dap-register-debug-template` semantics and
+- [x] Implement `dap-register-debug-template` semantics and
       `dap-debug-template-configurations`.
 - [ ] Implement `dap-debug-edit-template` and the `*DAP Templates*` workflow.
 - [x] Store a real recent-configuration ring so `dap-debug-last` and
@@ -244,9 +269,11 @@ lifecycle hooks.
 - [ ] Preserve launch arguments on sessions so restart/recent are lossless.
 - [ ] Port `.vscode/launch.json` discovery and selection behavior from
       `dap-launch.el`, including multi-root workspaces.
-- [ ] Implement task discovery/execution equivalent to `dap-tasks.el`, not
-      merely an API that requires another package to supply a task provider.
-- [ ] Supply standard `${command:...}` resolvers, including process picking.
+- [x] Implement built-in `tasks.json` label/command/dependsOn discovery and
+      execution; a custom provider can still override it.
+- [ ] Match the remaining `dap-tasks.el` task kinds and problem matchers.
+- [x] Supply a standard `${command:pickProcess}` resolver for process picking.
+- [ ] Supply the remaining standard command resolvers.
 - [ ] Validate input cancellation, password masking, command inputs, nested
       substitutions, compounds, `stopAll`, pre-launch tasks, and post-debug
       tasks with end-to-end tests.
@@ -257,14 +284,15 @@ lifecycle hooks.
 
 ### Requests/events missing from the GNU feature set
 
-- [ ] `source` requests and virtual read-only buffers for `sourceReference`
+- [x] `source` requests and virtual read-only buffers for `sourceReference`
       frames/breakpoints.
-- [ ] Remote-to-local/local-to-remote path transforms and URI decoding.
-- [ ] `exceptionInfo` at exception stops.
-- [ ] `setVariable` in the Locals tree.
-- [ ] `completions` in the REPL.
-- [ ] Loaded-source state and `loadedSource` events.
-- [ ] Correct current-session processing of process, module, invalidated,
+- [x] Remote-to-local/local-to-remote path transforms.
+- [x] Add URI decoding for mapped source paths.
+- [x] `exceptionInfo` at exception stops.
+- [x] `setVariable` in the Locals tree.
+- [x] `completions` in the REPL.
+- [x] Loaded-source state and `loadedSource` events.
+- [x] Correct current-session processing of process, module, invalidated,
       progress, and changed-capabilities events where adapters emit them.
 
 ### Robustness

@@ -29,6 +29,8 @@ export function installBuiltinDapAdapters(): () => void {
   const python: DapAdapterDescriptor = {
     types: ["debugpy", "python"],
     resolve(_config, context) {
+      const selectedDebugger = getCustom<string>("dap-python-debugger") ?? "debugpy"
+      if (selectedDebugger !== "debugpy") throw new Error(`Unsupported dap-python debugger ${selectedDebugger}; Jemacs supports debugpy (ptvsd is not installed)`)
       const command = getCustom<string>("dap-python-executable") ?? "python"
       const executable = whichExecutable(command)
       if (!executable) throw new Error(`Python debugger unavailable: ${command} is not on PATH`)
