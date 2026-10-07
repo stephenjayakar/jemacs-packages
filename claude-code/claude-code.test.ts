@@ -2,13 +2,15 @@ import { afterAll, expect, test } from "bun:test"
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
-import { Editor, listWindowLeaves, setCustom } from "@jemacs/core"
+import { BufferModel, Editor, listWindowLeaves, setCustom } from "@jemacs/core"
 import { jemacsHome } from "../core-path"
 import {
   claudeBufferName,
   claudeBuffers,
+  CLAUDE_DIRECTORY_LOCAL,
   fileReference,
   install,
+  instancesFor,
   promptBytes,
 } from "./index"
 
@@ -32,6 +34,23 @@ test("file references are root-relative with line ranges", () => {
 test("multi-line prompts are bracketed-pasted so newlines don't submit", () => {
   expect(promptBytes("hello")).toBe("hello")
   expect(promptBytes("a\nb")).toBe("\x1b[200~a\nb\x1b[201~")
+})
+
+test("sends go to the deepest instance whose directory contains the current one", () => {
+  const at = (dir: string, name = dir) => {
+    const buffer = new BufferModel({ name, text: "" })
+    buffer.locals.set(CLAUDE_DIRECTORY_LOCAL, dir)
+    return buffer
+  }
+  const repo = at("/repo")
+  const pkg = at("/repo/pkg")
+  const pkgReview = at("/repo/pkg", "review")
+  const other = at("/repo-other")
+  const all = [repo, pkg, pkgReview, other]
+  expect(instancesFor(all, "/repo")).toEqual([repo])
+  expect(instancesFor(all, "/repo/src")).toEqual([repo])
+  expect(instancesFor(all, "/repo/pkg/lib")).toEqual([pkg, pkgReview])
+  expect(instancesFor(all, "/elsewhere")).toEqual([])
 })
 
 async function waitFor(predicate: () => boolean, ms = 5000): Promise<void> {

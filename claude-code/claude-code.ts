@@ -97,20 +97,24 @@ export function promptBytes(text: string): string {
   return text.includes("\n") ? `\x1b[200~${text}\x1b[201~` : text
 }
 
-async function findRoot(dir: string): Promise<string> {
-  // Prefer the core project plugin so claude-code agrees with project/magit.
-  try {
-    const project = await import(join(jemacsHome(), "plugins/project/index.ts")) as {
-      projectRoot(dir: string): Promise<string | null>
-    }
-    return await project.projectRoot(dir) ?? dir
-  } catch {
-    return dir
-  }
+/** The directory of the buffer you're in (`default-directory`), so Claude
+ *  starts where you are working rather than at a guessed project root. */
+function sourceDirectory(editor: Editor): string {
+  const buffer = editor.currentBuffer
+  const local = buffer.locals.get("default-directory")
+  const dir = buffer.directory() ?? (typeof local === "string" && local ? local : process.cwd())
+  return resolve(dir)
 }
 
-function sourceDirectory(editor: Editor): string {
-  return editor.currentBuffer.directory() ?? process.cwd()
+/** Instances whose directory is DIR or an ancestor of it, deepest first. */
+export function instancesFor(buffers: BufferModel[], dir: string): BufferModel[] {
+  const containing = buffers.filter(buffer => {
+    const root = buffer.locals.get(CLAUDE_DIRECTORY_LOCAL) as string
+    return dir === root || dir.startsWith(root.endsWith("/") ? root : `${root}/`)
+  })
+  const depth = (buffer: BufferModel) => (buffer.locals.get(CLAUDE_DIRECTORY_LOCAL) as string).length
+  const deepest = Math.max(...containing.map(depth))
+  return containing.filter(buffer => depth(buffer) === deepest)
 }
 
 function programArgv(extra: string[]): string[] | null {
@@ -207,22 +211,23 @@ export function install(editor: Editor): void {
     return buffer
   }
 
-  /** The instance commands talk to: the current Claude buffer, else one for
-   *  the current project, else the only one; ask when several match. With
-   *  START, launch Claude for the project when there is none. */
+  /** The instance commands talk to: the current Claude buffer, else the one
+   *  started in (or above) the current directory. With START, launch Claude in
+   *  the current directory when none covers it; otherwise fall back to any
+   *  running instance. Ask when several match. */
   async function current(start_ = false): Promise<{ buffer: BufferModel; session: JtermSession } | null> {
     const jterm = await loadJterm()
     const live = claudeBuffers(editor).filter(buffer => sessionOf(jterm, buffer))
     const here = editor.currentBuffer
     let buffer: BufferModel | undefined = live.includes(here) ? here : undefined
     if (!buffer) {
-      const root = await findRoot(sourceDirectory(editor))
-      const inProject = live.filter(b => b.locals.get(CLAUDE_DIRECTORY_LOCAL) === root)
-      const candidates = inProject.length ? inProject : live
+      const dir = sourceDirectory(editor)
+      const covering = instancesFor(live, dir)
+      const candidates = covering.length || start_ ? covering : live
       if (candidates.length === 1) buffer = candidates[0]
       else if (candidates.length > 1) buffer = await pick(candidates, "Claude instance: ")
       else if (start_) {
-        buffer = await start(root, [], "default", false) ?? undefined
+        buffer = await start(dir, [], "default", false) ?? undefined
         const session = buffer && sessionOf(jterm, buffer)
         if (session) await waitForStartup(buffer!, session)
       }
@@ -241,9 +246,14 @@ export function install(editor: Editor): void {
     return buffers.find(buffer => buffer.name === choice)
   }
 
+  type Target = { buffer: BufferModel; session: JtermSession }
+
   async function send(text: string, submit = true): Promise<boolean> {
     const target = await current(true)
-    if (!target) return false
+    return target ? sendTo(target, text, submit) : false
+  }
+
+  async function sendTo(target: Target, text: string, submit = true): Promise<boolean> {
     target.session.writeRaw(promptBytes(text))
     if (submit) {
       await sleep(getCustom<number>("claude-code-submit-delay") ?? 100)
@@ -261,11 +271,11 @@ export function install(editor: Editor): void {
   }
 
   /** `@file#Lx-y` for the current buffer's region or line, relative to the
-   *  Claude session root. */
-  async function context(): Promise<string | null> {
+   *  directory TARGET's Claude runs in. */
+  function context(target: Target): string | null {
     const buffer = editor.currentBuffer
     if (!buffer.path || isClaudeBuffer(buffer)) return null
-    const root = await findRoot(sourceDirectory(editor))
+    const root = target.buffer.locals.get(CLAUDE_DIRECTORY_LOCAL) as string
     if (buffer.markActive && buffer.mark != null && buffer.mark !== buffer.point) {
       const start = Math.min(buffer.mark, buffer.point)
       const end = Math.max(buffer.mark, buffer.point)
@@ -282,10 +292,10 @@ export function install(editor: Editor): void {
     const dir = sourceDirectory(editor)
     const directory = prefixArgument != null
       ? await editor.completingRead("Start Claude in directory: ", { completion: "file", history: "file", initialValue: `${dir}/` })
-      : await findRoot(dir)
+      : dir
     if (!directory) return
     await start(resolve(directory), [])
-  }, "Start Claude Code in the current project root (C-u: choose the directory).")
+  }, "Start Claude Code in the current buffer's directory (C-u: choose the directory).")
 
   editor.command("claude-code-start-in-directory", async () => {
     const directory = await editor.completingRead("Start Claude in directory: ", {
@@ -297,18 +307,18 @@ export function install(editor: Editor): void {
   }, "Start Claude Code in a chosen directory.")
 
   editor.command("claude-code-continue", async () => {
-    await start(await findRoot(sourceDirectory(editor)), ["--continue"])
+    await start(sourceDirectory(editor), ["--continue"])
   }, "Start Claude Code continuing the most recent conversation (--continue).")
 
   editor.command("claude-code-resume", async () => {
-    await start(await findRoot(sourceDirectory(editor)), ["--resume"])
+    await start(sourceDirectory(editor), ["--resume"])
   }, "Start Claude Code and pick a past conversation to resume (--resume).")
 
   editor.command("claude-code-new-instance", async () => {
     const instance = await editor.prompt("Instance name: ", "", "claude-code-instance")
     if (!instance?.trim()) return
-    await start(await findRoot(sourceDirectory(editor)), [], instance.trim())
-  }, "Start an additional named Claude Code instance for the current project.")
+    await start(sourceDirectory(editor), [], instance.trim())
+  }, "Start an additional named Claude Code instance in the current directory.")
 
   editor.command("claude-code-kill", async () => {
     const target = await current()
@@ -370,10 +380,12 @@ export function install(editor: Editor): void {
   }, "Read a prompt in the minibuffer and send it to Claude.")
 
   editor.command("claude-code-send-command-with-context", async ({ args }) => {
-    const ref = await context()
+    const target = await current(true)
+    if (!target) return
+    const ref = context(target)
     const text = args[0] ?? await editor.prompt(ref ? `Claude (${ref}): ` : "Claude: ", "", "claude-code-command")
     if (!text) return
-    await send(ref ? `${text}\n${ref}` : text)
+    await sendTo(target, ref ? `${text}\n${ref}` : text)
   }, "Send a prompt to Claude with the current file and line (or region lines) as context.")
 
   editor.command("claude-code-send-region", async ({ prefixArgument }) => {
@@ -393,13 +405,15 @@ export function install(editor: Editor): void {
   editor.command("claude-code-send-buffer-file", async ({ prefixArgument }) => {
     const buffer = editor.currentBuffer
     if (!buffer.path) return editor.message("claude-code: buffer is not visiting a file")
-    const ref = fileReference(buffer.path, await findRoot(sourceDirectory(editor)))
+    const target = await current(true)
+    if (!target) return
+    const ref = fileReference(buffer.path, target.buffer.locals.get(CLAUDE_DIRECTORY_LOCAL) as string)
     if (prefixArgument != null) {
       const instruction = await editor.prompt(`Claude (${ref}): `, "", "claude-code-command")
       if (instruction == null) return
-      await send(instruction ? `${instruction} ${ref}` : ref)
+      await sendTo(target, instruction ? `${instruction} ${ref}` : ref)
     }
-    else await send(ref, false)
+    else await sendTo(target, ref, false)
   }, "Insert an @reference to the current file into Claude's prompt (C-u: add an instruction and submit).")
 
   editor.command("claude-code-fix-error-at-point", async () => {
@@ -410,9 +424,11 @@ export function install(editor: Editor): void {
       : []
     const here = diags.filter(d => d.range.start.line <= line && line <= d.range.end.line)
     if (!here.length) return editor.message("claude-code: no error at point")
-    const ref = await context()
+    const target = await current(true)
+    if (!target) return
+    const ref = context(target)
     const messages = here.map(d => `- ${d.source ? `${d.source}: ` : ""}${d.message}`).join("\n")
-    await send(`Fix this error${here.length > 1 ? "s" : ""} at ${ref ?? basename(buffer.path ?? buffer.name)}:\n${messages}`)
+    await sendTo(target, `Fix this error${here.length > 1 ? "s" : ""} at ${ref ?? basename(buffer.path ?? buffer.name)}:\n${messages}`)
   }, "Ask Claude to fix the flymake/LSP diagnostics on the current line.")
 
   editor.command("claude-code-slash-commands", async () => {

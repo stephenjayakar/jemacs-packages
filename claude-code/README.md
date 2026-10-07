@@ -1,17 +1,19 @@
 # claude-code
 
-Runs the local `claude` CLI inside jemacs, in a jterm buffer per project.
+Runs the local `claude` CLI inside jemacs, in a jterm buffer per directory.
 Ported from [claude-code.el](https://github.com/stevemolitor/claude-code.el).
 
-Buffers are named `*claude:~/project/*`. Commands sent from a source buffer go
-to the Claude instance for that buffer's project, and start one if none is running.
+Claude starts in the current buffer's directory (`default-directory`), in a
+buffer named `*claude:~/dir/*`. Commands sent from a source buffer go to the
+instance started in that buffer's directory or the nearest one above it. If
+there is none, they start one in the buffer's directory.
 
 | Key | Command | |
 | --- | --- | --- |
-| `C-c c c` | `claude-code` | Start in project root (`C-u`: pick directory) |
+| `C-c c c` | `claude-code` | Start in current directory (`C-u`: pick directory) |
 | `C-c c d` | `claude-code-start-in-directory` | |
 | `C-c c C` / `R` | `claude-code-continue` / `-resume` | `--continue` / `--resume` |
-| `C-c c i` | `claude-code-new-instance` | Extra named instance for the project |
+| `C-c c i` | `claude-code-new-instance` | Extra named instance in the current directory |
 | `C-c c k` / `K` | `claude-code-kill` / `-kill-all` | |
 | `C-c c t` | `claude-code-toggle` | Show/hide the Claude window |
 | `C-c c b` / `B` | `claude-code-switch-to-buffer` / `-select-buffer` | |
@@ -28,8 +30,9 @@ to the Claude instance for that buffer's project, and start one if none is runni
 | `C-c c f` | `claude-code-fork` | ESC ESC |
 | `C-c c m` | `claude-code-transient` | Menu of all of the above |
 
-Inside the Claude buffer every key goes to the CLI. jterm's `C-c` escapes still
-work there: `C-c C-t` for copy mode, `C-c C-k` to kill.
+Inside the Claude buffer keys go to the CLI, except `C-x` and `M-x` (jterm's
+`jterm-keymap-exceptions`, like vterm), so `C-x 0`, `C-x o` and `C-x b` work.
+jterm's `C-c` escapes also work there: `C-c C-t` for copy mode, `C-c C-k` to kill.
 
 Customize: `claude-code-program`, `claude-code-program-switches` (e.g.
 `--dangerously-skip-permissions`), `claude-code-submit-delay`,
