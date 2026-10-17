@@ -6,6 +6,8 @@ import { basename, dirname, join, resolve } from "node:path"
 import type { BufferModel, Editor } from "@jemacs/core"
 import { createPluginContext, defcustom, getCustom, type PluginContext } from "@jemacs/core"
 
+import { installTagView } from "./tag-view"
+
 defcustom("obsidian-directory", "string", "",
   "Vault for obsidian commands run outside a vault. Empty means Obsidian's open (or most recent) vault.", "obsidian")
 
@@ -168,4 +170,6 @@ export function install(editor: Editor, ctx?: PluginContext): void {
 
   c.key("global", "C-c o d", "obsidian-daily-note")
   c.key("global", "C-c o t", "obsidian-insert-today")
+
+  installTagView(editor, c, obsidianVault)
 }
