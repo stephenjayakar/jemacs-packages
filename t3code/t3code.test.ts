@@ -2,8 +2,8 @@ import { afterEach, expect, test } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { newThreadCommands, projectFor, T3Client, threadTitle, workspaceRootFor, type T3Project } from "./client"
-import { resolveModelSelection } from "./t3code"
+import { newThreadCommands, projectAt, T3Client, threadTitle, type T3Project } from "./client"
+import { readLastDirectory, resolveModelSelection, writeLastDirectory } from "./t3code"
 
 const project = (id: string, workspaceRoot: string, deletedAt: string | null = null): T3Project =>
   ({ id, title: id, workspaceRoot, defaultModelSelection: null, deletedAt })
@@ -14,18 +14,22 @@ test("threadTitle follows the web client's 50-char truncation", () => {
   expect(threadTitle("x".repeat(60))).toBe(`${"x".repeat(50)}...`)
 })
 
-test("projectFor picks the deepest live project containing the directory", () => {
-  const projects = [project("outer", "/w"), project("inner", "/w/app"), project("gone", "/w/app/src", "2026-01-01")]
-  expect(projectFor(projects, "/w/app/src/lib")?.id).toBe("inner")
-  expect(projectFor(projects, "/w")?.id).toBe("outer")
-  expect(projectFor(projects, "/w-other")).toBeUndefined()
+test("projectAt only matches a live project rooted exactly at the directory", () => {
+  const projects = [project("outer", "/w"), project("inner", "/w/app/"), project("gone", "/w/lib", "2026-01-01")]
+  expect(projectAt(projects, "/w/app")?.id).toBe("inner")
+  expect(projectAt(projects, "/w")?.id).toBe("outer")
+  expect(projectAt(projects, "/w/app/src")).toBeUndefined()
+  expect(projectAt(projects, "/w/lib")).toBeUndefined()
 })
 
-test("workspaceRootFor finds the enclosing git root", () => {
-  const root = mkdtempSync(join(tmpdir(), "t3code-root-"))
-  mkdirSync(join(root, ".git"))
-  mkdirSync(join(root, "a", "b"), { recursive: true })
-  expect(workspaceRootFor(join(root, "a", "b"))).toBe(root)
+test("the last directory round-trips and is dropped once it no longer exists", () => {
+  const root = mkdtempSync(join(tmpdir(), "t3code-state-"))
+  const file = join(root, "nested", "state.json")
+  expect(readLastDirectory(file)).toBeNull()
+  writeLastDirectory(root, file)
+  expect(readLastDirectory(file)).toBe(root)
+  writeLastDirectory(join(root, "missing"), file)
+  expect(readLastDirectory(file)).toBeNull()
   rmSync(root, { recursive: true })
 })
 

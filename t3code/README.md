@@ -5,16 +5,14 @@ desktop app from jemacs. The thread runs in T3 and shows up in its sidebar right
 away; jemacs only sends the first prompt. (A jemacs view of the conversation
 will come later.)
 
-The thread goes to the T3 project whose workspace root contains the current
-buffer's directory (the deepest one if several do). If no project does, you're
-asked for a root to add, which defaults to the enclosing git repository.
+`C-c T` (`t3code-compose`) asks which directory the thread should run in. It
+offers the last directory you used, which is kept in
+`~/.jemacs/t3code-state.json`. For your first thread it offers the current
+buffer's directory. It then opens a prompt buffer: `C-c C-c` starts the thread
+and `C-c C-k` discards the prompt.
 
-| Key | Command | |
-| --- | --- | --- |
-| `C-c T n` | `t3code-new-thread` | Prompt from the minibuffer (`C-u`: choose the project) |
-| `C-c T c` | `t3code-compose` | Multi-line prompt buffer: `C-c C-c` sends, `C-c C-k` discards (`C-u`: choose the project) |
-| `C-c T r` | `t3code-new-thread-from-region` | Region or whole buffer as the prompt (`C-u`: prefix an instruction) |
-| `C-c T o` | `t3code-open-app` | Bring the T3 Code window to the front |
+A T3 thread runs in its project's root. So the thread uses the T3 project rooted
+at exactly that directory, and if there isn't one, a project for it is added.
 
 ## How it talks to T3
 

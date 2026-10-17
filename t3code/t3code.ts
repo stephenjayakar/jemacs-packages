@@ -1,5 +1,6 @@
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { resolve } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 import {
   BufferModel,
   defcustom,
@@ -12,24 +13,24 @@ import {
   CLAUDE_INSTANCE,
   defaultConfig,
   FALLBACK_CLAUDE_MODEL,
-  projectFor,
+  projectAt,
   settingsModelSelection,
   T3Client,
-  workspaceRootFor,
   type InteractionMode,
   type ModelSelection,
   type RuntimeMode,
   type T3Project,
 } from "./client"
 
-/** Kick off Claude Code threads in the T3 Code desktop app from jemacs. The
- *  thread runs in T3 (it shows up in the sidebar straight away); jemacs only
- *  sends the first prompt. */
+/** Kick off Claude Code threads in the T3 Code desktop app from jemacs:
+ *  `t3code-compose` asks for the directory the thread runs in, then opens a
+ *  prompt buffer whose C-c C-c starts the thread. The thread runs in T3 (it
+ *  shows up in the sidebar straight away); jemacs only sends the first prompt. */
 
 export const COMPOSE_MODE = "t3code-prompt-mode"
 const COMPOSE_DIRECTORY_LOCAL = "t3code-directory"
-const COMPOSE_PROJECT_LOCAL = "t3code-project"
 const COMPOSE_WINCONF_LOCAL = "t3code-winconf"
+export const STATE_FILE = join(homedir(), ".jemacs", "t3code-state.json")
 
 const defaults = defaultConfig()
 defcustom("t3code-base-directory", "string", defaults.baseDir, "T3 Code's base directory (holds userdata/server-runtime.json).", "t3code")
@@ -82,10 +83,33 @@ function abbreviateHome(path: string): string {
 
 function sourceDirectory(editor: Editor): string {
   const buffer = editor.currentBuffer
-  const composed = buffer.locals.get(COMPOSE_DIRECTORY_LOCAL)
-  if (typeof composed === "string") return composed
   const local = buffer.locals.get("default-directory")
   return resolve(buffer.directory() ?? (typeof local === "string" && local ? local : process.cwd()))
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory()
+  }
+  catch {
+    return false
+  }
+}
+
+/** The directory the last thread was composed for, if it still exists. */
+export function readLastDirectory(file = STATE_FILE): string | null {
+  try {
+    const dir = JSON.parse(readFileSync(file, "utf8")).lastDirectory
+    return typeof dir === "string" && isDirectory(dir) ? dir : null
+  }
+  catch {
+    return null
+  }
+}
+
+export function writeLastDirectory(dir: string, file = STATE_FILE): void {
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, JSON.stringify({ lastDirectory: dir }, null, 2) + "\n")
 }
 
 function failure(error: unknown): string {
@@ -93,37 +117,24 @@ function failure(error: unknown): string {
 }
 
 export function install(editor: Editor): void {
-  /** The project for DIR: the T3 project covering it, else offer to add its
-   *  repository root. With CHOOSE, pick from every project instead. */
-  async function project(dir: string, choose: boolean): Promise<T3Project | null> {
-    const projects = (await t3().snapshot()).projects.filter(project => !project.deletedAt)
-    if (choose) {
-      const label = (project: T3Project) => `${project.title} (${abbreviateHome(project.workspaceRoot)})`
-      const choice = await editor.completingRead("T3 project: ", { collection: projects.map(label) })
-      return projects.find(project => label(project) === choice) ?? null
-    }
-    const found = projectFor(projects, dir)
+  /** The T3 project rooted at DIR, adding one when there is none: a thread
+   *  runs in its project's root, so this is what makes it start in DIR. */
+  async function projectRootedAt(dir: string): Promise<T3Project> {
+    const found = projectAt((await t3().snapshot()).projects, dir)
     if (found) return found
-    const root = await editor.prompt(
-      `No T3 project contains ${abbreviateHome(dir)}; add project at: `,
-      `${workspaceRootFor(dir)}/`,
-      "file",
-      { completion: "file" },
-    )
-    if (!root?.trim()) return null
-    const workspaceRoot = resolve(root.trim())
-    const projectId = await t3().createProject(workspaceRoot)
-    editor.message(`t3code: added project ${abbreviateHome(workspaceRoot)}`)
-    return { id: projectId, title: workspaceRoot, workspaceRoot, defaultModelSelection: null, deletedAt: null }
+    const projectId = await t3().createProject(dir)
+    editor.message(`t3code: added project ${abbreviateHome(dir)}`)
+    return { id: projectId, title: basename(dir) || dir, workspaceRoot: dir, defaultModelSelection: null, deletedAt: null }
   }
 
-  async function startThread(prompt: string, target: T3Project): Promise<boolean> {
+  async function startThread(prompt: string, dir: string): Promise<void> {
+    const target = await projectRootedAt(dir)
     const modelSelection = resolveModelSelection(
       [target.defaultModelSelection, settingsModelSelection(t3().config.baseDir)],
       getCustom<string>("t3code-model") ?? "",
       getCustom<string>("t3code-effort") ?? "",
     )
-    editor.message(`t3code: starting thread in ${target.title}...`)
+    editor.message(`t3code: starting thread in ${abbreviateHome(dir)}...`)
     const { title } = await t3().startThread({
       projectId: target.id,
       prompt,
@@ -131,70 +142,31 @@ export function install(editor: Editor): void {
       runtimeMode: (getCustom<string>("t3code-runtime-mode") || "full-access") as RuntimeMode,
       interactionMode: (getCustom<string>("t3code-interaction-mode") || "default") as InteractionMode,
     })
-    editor.message(`t3code: started "${title}" in ${target.title} (${modelSelection.model})`)
+    editor.message(`t3code: started "${title}" in ${abbreviateHome(dir)} (${modelSelection.model})`)
     if (getCustom<boolean>("t3code-raise-app")) {
       Bun.spawn(["open", t3().config.appPath], { stdout: "ignore", stderr: "ignore" })
     }
-    return true
   }
 
-  /** Resolve the project for the current buffer, then send PROMPT. Errors are
-   *  reported in the echo area rather than thrown into the command loop. */
-  async function send(prompt: string, choose: boolean, dir = sourceDirectory(editor)): Promise<boolean> {
-    if (!prompt.trim()) {
-      editor.message("t3code: empty prompt")
-      return false
-    }
-    try {
-      const target = await project(dir, choose)
-      return target ? await startThread(prompt, target) : false
-    }
-    catch (error) {
-      editor.message(`t3code: ${failure(error)}`)
-      return false
-    }
-  }
+  editor.command("t3code-compose", async () => {
+    const initial = readLastDirectory() ?? sourceDirectory(editor)
+    const answer = await editor.prompt("Start T3 thread in: ", `${initial.replace(/\/$/, "")}/`, "t3code-directory", { completion: "file" })
+    if (!answer?.trim()) return
+    const dir = resolve(answer.trim().replace(/^~(?=\/|$)/, homedir()))
+    if (!isDirectory(dir)) return editor.message(`t3code: not a directory: ${abbreviateHome(dir)}`)
+    writeLastDirectory(dir)
 
-  editor.command("t3code-new-thread", async ({ args, prefixArgument }) => {
-    const prompt = args[0] ?? await editor.prompt("T3 Claude: ", "", "t3code-prompt")
-    if (prompt != null) await send(prompt, prefixArgument != null)
-  }, "Start a Claude Code thread in T3 Code with a prompt from the minibuffer (C-u: choose the project).")
-
-  editor.command("t3code-new-thread-from-region", async ({ prefixArgument }) => {
-    const buffer = editor.currentBuffer
-    const region = buffer.markActive ? buffer.selectedText() : ""
-    const text = region || buffer.text
-    if (!text.trim()) return editor.message("t3code: nothing to send")
-    const instruction = prefixArgument != null ? await editor.prompt("Instruction: ", "", "t3code-prompt") : ""
-    if (instruction == null) return
-    const where = buffer.path ? `From ${abbreviateHome(buffer.path)}:\n\n` : ""
-    if (await send(instruction ? `${instruction}\n\n${where}${text}` : text, false)) buffer.markActive = false
-  }, "Start a T3 Code thread with the region (or whole buffer) as the prompt (C-u: prefix an instruction).")
-
-  editor.command("t3code-compose", async ({ prefixArgument }) => {
-    const dir = sourceDirectory(editor)
-    let chosen: T3Project | null = null
-    if (prefixArgument != null) {
-      try {
-        chosen = await project(dir, true)
-      }
-      catch (error) {
-        return editor.message(`t3code: ${failure(error)}`)
-      }
-      if (!chosen) return
-    }
-    const name = `*t3code-prompt: ${abbreviateHome(chosen?.workspaceRoot ?? dir)}*`
+    const name = `*t3code-prompt: ${abbreviateHome(dir)}*`
     const existing = [...editor.buffers.values()].find(buffer => buffer.name === name)
     const winconf = editor.currentWindowConfiguration()
     const buffer = existing ?? editor.addBuffer(new BufferModel({ name, text: "", kind: "scratch", mode: COMPOSE_MODE }))
     if (!existing) editor.enterMode(buffer, COMPOSE_MODE)
-    buffer.locals.set("default-directory", chosen?.workspaceRoot ?? dir)
-    buffer.locals.set(COMPOSE_DIRECTORY_LOCAL, chosen?.workspaceRoot ?? dir)
-    buffer.locals.set(COMPOSE_PROJECT_LOCAL, chosen)
+    buffer.locals.set("default-directory", dir)
+    buffer.locals.set(COMPOSE_DIRECTORY_LOCAL, dir)
     buffer.locals.set(COMPOSE_WINCONF_LOCAL, winconf)
     editor.displayBufferInOtherWindow(buffer.id, { select: true })
     editor.message("Write the prompt; C-c C-c to start the thread, C-c C-k to cancel")
-  }, "Write a multi-line prompt in a buffer, then C-c C-c starts a T3 Code thread (C-u: choose the project).")
+  }, "Pick a directory (default: the last one used), then write a prompt; C-c C-c starts a T3 Code thread there.")
 
   function closeCompose(buffer: BufferModel): void {
     const winconf = buffer.locals.get(COMPOSE_WINCONF_LOCAL) as ReturnType<Editor["currentWindowConfiguration"]> | undefined
@@ -204,13 +176,10 @@ export function install(editor: Editor): void {
 
   editor.command("t3code-compose-send", async ({ buffer }) => {
     if (buffer.mode !== COMPOSE_MODE) return editor.message("t3code: not in a prompt buffer")
-    const dir = buffer.locals.get(COMPOSE_DIRECTORY_LOCAL) as string
-    const chosen = buffer.locals.get(COMPOSE_PROJECT_LOCAL) as T3Project | null
     const prompt = buffer.text
     if (!prompt.trim()) return editor.message("t3code: empty prompt")
     try {
-      const target = chosen ?? await project(dir, false)
-      if (!target || !await startThread(prompt, target)) return
+      await startThread(prompt, buffer.locals.get(COMPOSE_DIRECTORY_LOCAL) as string)
     }
     catch (error) {
       // Keep the buffer so the prompt isn't lost.
@@ -225,20 +194,10 @@ export function install(editor: Editor): void {
     editor.message("t3code: prompt discarded")
   }, "Discard this T3 Code prompt buffer.")
 
-  editor.command("t3code-open-app", () => {
-    Bun.spawn(["open", t3().config.appPath], { stdout: "ignore", stderr: "ignore" })
-  }, "Bring the T3 Code window to the front.")
-
   const composeMap = new Keymap("t3code-prompt-mode-map")
   composeMap.bind("C-c C-c", "t3code-compose-send")
   composeMap.bind("C-c C-k", "t3code-compose-cancel")
   defineMode({ name: COMPOSE_MODE, parent: "markdown", keymap: composeMap })
 
-  const keys: Array<[string, string]> = [
-    ["n", "t3code-new-thread"],
-    ["c", "t3code-compose"],
-    ["r", "t3code-new-thread-from-region"],
-    ["o", "t3code-open-app"],
-  ]
-  for (const [key, command] of keys) editor.key(`C-c T ${key}`, command)
+  editor.key("C-c T", "t3code-compose")
 }

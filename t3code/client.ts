@@ -2,7 +2,7 @@ import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { basename, dirname, join, resolve, sep } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 
 /** Minimal client for a locally running T3 Code server: discovery from
  *  `<base>/userdata/server-runtime.json`, a bearer token minted with the app's
@@ -79,26 +79,10 @@ export function threadTitle(prompt: string): string {
   return trimmed.length <= TITLE_MAX ? trimmed : `${trimmed.slice(0, TITLE_MAX)}...`
 }
 
-/** The live project whose workspace root is DIR or its nearest ancestor. */
-export function projectFor(projects: T3Project[], dir: string): T3Project | undefined {
+/** The live project whose workspace root is exactly DIR. */
+export function projectAt(projects: T3Project[], dir: string): T3Project | undefined {
   const target = resolve(dir)
-  const covering = projects.filter(project => {
-    if (project.deletedAt) return false
-    const root = project.workspaceRoot.replace(/\/+$/, "")
-    return target === root || target.startsWith(root + sep)
-  })
-  return covering.sort((a, b) => b.workspaceRoot.length - a.workspaceRoot.length)[0]
-}
-
-/** Nearest ancestor of DIR containing `.git`, else DIR itself. */
-export function workspaceRootFor(dir: string): string {
-  let current = resolve(dir)
-  while (true) {
-    if (existsSync(join(current, ".git"))) return current
-    const parent = dirname(current)
-    if (parent === current) return resolve(dir)
-    current = parent
-  }
+  return projects.find(project => !project.deletedAt && resolve(project.workspaceRoot) === target)
 }
 
 export type NewThread = {

@@ -1,2 +1,2 @@
-export { COMPOSE_MODE, install, resolveModelSelection } from "./t3code"
-export { newThreadCommands, projectFor, T3Client, threadTitle, workspaceRootFor } from "./client"
+export { COMPOSE_MODE, install, readLastDirectory, resolveModelSelection, writeLastDirectory } from "./t3code"
+export { newThreadCommands, projectAt, T3Client, threadTitle } from "./client"
