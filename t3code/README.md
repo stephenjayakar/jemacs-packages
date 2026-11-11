@@ -1,15 +1,18 @@
 # t3code
 
-Starts Claude Code threads in the [T3 Code](https://github.com/pingdotgg/t3code)
-desktop app from jemacs. The thread runs in T3 and shows up in its sidebar right
-away; jemacs only sends the first prompt. (A jemacs view of the conversation
-will come later.)
+Starts Claude Code or Antigravity (`agy`) threads in the
+[T3 Code](https://github.com/pingdotgg/t3code) desktop app from jemacs. The
+thread runs in T3 and shows up in its sidebar right away; jemacs only sends the
+first prompt.
 
-`C-c T` (`t3code-compose`) asks which directory the thread should run in. It
-offers the last directory you used, which is kept in
-`~/.jemacs/t3code-state.json`. For your first thread it offers the current
-buffer's directory. It then opens a prompt buffer: `C-c C-c` starts the thread
-and `C-c C-k` discards the prompt.
+- `C-c T` (`t3code-compose`) asks which directory the thread should run in
+  (defaulting to the last one used, kept in `~/.jemacs/t3code-state.json`, or
+  the current buffer's directory), then opens a prompt buffer. With `C-u`, it
+  first asks which provider (`agy` or `claude`) to use.
+- `C-c A` (`t3code-compose-agy`) does the same, targeting Antigravity (`agy`,
+  `gemini-4-carbon` by default).
+- In the prompt buffer: `C-c C-c` starts the thread, `C-c C-p` switches the
+  buffer between `claude` and `agy`, and `C-c C-k` discards the prompt.
 
 A T3 thread runs in its project's root. So the thread uses the T3 project rooted
 at exactly that directory, and if there isn't one, a project for it is added.
@@ -18,10 +21,9 @@ at exactly that directory, and if there isn't one, a project for it is added.
 
 - The server's address comes from `~/.t3/userdata/server-runtime.json`, so
   T3 Code has to be running.
-- Requests use T3's HTTP API. Each new thread is two `POST
-  /api/orchestration/dispatch` calls, `thread.create` then `thread.turn.start`.
-  This is the same pair the web client sends. T3 then generates the thread
-  title.
+- Projects use `GET /api/projects` and `POST /api/projects/mutate`; threads are
+  launched over T3's v2 WebSocket RPC (`orchestration.launchThread`) using a
+  short-lived ticket from `POST /api/auth/websocket-ticket/rpc`.
 - Auth is a bearer session issued by the CLI that ships inside the app. It runs
   `bin.mjs auth session issue` under the app's Electron binary with
   `ELECTRON_RUN_AS_NODE=1`. The token is cached in
@@ -29,18 +31,18 @@ at exactly that directory, and if there isn't one, a project for it is added.
   if the server ever rejects it. List or revoke these sessions with the same
   CLI: `auth session list|revoke --base-dir ~/.t3`.
 
-## Model
+## Provider & Model
 
-The provider is always `claudeAgent`. The model comes from the first of these
-that is a Claude model:
+Supported providers:
 
-1. the project's default model in T3
-2. T3's global default model
-3. `claude-opus-5-5`
+- `claudeAgent` (`claude`) — defaults to the project's or T3's default Claude
+  model, else `claude-opus-5-5` (reasoning option `effort`).
+- `antigravity` (`agy`) — defaults to the project's or T3's default Antigravity
+  model, else `gemini-4-carbon` (reasoning option `thought_level`). Make sure
+  Antigravity is enabled in `~/.t3/userdata/settings.json` (with `binaryPath`
+  pointing to `agy` when using the Antigravity CLI).
 
-`t3code-model` and `t3code-effort` override the model and effort.
-
-Customize: `t3code-model`, `t3code-effort`, `t3code-runtime-mode`
-(`full-access` by default, like T3), `t3code-interaction-mode` (`default` or
-`plan`), `t3code-raise-app`, `t3code-app-path`, `t3code-base-directory`,
-`t3code-token`.
+Customize: `t3code-provider`, `t3code-model`, `t3code-agy-model`,
+`t3code-effort`, `t3code-runtime-mode` (`full-access` by default, like T3),
+`t3code-interaction-mode` (`default` or `plan`), `t3code-raise-app`,
+`t3code-app-path`, `t3code-base-directory`, `t3code-token`.

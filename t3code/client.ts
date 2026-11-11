@@ -6,7 +6,8 @@ import { basename, dirname, join, resolve } from "node:path"
 
 /** Minimal client for a locally running T3 Code server: discovery from
  *  `<base>/userdata/server-runtime.json`, a bearer token minted with the app's
- *  bundled CLI (`auth session issue`), and the HTTP orchestration API. */
+ *  bundled CLI (`auth session issue`), REST `/api/projects`, and the v2
+ *  WebSocket RPC (`orchestration.launchThread`). */
 
 export type ModelOption = { id: string; value: string | boolean | number }
 export type ModelSelection = { instanceId: string; model: string; options?: ModelOption[] }
@@ -21,7 +22,7 @@ export type T3Project = {
   deletedAt: string | null
 }
 
-export type T3Snapshot = { snapshotSequence: number; projects: T3Project[] }
+export type T3Snapshot = { projects: T3Project[]; updatedAt?: string }
 
 export type T3Config = {
   /** T3 base directory (`~/.t3`), holding `userdata/`. */
@@ -37,13 +38,25 @@ export type T3Config = {
 type CachedToken = { sessionId: string; token: string; expiresAt: string }
 
 export const CLAUDE_INSTANCE = "claudeAgent"
+export const AGY_INSTANCE = "antigravity"
 export const FALLBACK_CLAUDE_MODEL = "claude-opus-5-5"
+export const FALLBACK_AGY_MODEL = "gemini-4-carbon"
 const TITLE_MAX = 50
+
+const APP_CANDIDATES = [
+  "/Applications/T3 Code (Beta).app",
+  "/Applications/T3 Code.app",
+  "/Applications/T3 Code (Alpha).app",
+]
+
+export function defaultAppPath(): string {
+  return APP_CANDIDATES.find(path => existsSync(path)) ?? APP_CANDIDATES[0]!
+}
 
 export function defaultConfig(): T3Config {
   return {
     baseDir: join(homedir(), ".t3"),
-    appPath: "/Applications/T3 Code (Alpha).app",
+    appPath: defaultAppPath(),
     tokenFile: join(homedir(), ".jemacs", "t3code-token.json"),
   }
 }
@@ -93,37 +106,31 @@ export type NewThread = {
   interactionMode: InteractionMode
 }
 
-/** The `thread.create` + `thread.turn.start` pair the web client sends for a
- *  first message. The server regenerates the title from `titleSeed`. */
-export function newThreadCommands(input: NewThread, now = new Date(), id: () => string = randomUUID) {
+/** The `orchestration.launchThread` RPC payload for starting a new thread with
+ *  its first user message. `generateTitle: true` asks T3 to refine `title`. */
+export function newThreadCommands(input: NewThread, id: () => string = randomUUID) {
   const threadId = id()
-  const createdAt = now.toISOString()
   const title = threadTitle(input.prompt)
-  const create = {
-    type: "thread.create",
+  const runtimeMode: RuntimeMode = input.modelSelection.instanceId === AGY_INSTANCE && input.runtimeMode === "auto"
+    ? "auto-accept-edits"
+    : input.runtimeMode
+  const launch = {
     commandId: id(),
     threadId,
     projectId: input.projectId,
     title,
+    generateTitle: true,
     modelSelection: input.modelSelection,
-    runtimeMode: input.runtimeMode,
+    runtimeMode,
     interactionMode: input.interactionMode,
-    branch: null,
-    worktreePath: null,
-    createdAt,
+    workspaceStrategy: { type: "root" as const },
+    initialMessage: {
+      messageId: id(),
+      text: input.prompt,
+      attachments: [] as never[],
+    },
   }
-  const turn = {
-    type: "thread.turn.start",
-    commandId: id(),
-    threadId,
-    message: { messageId: id(), role: "user", text: input.prompt, attachments: [] },
-    modelSelection: input.modelSelection,
-    titleSeed: title,
-    runtimeMode: input.runtimeMode,
-    interactionMode: input.interactionMode,
-    createdAt,
-  }
-  return { threadId, title, create, turn }
+  return { threadId, title, launch }
 }
 
 export class T3Error extends Error {}
@@ -140,32 +147,62 @@ export class T3Client {
   }
 
   async snapshot(): Promise<T3Snapshot> {
-    return await this.request<T3Snapshot>("GET", "/api/orchestration/snapshot")
-  }
-
-  async dispatch(command: object): Promise<{ sequence: number }> {
-    return await this.request<{ sequence: number }>("POST", "/api/orchestration/dispatch", command)
+    return await this.request<T3Snapshot>("GET", "/api/projects")
   }
 
   async createProject(workspaceRoot: string): Promise<string> {
     const projectId = randomUUID()
-    await this.dispatch({
+    const created = await this.request<T3Project>("POST", "/api/projects/mutate", {
       type: "project.create",
       commandId: randomUUID(),
       projectId,
       title: basename(workspaceRoot) || workspaceRoot,
       workspaceRoot,
       createWorkspaceRootIfMissing: false,
-      createdAt: new Date().toISOString(),
     })
-    return projectId
+    return created.id || projectId
   }
 
   async startThread(input: NewThread): Promise<{ threadId: string; title: string }> {
-    const { threadId, title, create, turn } = newThreadCommands(input)
-    await this.dispatch(create)
-    await this.dispatch(turn)
-    return { threadId, title }
+    const { threadId, title, launch } = newThreadCommands(input)
+    const launched = await this.rpc<{ threadId: string }>("orchestration.launchThread", launch)
+    return { threadId: launched.threadId || threadId, title }
+  }
+
+  /** One v2 WebSocket RPC call using a short-lived `wsTicket`. */
+  async rpc<T>(tag: string, payload: object): Promise<T> {
+    const { ticket } = await this.request<{ ticket: string }>("POST", "/api/auth/websocket-ticket/rpc")
+    const wsUrl = `${this.origin().replace(/^http/, "ws")}/ws?orchestrationProtocol=2&wsTicket=${encodeURIComponent(ticket)}`
+    return await new Promise<T>((resolveRpc, rejectRpc) => {
+      const ws = new WebSocket(wsUrl)
+      let settled = false
+      const finish = (fn: () => void) => {
+        if (settled) return
+        settled = true
+        try { ws.close() } catch {}
+        fn()
+      }
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ _tag: "Request", id: "1", tag, payload, headers: [] }))
+      }
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(String(event.data))
+          if (msg._tag !== "Exit" || (msg.requestId && msg.requestId !== "1")) return
+          if (msg.exit?._tag === "Success") finish(() => resolveRpc(msg.exit.value as T))
+          else finish(() => rejectRpc(new T3Error(`${tag}: ${rpcErrorDetail(msg.exit)}`)))
+        }
+        catch (error) {
+          finish(() => rejectRpc(error instanceof Error ? error : new T3Error(String(error))))
+        }
+      }
+      ws.onerror = () => {
+        finish(() => rejectRpc(new T3Error(`${tag}: WebSocket connection to T3 Code failed`)))
+      }
+      ws.onclose = () => {
+        finish(() => rejectRpc(new T3Error(`${tag}: T3 Code closed the connection before replying`)))
+      }
+    })
   }
 
   /** One request, re-minting the token once if the server rejects it. */
@@ -201,11 +238,20 @@ export class T3Client {
 function errorDetail(text: string): string {
   try {
     const error = JSON.parse(text)
-    return [error.code ?? error._tag, error.reason].filter(Boolean).join(": ") || text
+    return [error.code ?? error._tag, error.reason ?? error.message].filter(Boolean).join(": ") || text
   }
   catch {
     return text || "(empty response)"
   }
+}
+
+function rpcErrorDetail(exit: any): string {
+  const causes = Array.isArray(exit?.cause) ? exit.cause : []
+  const error = causes.find((entry: any) => entry?.error)?.error
+  if (error && typeof error === "object") {
+    return error.detail || error.message || error._tag || JSON.stringify(error)
+  }
+  return exit ? JSON.stringify(exit) : "unknown RPC failure"
 }
 
 function readCachedToken(file: string): CachedToken | null {

@@ -10,8 +10,10 @@ import {
   type Editor,
 } from "@jemacs/core"
 import {
+  AGY_INSTANCE,
   CLAUDE_INSTANCE,
   defaultConfig,
+  FALLBACK_AGY_MODEL,
   FALLBACK_CLAUDE_MODEL,
   projectAt,
   settingsModelSelection,
@@ -22,22 +24,27 @@ import {
   type T3Project,
 } from "./client"
 
-/** Kick off Claude Code threads in the T3 Code desktop app from jemacs:
- *  `t3code-compose` asks for the directory the thread runs in, then opens a
- *  prompt buffer whose C-c C-c starts the thread. The thread runs in T3 (it
- *  shows up in the sidebar straight away); jemacs only sends the first prompt. */
+/** Kick off Claude Code or Antigravity (agy) threads in the T3 Code desktop app
+ *  from jemacs: `t3code-compose` (`C-c T`) or `t3code-compose-agy` (`C-c A`)
+ *  asks for the directory the thread runs in, then opens a prompt buffer whose
+ *  `C-c C-c` starts the thread in T3 Code's sidebar. */
 
 export const COMPOSE_MODE = "t3code-prompt-mode"
 const COMPOSE_DIRECTORY_LOCAL = "t3code-directory"
+const COMPOSE_PROVIDER_LOCAL = "t3code-provider"
 const COMPOSE_WINCONF_LOCAL = "t3code-winconf"
 export const STATE_FILE = join(homedir(), ".jemacs", "t3code-state.json")
+
+const AGY_THINKING_LEVELS = new Set(["low", "medium", "high"])
 
 const defaults = defaultConfig()
 defcustom("t3code-base-directory", "string", defaults.baseDir, "T3 Code's base directory (holds userdata/server-runtime.json).", "t3code")
 defcustom("t3code-app-path", "string", defaults.appPath, "The T3 Code .app bundle, whose bundled CLI issues API tokens.", "t3code")
 defcustom("t3code-token", "string", "", "Explicit T3 Code bearer token. Empty: issue one with the app's CLI and cache it in ~/.jemacs/t3code-token.json.", "t3code")
-defcustom("t3code-model", "string", "", "Claude model for new threads. Empty: the project's or T3's default Claude model, else claude-opus-5-5.", "t3code")
-defcustom("t3code-effort", "string", "", "Reasoning effort for new threads (low, medium, high, xhigh, max, ...). Empty: T3's default.", "t3code")
+defcustom("t3code-provider", "string", "", "Default provider for t3code-compose: agy (antigravity) or claude (claudeAgent). Empty: project or T3 default, else claudeAgent.", "t3code")
+defcustom("t3code-model", "string", "", "Claude model override for new threads. Empty: the project's or T3's default Claude model, else claude-opus-5-5.", "t3code")
+defcustom("t3code-agy-model", "string", "", "Antigravity (agy) model override for new threads. Empty: the project's or T3's default Antigravity model, else gemini-4-carbon.", "t3code")
+defcustom("t3code-effort", "string", "", "Reasoning effort / thinking level for new threads (low, medium, high, xhigh, max, ...). Empty: T3's default.", "t3code")
 defcustom("t3code-runtime-mode", "string", "full-access", "Runtime mode for new threads: approval-required, auto-accept-edits, auto or full-access.", "t3code")
 defcustom("t3code-interaction-mode", "string", "default", "Interaction mode for new threads: default or plan.", "t3code")
 defcustom("t3code-raise-app", "boolean", false, "Bring the T3 Code window to the front after starting a thread.", "t3code")
@@ -60,20 +67,65 @@ function t3(): T3Client {
   return client
 }
 
-/** Claude selection for a new thread: the project's default, then T3's,
- *  when those are Claude; customs override the model and effort. */
+export function normalizeProvider(provider: string): string {
+  const trimmed = provider.trim()
+  const lower = trimmed.toLowerCase()
+  if (!lower) return ""
+  if (lower === "agy" || lower === "antigravity") return AGY_INSTANCE
+  if (lower === "claude" || lower === "claudeagent" || lower === "claude-code") return CLAUDE_INSTANCE
+  return trimmed
+}
+
+function providerLabel(instanceId: string): string {
+  return instanceId === AGY_INSTANCE ? "agy" : instanceId === CLAUDE_INSTANCE ? "claude" : instanceId
+}
+
+function fallbackModelFor(instanceId: string): string {
+  return instanceId === AGY_INSTANCE ? FALLBACK_AGY_MODEL : FALLBACK_CLAUDE_MODEL
+}
+
+function reasoningOptionId(instanceId: string): string {
+  return instanceId === AGY_INSTANCE ? "thought_level" : "effort"
+}
+
+function normalizeEffortFor(instanceId: string, effort: string): string {
+  const trimmed = effort.trim()
+  if (!trimmed || instanceId !== AGY_INSTANCE) return trimmed
+  const lower = trimmed.toLowerCase()
+  if (AGY_THINKING_LEVELS.has(lower)) return lower
+  if (lower === "xhigh" || lower === "max" || lower === "ultracode" || lower === "ultrathink") return "high"
+  return trimmed
+}
+
+/** Model selection for a new thread: honors an explicit provider (`agy` or
+ *  `claude`), else the project's or T3's default when it is Claude or
+ *  Antigravity, else Claude; customs override the model and reasoning level. */
 export function resolveModelSelection(
   candidates: Array<ModelSelection | null | undefined>,
   model: string,
   effort: string,
+  provider = "",
 ): ModelSelection {
-  const base = candidates.find(selection => selection?.instanceId === CLAUDE_INSTANCE)
-    ?? { instanceId: CLAUDE_INSTANCE, model: FALLBACK_CLAUDE_MODEL, options: [] }
+  const explicit = normalizeProvider(provider)
+  const supported = new Set([CLAUDE_INSTANCE, AGY_INSTANCE])
+  const base = (explicit
+    ? candidates.find(selection => selection?.instanceId === explicit)
+    : candidates.find(selection => selection && supported.has(selection.instanceId)))
+    ?? {
+      instanceId: explicit || CLAUDE_INSTANCE,
+      model: fallbackModelFor(explicit || CLAUDE_INSTANCE),
+      options: [],
+    }
+  const instanceId = base.instanceId
+  const optionKey = reasoningOptionId(instanceId)
   let options = base.options ?? []
-  // Options like contextWindow are per-model; only effort carries across.
-  if (model && model !== base.model) options = options.filter(option => option.id === "effort")
-  if (effort) options = [...options.filter(option => option.id !== "effort"), { id: "effort", value: effort }]
-  return { instanceId: CLAUDE_INSTANCE, model: model || base.model, options }
+  // Options like contextWindow are per-model; only reasoning carries across.
+  if (model && model !== base.model) options = options.filter(option => option.id === optionKey)
+  const normalizedEffort = normalizeEffortFor(instanceId, effort)
+  if (normalizedEffort) {
+    options = [...options.filter(option => option.id !== optionKey), { id: optionKey, value: normalizedEffort }]
+  }
+  return { instanceId, model: model || base.model, options }
 }
 
 function abbreviateHome(path: string): string {
@@ -127,14 +179,35 @@ export function install(editor: Editor): void {
     return { id: projectId, title: basename(dir) || dir, workspaceRoot: dir, defaultModelSelection: null, deletedAt: null }
   }
 
-  async function startThread(prompt: string, dir: string): Promise<void> {
+  function modelOverrideFor(instanceId: string): string {
+    if (instanceId === AGY_INSTANCE) return getCustom<string>("t3code-agy-model") ?? ""
+    return getCustom<string>("t3code-model") ?? ""
+  }
+
+  function effectiveProvider(providerOverride = ""): string {
+    const explicit = normalizeProvider(providerOverride || (getCustom<string>("t3code-provider") ?? ""))
+    if (explicit) return explicit
+    const settingsDefault = settingsModelSelection(t3().config.baseDir)?.instanceId
+    return settingsDefault === AGY_INSTANCE ? AGY_INSTANCE : CLAUDE_INSTANCE
+  }
+
+  async function startThread(prompt: string, dir: string, providerOverride = ""): Promise<void> {
     const target = await projectRootedAt(dir)
+    const configuredProvider = normalizeProvider(providerOverride || (getCustom<string>("t3code-provider") ?? ""))
+    const provisional = resolveModelSelection(
+      [target.defaultModelSelection, settingsModelSelection(t3().config.baseDir)],
+      "",
+      "",
+      configuredProvider,
+    )
     const modelSelection = resolveModelSelection(
       [target.defaultModelSelection, settingsModelSelection(t3().config.baseDir)],
-      getCustom<string>("t3code-model") ?? "",
+      modelOverrideFor(provisional.instanceId),
       getCustom<string>("t3code-effort") ?? "",
+      provisional.instanceId,
     )
-    editor.message(`t3code: starting thread in ${abbreviateHome(dir)}...`)
+    const label = providerLabel(modelSelection.instanceId)
+    editor.message(`t3code: starting ${label} thread in ${abbreviateHome(dir)}...`)
     const { title } = await t3().startThread({
       projectId: target.id,
       prompt,
@@ -142,31 +215,69 @@ export function install(editor: Editor): void {
       runtimeMode: (getCustom<string>("t3code-runtime-mode") || "full-access") as RuntimeMode,
       interactionMode: (getCustom<string>("t3code-interaction-mode") || "default") as InteractionMode,
     })
-    editor.message(`t3code: started "${title}" in ${abbreviateHome(dir)} (${modelSelection.model})`)
+    editor.message(`t3code: started "${title}" in ${abbreviateHome(dir)} (${label}: ${modelSelection.model})`)
     if (getCustom<boolean>("t3code-raise-app")) {
       Bun.spawn(["open", t3().config.appPath], { stdout: "ignore", stderr: "ignore" })
     }
   }
 
-  editor.command("t3code-compose", async () => {
+  function composeBufferName(dir: string, provider: string): string {
+    const tag = normalizeProvider(provider) === AGY_INSTANCE ? " [agy]" : ""
+    return `*t3code-prompt${tag}: ${abbreviateHome(dir)}*`
+  }
+
+  async function openCompose(providerOverride = ""): Promise<void> {
     const initial = readLastDirectory() ?? sourceDirectory(editor)
-    const answer = await editor.prompt("Start T3 thread in: ", `${initial.replace(/\/$/, "")}/`, "t3code-directory", { completion: "file" })
+    const tag = normalizeProvider(providerOverride) === AGY_INSTANCE ? "agy " : ""
+    const answer = await editor.prompt(`Start T3 ${tag}thread in: `, `${initial.replace(/\/$/, "")}/`, "t3code-directory", { completion: "file" })
     if (!answer?.trim()) return
     const dir = resolve(answer.trim().replace(/^~(?=\/|$)/, homedir()))
-    if (!isDirectory(dir)) return editor.message(`t3code: not a directory: ${abbreviateHome(dir)}`)
+    if (!isDirectory(dir)) {
+      editor.message(`t3code: not a directory: ${abbreviateHome(dir)}`)
+      return
+    }
     writeLastDirectory(dir)
 
-    const name = `*t3code-prompt: ${abbreviateHome(dir)}*`
+    const name = composeBufferName(dir, providerOverride)
     const existing = [...editor.buffers.values()].find(buffer => buffer.name === name)
     const winconf = editor.currentWindowConfiguration()
     const buffer = existing ?? editor.addBuffer(new BufferModel({ name, text: "", kind: "scratch", mode: COMPOSE_MODE }))
     if (!existing) editor.enterMode(buffer, COMPOSE_MODE)
     buffer.locals.set("default-directory", dir)
     buffer.locals.set(COMPOSE_DIRECTORY_LOCAL, dir)
+    buffer.locals.set(COMPOSE_PROVIDER_LOCAL, normalizeProvider(providerOverride))
     buffer.locals.set(COMPOSE_WINCONF_LOCAL, winconf)
     editor.displayBufferInOtherWindow(buffer.id, { select: true })
-    editor.message("Write the prompt; C-c C-c to start the thread, C-c C-k to cancel")
-  }, "Pick a directory (default: the last one used), then write a prompt; C-c C-c starts a T3 Code thread there.")
+    const activeLabel = providerLabel(effectiveProvider(providerOverride))
+    editor.message(`Write ${activeLabel} prompt; C-c C-c to start, C-c C-p to switch provider, C-c C-k to cancel`)
+  }
+
+  editor.command("t3code-compose", async ({ prefixArgument }) => {
+    let provider = ""
+    if (prefixArgument !== null && prefixArgument !== undefined) {
+      const picked = await editor.completingRead("T3 provider: ", { collection: ["agy", "claude"] })
+      if (!picked) return
+      provider = normalizeProvider(picked)
+    }
+    await openCompose(provider)
+  }, "Pick a directory (default: the last one used), then write a prompt; C-c C-c starts a T3 Code thread there. C-u picks provider (agy or claude).")
+
+  editor.command("t3code-compose-agy", async () => {
+    await openCompose(AGY_INSTANCE)
+  }, "Pick a directory (default: the last one used), then write a prompt; C-c C-c starts an Antigravity (agy) thread in T3 Code.")
+
+  editor.command("t3code-compose-toggle-provider", ({ buffer }) => {
+    if (buffer.mode !== COMPOSE_MODE) return editor.message("t3code: not in a prompt buffer")
+    const current = effectiveProvider((buffer.locals.get(COMPOSE_PROVIDER_LOCAL) as string | undefined) ?? "")
+    const next = current === AGY_INSTANCE ? CLAUDE_INSTANCE : AGY_INSTANCE
+    buffer.locals.set(COMPOSE_PROVIDER_LOCAL, next)
+    const dir = buffer.locals.get(COMPOSE_DIRECTORY_LOCAL) as string | undefined
+    if (dir) buffer.name = composeBufferName(dir, next)
+    const model = next === AGY_INSTANCE
+      ? (getCustom<string>("t3code-agy-model") || FALLBACK_AGY_MODEL)
+      : (getCustom<string>("t3code-model") || FALLBACK_CLAUDE_MODEL)
+    editor.message(`t3code: switched prompt to ${providerLabel(next)} (${model})`)
+  }, "Switch this T3 Code prompt buffer between Claude and Antigravity (agy).")
 
   function closeCompose(buffer: BufferModel): void {
     const winconf = buffer.locals.get(COMPOSE_WINCONF_LOCAL) as ReturnType<Editor["currentWindowConfiguration"]> | undefined
@@ -178,8 +289,9 @@ export function install(editor: Editor): void {
     if (buffer.mode !== COMPOSE_MODE) return editor.message("t3code: not in a prompt buffer")
     const prompt = buffer.text
     if (!prompt.trim()) return editor.message("t3code: empty prompt")
+    const provider = (buffer.locals.get(COMPOSE_PROVIDER_LOCAL) as string | undefined) ?? ""
     try {
-      await startThread(prompt, buffer.locals.get(COMPOSE_DIRECTORY_LOCAL) as string)
+      await startThread(prompt, buffer.locals.get(COMPOSE_DIRECTORY_LOCAL) as string, provider)
     }
     catch (error) {
       // Keep the buffer so the prompt isn't lost.
@@ -197,7 +309,9 @@ export function install(editor: Editor): void {
   const composeMap = new Keymap("t3code-prompt-mode-map")
   composeMap.bind("C-c C-c", "t3code-compose-send")
   composeMap.bind("C-c C-k", "t3code-compose-cancel")
+  composeMap.bind("C-c C-p", "t3code-compose-toggle-provider")
   defineMode({ name: COMPOSE_MODE, parent: "markdown", keymap: composeMap })
 
   editor.key("C-c T", "t3code-compose")
+  editor.key("C-c A", "t3code-compose-agy")
 }
